@@ -113,16 +113,14 @@ _BOARD_RPY_RAD: tuple[float, float, float] = (0.0, 0.0, np.deg2rad(90))
 #            hemisphere covers ±60° around that base→board ray.
 # Set _SHOW_HEMISPHERE_WIREFRAME=False to hide the visualisation.
 _SHOW_HEMISPHERE_WIREFRAME: bool = True
-_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.20, 0.30)  # (min, max) radial distance
-# 30° → 75°. The previous (25°, 90°) range had two problems: (a) the
-# outer-shell wireframe at d_max × ev_max = 90° put the top of the dome
-# higher than PAROL6 can practically reach with the wrist-flip mount,
-# making that part of the dome forever empty of dots, and (b) elevations
-# above ~80° almost never produce IK-feasible poses on the cold-start
-# mount (verified empirically: of 1024 Sobol samples, fewer than 10
-# survivors had elev > 80°). Narrowing to (30°, 75°) keeps the dome
-# inside the actually-reachable region.
-_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (30.0, 75.0)
+_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.18, 0.28)  # (min, max) radial distance
+# 15° → 70°. Lower bound is genuinely useful — low-elevation oblique
+# views see the board's edges in heavy foreshortening, but ChArUco
+# tolerates that down to ~75° off-normal (= ev=15° if board lies flat).
+# Upper bound trimmed to 70° because elevations >80° essentially never
+# IK-solve on the wrist-flip mount, and 75°-80° is a thin sliver that
+# isn't worth the wireframe shell extending into.
+_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (15.0, 70.0)
 # Distance lower bound 0.22 m: at fx=fy=615 the camera covers ~230 mm of
 # horizontal scene at this distance, just enough for the 210 mm-wide board
 # to fit with safety margin. Closer than this and the board falls outside
@@ -257,11 +255,13 @@ _SETTLE_TIME_REAL_S: float = 2.5
 # more than this many degrees off the board surface normal. At extreme
 # angles the board projection is heavily foreshortened, ChArUco corners are
 # detected at low count + high reproj error, and the calibration's effective
-# spatial resolution drops. With _HEMI_ELEVATION_RANGE_DEG = (25, 90), an
-# elevation of 25° already puts the camera at 65° off-normal; multi-target
-# look-at with off-centre targets can push that another ~10°. Tune downward
-# (more aggressive filtering) if you see oblique poses making it through.
-_MAX_CAM_BOARD_ANGLE_DEG: float = 65.0
+# spatial resolution drops. With _HEMI_ELEVATION_RANGE_DEG = (15°, 70°),
+# elevation 15° puts the camera at 75° off the board normal; we set the
+# limit slightly above that (78°) so the lowest hemisphere elevations
+# survive the filter, with multi-target look-at having a few degrees of
+# headroom. Tune downward (more aggressive filtering) if low-angle poses
+# look like they're hurting calibration accuracy.
+_MAX_CAM_BOARD_ANGLE_DEG: float = 78.0
 
 # Floor-collision primitive — add a flat collision box at z<0 to the
 # CollisionManager. Any gripper / arm link that dips below the workbench
