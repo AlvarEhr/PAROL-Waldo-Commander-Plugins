@@ -460,14 +460,18 @@ _state: dict[str, Any] = {
     # board-localise thread reuses these as lookout joint configurations so we
     # don't have to re-run pose generation just to pick scan poses.
     "reachable_candidates": [],
-    # Multi-target relaxed look-at: when set to a (3,) world point, the
-    # pose-generator's look-at uses THIS point instead of self.target_world.
-    # The hemisphere centre stays anchored on self.target_world (board centre)
-    # so we get the same camera positions but with relaxed look-at directions.
-    "look_at_target_override": None,
     # Cached collision-manager pair for validate_joint_trajectory(); built
     # lazily on first call so users importing this module pay nothing.
     "trajectory_collision_mgr_pair": None,
+    # Timestamp of the most recent successful Localise Board run. None
+    # means never — the Run button shows a warning dialog in that case
+    # because calibration would aim at the configured _BOARD_TRANSLATE_M
+    # rather than the actual board pose.
+    "last_localise_ok_at": None,
+    # True while the localise-before-Run confirmation dialog is open.
+    # _busy_warn checks this so the user can't start a parallel Localise
+    # while the dialog is awaiting their answer.
+    "dialog_open": False,
 }
 
 
@@ -1352,7 +1356,14 @@ def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
     board_pos = _T_BOARD2BASE[:3, 3].copy()
     board_pos[2] += 0.001  # nudge above the floor grid to avoid z-fight
     board_group = scene_root.group().move(*board_pos.tolist())
-    rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("XYZ").tolist()
+    # NiceGUI's group.rotate(rx, ry, rz) wraps three.js Object3D.rotation,
+    # which uses INTRINSIC XYZ (i.e. "xyz" in scipy convention — lowercase).
+    # _BOARD_RPY_RAD is documented as scipy XYZ-extrinsic (uppercase) so
+    # we round-trip through the rotation matrix and decompose with the
+    # intrinsic convention here. For single-axis rotations (e.g. yaw-only)
+    # both conventions give identical Euler angles; the difference only
+    # shows up for tilted boards (multiple non-zero axes).
+    rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("xyz").tolist()
     if any(abs(a) > 1e-6 for a in rpy):
         board_group = board_group.rotate(*rpy)
     with board_group:
@@ -1423,7 +1434,9 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
         dtype=np.float64,
     )
     centre_world = (_T_BOARD2BASE @ tablet_centre_local)[:3]
-    rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("XYZ").tolist()
+    # Lowercase "xyz" = scipy intrinsic, matches three.js Object3D.rotation
+    # default. See note in _build_board_overlay_group for context.
+    rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("xyz").tolist()
 
     grp = scene_root.group().move(*centre_world.tolist()).with_name("calib:tablet")
     if any(abs(a) > 1e-6 for a in rpy):
@@ -1480,7 +1493,16 @@ def refresh_board_dependent_overlays() -> None:
         # No event loop captured — caller is on the main thread.
         _do_refresh()
     else:
-        loop.call_soon_threadsafe(_do_refresh)
+        try:
+            loop.call_soon_threadsafe(_do_refresh)
+        except RuntimeError as e:
+            # Event loop is closed (page torn down mid-localise). Nothing
+            # to refresh.
+            logger.info(
+                "refresh_board_dependent_overlays: loop unavailable (%s); "
+                "skipping scene refresh",
+                e,
+            )
 
 
 def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]) -> None:
@@ -1876,9 +1898,12 @@ def _calibration_thread() -> None:
                 enable_depth=False,  # calibration only needs color frames
                 enable_color=True,
             )
+            # Stash BEFORE start(): if start() raises mid-pipeline-init the
+            # device may have already been claimed; the finally-block must
+            # see the camera handle to call .stop() cleanly.
+            _state["real_camera"] = camera
             camera.start()
             intrinsics = camera.intrinsics
-            _state["real_camera"] = camera  # for finally cleanup on STOP / crash
             logger.info(
                 "calibration camera: RealSenseCamera (real-hardware mode), "
                 "intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f, dist=%s",
@@ -1953,41 +1978,46 @@ def _calibration_thread() -> None:
                 kwargs["max_count"] = max_count * 5
 
                 # Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
-                # When _BOARD_TARGET_OFFSETS_LOCAL has more than one entry,
-                # run super().generate() once per board-local target offset
-                # and merge candidate lists. The hemisphere CENTRE stays
-                # anchored on self.target_world (board centre); only the
-                # look-at direction changes, via the look_at_target_override
-                # picked up by the patched pose_generator.look_at_pose.
-                if len(_BOARD_TARGET_OFFSETS_LOCAL) > 1:
-                    cfg = BOARD_TABLET_30MM
-                    w_m_b = cfg.squares_x * cfg.square_length
-                    h_m_b = cfg.squares_y * cfg.square_length
-                    all_cands: list = []
-                    last_stats = None
-                    try:
-                        for offset_u, offset_v in _BOARD_TARGET_OFFSETS_LOCAL:
-                            target_local = np.array(
-                                [offset_u * w_m_b, offset_v * h_m_b, 0.0, 1.0],
-                                dtype=np.float64,
-                            )
-                            _state["look_at_target_override"] = (
-                                _T_BOARD2BASE @ target_local
-                            )[:3]
-                            cands_pass, stats_pass = super().generate(**kwargs)  # type: ignore[arg-type]
-                            all_cands.extend(cands_pass)
-                            last_stats = stats_pass
-                    finally:
-                        _state["look_at_target_override"] = None
-                    cands = all_cands
-                    stats = last_stats
+                # Build the per-pass aim points in board-local UV ∈ [0, 1]²,
+                # convert to world frame, pass to super().generate() as
+                # `look_at_targets`. The hemisphere CENTRE stays anchored on
+                # self.target_world (the value of _hemi_centre_world() at
+                # construction time — possibly the override); only the
+                # look-at aim varies per pass.
+                #
+                # When _HEMI_CENTRE_OVERRIDE_M is set, self.target_world is
+                # the override (a fixed workable-space anchor). The aim
+                # points STILL come from _T_BOARD2BASE — i.e. cameras aim
+                # at the actual board, not the override. Single-target mode
+                # uses the centre offset (0.5, 0.5) explicitly so the same
+                # invariant holds with or without multi-target.
+                cfg = BOARD_TABLET_30MM
+                w_m_b = cfg.squares_x * cfg.square_length
+                h_m_b = cfg.squares_y * cfg.square_length
+                offsets = (
+                    _BOARD_TARGET_OFFSETS_LOCAL
+                    if len(_BOARD_TARGET_OFFSETS_LOCAL) > 1
+                    else ((0.5, 0.5),)
+                )
+                aim_targets = [
+                    (
+                        _T_BOARD2BASE
+                        @ np.array(
+                            [u * w_m_b, v * h_m_b, 0.0, 1.0],
+                            dtype=np.float64,
+                        )
+                    )[:3]
+                    for u, v in offsets
+                ]
+                cands, stats = super().generate(  # type: ignore[arg-type]
+                    **kwargs, look_at_targets=aim_targets,
+                )
+                if len(offsets) > 1:
                     logger.info(
                         "multi-target look-at: %d targets, %d raw candidates "
                         "(pre-filter)",
-                        len(_BOARD_TARGET_OFFSETS_LOCAL), len(cands),
+                        len(offsets), len(cands),
                     )
-                else:
-                    cands, stats = super().generate(**kwargs)  # type: ignore[arg-type]
 
                 # 1. Hull filter.
                 if _state.get("envelope_planes_A") is not None:
@@ -2146,44 +2176,20 @@ def _calibration_thread() -> None:
 
                 return cands, stats
 
-        # Monkey-patch the orchestrator's PoseGenerator binding so the
-        # subclass is used during the main hemisphere pass too. The original
-        # is stashed in _state so the finally block can restore even if we
-        # crash mid-run.
-        import parol6_vision.calibration.orchestrator as _orch_mod  # noqa: PLC0415
-        _state["orig_pose_generator"] = _orch_mod.PoseGenerator
-        _orch_mod.PoseGenerator = HullFilteredPoseGenerator
+        # NB: prior to this commit we monkey-patched
+        # ``parol6_vision.calibration.orchestrator.PoseGenerator`` here so
+        # the orchestrator's main hemisphere pass would use our filtered
+        # subclass. The orchestrator now accepts a ``pose_generator_factory``
+        # in its config, so the subclass is injected explicitly via
+        # ``OrchestratorConfig(pose_generator_factory=...)`` further down.
 
-        # Multi-target relaxed look-at infrastructure — DEFERRED_FEATURES.md §6.
-        # Wrap pose_generator.look_at_pose so it consults
-        # _state["look_at_target_override"]. When the override is None
-        # (default) we forward verbatim, so single-centre mode is unaffected.
-        # When set, the override REPLACES the target_world arg, leaving
-        # self.target_world untouched (so hemisphere_camera_position keeps
-        # its original board-centre anchoring).
-        import parol6_vision.calibration.pose_generator as _pg_mod  # noqa: PLC0415
-        _orig_look_at = _pg_mod.look_at_pose
-        _state["orig_look_at_pose"] = _orig_look_at
-
-        def _multi_target_look_at_pose(
-            camera_position_world,
-            target_world,
-            world_up=np.array([0.0, 0.0, 1.0]),
-        ):
-            override = _state.get("look_at_target_override")
-            effective_target = override if override is not None else target_world
-            return _orig_look_at(camera_position_world, effective_target, world_up)
-
-        _pg_mod.look_at_pose = _multi_target_look_at_pose
-
-        # NB: prior to 2026-05-05 we monkey-patched
+        # NB: prior to this commit we monkey-patched
         # ``parol6_vision.calibration.refinement.board_position_from_sample``
-        # here to return the board CENTRE instead of the corner-anchored
-        # origin. The upstream now takes a ``board: BoardConfig`` kwarg and
-        # the orchestrator passes it explicitly, so the patch is no longer
-        # needed. Two monkey-patches remain (PoseGenerator class swap +
-        # look_at_pose); both have outstanding upstream proposals — see
-        # parol6-vision Docs/DEFERRED_FEATURES.md.
+        # AND ``parol6_vision.calibration.pose_generator.look_at_pose`` here.
+        # Both are now upstreamed — refinement takes a ``board: BoardConfig``
+        # kwarg, and the pose generator's ``generate()`` takes
+        # ``look_at_targets=[...]`` to drive multi-target relaxed look-at.
+        # Zero monkey-patches remain in this thread.
 
         # Hemisphere params for the bootstrap pass and the main pass.
         #
@@ -2237,6 +2243,20 @@ def _calibration_thread() -> None:
             tuple(np.degrees(c.joint_angles_rad).tolist()) for c in bcands
         )
 
+        # Pose-generator factory: injects our HullFilteredPoseGenerator
+        # subclass into the orchestrator's `_collect_hemisphere` so the same
+        # six-stage filter pipeline (hull, floor, self-collision, occlusion,
+        # farthest-first, trajectory) runs in both the bootstrap and main
+        # passes. Replaces the previous monkey-patch on
+        # `orchestrator.PoseGenerator`.
+        def _hull_filtered_factory(robot, mount, target_world, params):
+            return HullFilteredPoseGenerator(
+                robot=robot,
+                mount=mount,
+                target_world=target_world,
+                params=params,
+            )
+
         # Reduced sample count + zero settle time — the controller's motion
         # physics already enforces realistic timing, so we don't need
         # additional settling. Sample count trades calibration quality for
@@ -2248,6 +2268,7 @@ def _calibration_thread() -> None:
             enable_second_pass=False,
             settle_time_s=0.2,
             hemisphere=main_params,
+            pose_generator_factory=_hull_filtered_factory,
         )
 
         orchestrator = CalibrationOrchestrator(
@@ -2285,25 +2306,6 @@ def _calibration_thread() -> None:
             logger.exception("Calibration thread crashed")
             _post_status(f"ERROR: {e}")
     finally:
-        # Restore the orchestrator's PoseGenerator binding if we patched it.
-        if _state.get("orig_pose_generator") is not None:
-            try:
-                import parol6_vision.calibration.orchestrator as _orch_mod  # noqa: PLC0415
-                _orch_mod.PoseGenerator = _state["orig_pose_generator"]
-            except Exception:  # noqa: BLE001
-                pass
-            _state["orig_pose_generator"] = None
-        # Restore look_at_pose if we patched it.
-        if _state.get("orig_look_at_pose") is not None:
-            try:
-                import parol6_vision.calibration.pose_generator as _pg_mod  # noqa: PLC0415
-                _pg_mod.look_at_pose = _state["orig_look_at_pose"]
-            except Exception:  # noqa: BLE001
-                pass
-            _state["orig_look_at_pose"] = None
-        # Clear any lingering target override (defensive — should be None
-        # already after the multi-target loop's own finally clause).
-        _state["look_at_target_override"] = None
         # Stop the RealSenseCamera if we started one in real-hardware mode.
         real_cam = _state.get("real_camera")
         if real_cam is not None:
@@ -2398,7 +2400,17 @@ def _localise_board_thread() -> None:
                 target_world=target_world,
                 params=params,
             )
-            pose_cands, _ = gen.generate(max_count=1)
+            try:
+                pose_cands, _ = gen.generate(max_count=1)
+            except Exception as e:  # noqa: BLE001
+                # A single bad target (numba JIT issue, IK numerical break)
+                # shouldn't kill the whole scan. Log and continue.
+                logger.warning(
+                    "localise scan target (%.2f, %.2f) — pose generation "
+                    "raised %s: %s. Skipping target.",
+                    tx, ty, type(e).__name__, e,
+                )
+                continue
             if pose_cands:
                 candidates.append(pose_cands[0])
             else:
@@ -2468,9 +2480,10 @@ def _localise_board_thread() -> None:
                 enable_depth=False,
                 enable_color=True,
             )
+            # Stash BEFORE start(): see _calibration_thread for rationale.
+            _state["real_camera"] = camera
             camera.start()
             intrinsics = camera.intrinsics
-            _state["real_camera"] = camera
             logger.info(
                 "localise camera: RealSenseCamera (real-hardware mode), "
                 "intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
@@ -2526,13 +2539,30 @@ def _localise_board_thread() -> None:
                 logger.info("localise scan %d returned rc=%d; skipping", i, rc)
                 continue
             time.sleep(0.2)  # let the camera frame stabilise after motion
-            frame = camera.capture_color()
+            try:
+                frame = camera.capture_color()
+            except Exception as e:  # noqa: BLE001
+                # USB jiggle, dropped frame, etc. Skip this pose, don't
+                # crash the whole scan.
+                logger.warning(
+                    "localise scan %d: capture_color failed (%s: %s); skipping",
+                    i, type(e).__name__, e,
+                )
+                continue
             detection = detector.detect(frame, K, D)
             if detection is None:
                 logger.info("localise scan %d: no board detected", i)
                 continue
             T_board2cam = board_pose_to_matrix(detection)
-            T_flange2base = _flange_pose_from_client(raw_client)
+            try:
+                T_flange2base = _flange_pose_from_client(raw_client)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "localise scan %d: flange-pose query failed (%s: %s); "
+                    "skipping",
+                    i, type(e).__name__, e,
+                )
+                continue
             if T_flange2base is None:
                 continue
             T_board2base_obs = T_flange2base @ cold_start.T_cam2flange @ T_board2cam
@@ -2583,32 +2613,51 @@ def _localise_board_thread() -> None:
         best_inlier_idx = int(max(inlier_indices, key=lambda j: detected_qualities[j]))
         R_detected = np.asarray(detected_poses[best_inlier_idx], dtype=np.float64)[:3, :3]
 
-        # Mutate _T_BOARD2BASE in place (rotation + translation) so existing
-        # closure references see the update. Translation: re-compute the
-        # corner-anchored origin from the inlier-mean centre using the NEWLY
-        # DETECTED rotation, not the old configured rotation.
+        # Build the new full 4x4 transform first, then assign atomically. The
+        # previous in-memory rotation/translation are snapshotted for the
+        # delta report so it shows the actual change since this update
+        # (not the configured-vs-detected delta — that would be misleading
+        # on repeat localise calls).
+        old_R = _T_BOARD2BASE[:3, :3].copy()
         old_origin = _T_BOARD2BASE[:3, 3].copy()
         center_offset_world = R_detected @ center_local[:3]
         new_origin = new_centre - center_offset_world
-        _T_BOARD2BASE[:3, :3] = R_detected
-        _T_BOARD2BASE[:3, 3] = new_origin
+
+        new_T = np.eye(4, dtype=np.float64)
+        new_T[:3, :3] = R_detected
+        new_T[:3, 3] = new_origin
+        # Atomic-ish write: a concurrent reader of `_T_BOARD2BASE` either sees
+        # the entire pre-update matrix or the entire post-update matrix, never
+        # a torn (R_new, t_old) state. NumPy's `[:] = …` invokes element-wise
+        # assignment under the GIL; the GIL doesn't make it formally atomic
+        # but in practice no Python statement interleaves between the two
+        # halves of a 4x4 copy.
+        _T_BOARD2BASE[:] = new_T
 
         delta_mm = float(np.linalg.norm(new_origin - old_origin)) * 1000.0
-        # Approximate rotation delta via Frobenius norm of (R_detected - R_old).
-        # Quick-and-dirty: ‖R_a − R_b‖_F ≈ 2√2 sin(θ/2) for small angles.
-        R_old = _build_T_board2base()[:3, :3]  # configured rotation (re-derive)
-        rot_frob = float(np.linalg.norm(R_detected - R_old, ord="fro"))
-        rot_delta_deg = float(np.degrees(2.0 * np.arcsin(min(1.0, rot_frob / (2.0 * np.sqrt(2))))))
+        # ‖R_a − R_b‖_F = 2√2 sin(θ/2) is the exact identity (not approximate),
+        # so this recovers the rotation angle in degrees.
+        rot_frob = float(np.linalg.norm(R_detected - old_R, ord="fro"))
+        rot_delta_deg = float(
+            np.degrees(2.0 * np.arcsin(min(1.0, rot_frob / (2.0 * np.sqrt(2)))))
+        )
         _post_status(
             f"Localise OK: {n_inliers}/{len(detected_centres)} inliers, "
             f"centre ({new_centre[0]:.3f}, {new_centre[1]:.3f}, "
             f"{new_centre[2]:.3f}) m, shift {delta_mm:.1f} mm / {rot_delta_deg:.1f}°"
         )
 
-        # Invalidate the cached collision manager used by
-        # validate_joint_trajectory — the tablet primitive embedded in it
-        # references the OLD board pose. Next call rebuilds with the new pose.
+        # Invalidate caches that depend on the previous _T_BOARD2BASE:
+        #   - trajectory_collision_mgr_pair embeds the OLD tablet pose.
+        #   - reachable_candidates were generated against the OLD centre, so
+        #     their joint configs no longer aim at the new board location.
+        # Both rebuild on next use.
         _state["trajectory_collision_mgr_pair"] = None
+        _state["reachable_candidates"] = []
+
+        # Stamp the successful-localise time so the Run button knows the
+        # board has been localised this session and skips the warning dialog.
+        _state["last_localise_ok_at"] = time.time()
 
         # Refresh visual overlays so board, hemisphere, and reachability dots
         # all reflect the new pose. Schedules on the asyncio loop.
@@ -2643,10 +2692,22 @@ def _post_status(text: str) -> None:
         return
 
     def _update():
-        label.text = text
+        # Re-fetch in case the page tore down between scheduling and
+        # dispatch (status_label was deleted, set to None on cleanup).
+        live_label = _state.get("status_label")
+        if live_label is None:
+            return
+        try:
+            live_label.text = text
+        except Exception:  # noqa: BLE001
+            # Label exists but is detached / disposed.
+            pass
 
     try:
         loop.call_soon_threadsafe(_update)
+    except RuntimeError as e:
+        # Loop closed (page tear-down). Log at info — not a real failure.
+        logger.info("Status post skipped (loop unavailable): %s", e)
     except Exception as e:  # noqa: BLE001
         logger.warning("Could not post GUI status: %s", e)
 
@@ -2679,7 +2740,8 @@ def add_control_panel() -> None:
 
     def _busy_warn(msg: str) -> bool:
         """Reject button press if either the calibration or the localise thread
-        is already running. Returns True if a warning was issued."""
+        is already running, OR if the localise-before-Run dialog is open.
+        Returns True if a warning was issued."""
         if _state.get("is_running"):
             ui.notify(
                 f"{msg}: calibration already running — wait for it to finish",
@@ -2694,16 +2756,68 @@ def add_control_panel() -> None:
                 position="top",
             )
             return True
+        if _state.get("dialog_open"):
+            ui.notify(
+                f"{msg}: confirmation dialog open — answer it first",
+                color="warning",
+                position="top",
+            )
+            return True
         return False
 
-    def _on_click() -> None:
-        if _busy_warn("Run"):
-            return
+    def _start_calibration() -> None:
+        """Spawn the calibration thread (post-confirmation)."""
         _state["is_running"] = True
         _state["stop_requested"] = False
         _state["calibrated_mount"] = None
         _post_status("Running calibration via parol6-server...")
         threading.Thread(target=_calibration_thread, daemon=True).start()
+
+    def _on_click() -> None:
+        if _busy_warn("Run"):
+            return
+        # Localise-before-Run guard. If the user hasn't successfully run
+        # the Localise Board sweep this session, the calibration's bootstrap
+        # will aim at the configured _BOARD_TRANSLATE_M — which on real
+        # hardware is essentially never accurate. A confirmation dialog
+        # offers to run anyway (sim mode, or already-trusted setup) or
+        # cancel and run Localise first.
+        if _state.get("last_localise_ok_at") is None:
+            # Block any other Run / Localise click while the dialog is open.
+            # Without this, the user can click Localise during the open
+            # dialog → both threads end up running in parallel.
+            _state["dialog_open"] = True
+            with ui.dialog() as dialog, ui.card():
+                ui.label("Board hasn't been localised this session").classes(
+                    "text-base font-semibold"
+                )
+                ui.label(
+                    "Calibration will use the configured _BOARD_TRANSLATE_M as "
+                    "the bootstrap target. If your physical tablet isn't there, "
+                    "bootstrap will fail to find the board."
+                ).classes("text-sm")
+                ui.label(
+                    "Recommended: Cancel, click Localise Board first, then Run."
+                ).classes("text-xs opacity-80")
+                with ui.row():
+                    def _proceed():
+                        _state["dialog_open"] = False
+                        dialog.close()
+                        _start_calibration()
+
+                    def _cancel():
+                        _state["dialog_open"] = False
+                        dialog.close()
+                    ui.button(
+                        "Run anyway", on_click=_proceed, color="warning",
+                    ).props("size=sm")
+                    ui.button("Cancel", on_click=_cancel).props("size=sm")
+            # Backdrop / Esc dismisses the dialog without invoking either
+            # button — clear the flag in that case too.
+            dialog.on("hide", lambda _e=None: _state.update(dialog_open=False))
+            dialog.open()
+            return
+        _start_calibration()
 
     def _on_localise() -> None:
         """Drive a small lookout sweep + auto-locate the board centre."""
