@@ -865,6 +865,13 @@ def _build_occlusion_mesh() -> Any | None:
     trimesh for line-of-sight occlusion queries. The gripper is excluded
     because it sits between the camera and... well, IS where the camera is
     mounted, so it can't occlude the camera's own view of the scene.
+
+    Verifies trimesh's ray-casting is functional before returning. Trimesh
+    requires the ``rtree`` package for the BVH used by
+    ``ray.intersects_location``; without rtree, every ray query raises
+    ``ModuleNotFoundError`` and the occlusion filter silently no-ops.
+    Returns None and logs a loud warning when rtree is missing — better
+    to fail open with notice than fail silently.
     """
     try:
         import trimesh  # noqa: PLC0415
@@ -883,6 +890,38 @@ def _build_occlusion_mesh() -> Any | None:
             meshes_with_link.append((name, trimesh.load(path, force="mesh")))
         except Exception as e:  # noqa: BLE001
             logger.warning("occlusion mesh load failed for %s: %s", path, e)
+
+    # Sanity-check: a single ray trace through the first mesh's bounding
+    # volume. If this raises ModuleNotFoundError on rtree, the rest of
+    # the occlusion filter would silently no-op for every candidate, so
+    # bail loudly here instead.
+    if meshes_with_link:
+        try:
+            first_mesh = meshes_with_link[0][1]
+            bb_centre = np.asarray(first_mesh.bounding_box.centroid)
+            origin = (bb_centre + np.array([1.0, 0.0, 0.0])).reshape(1, 3)
+            direction = np.array([[-1.0, 0.0, 0.0]])
+            first_mesh.ray.intersects_location(
+                ray_origins=origin, ray_directions=direction,
+                multiple_hits=False,
+            )
+        except ModuleNotFoundError as e:
+            logger.warning(
+                "OCCLUSION CHECK DISABLED — trimesh ray-casting requires "
+                "the 'rtree' package, which is not installed (%s). Install "
+                "with: uv pip install rtree (or pip install rtree). The "
+                "calibration pipeline will run without occlusion filtering "
+                "and may accept poses where a robot link blocks the camera "
+                "view of the board.", e,
+            )
+            return None
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "occlusion sanity-check raised %s: %s — disabling filter "
+                "to avoid silent per-candidate failures.",
+                type(e).__name__, e,
+            )
+            return None
     return meshes_with_link
 
 
@@ -957,7 +996,17 @@ def _camera_occlusion_count(
                     ray_directions=ray_direction_local.reshape(1, 3),
                     multiple_hits=False,
                 )
-            except Exception:  # noqa: BLE001
+            except (ValueError, RuntimeError, IndexError) as e:
+                # Numerical / degenerate-ray cases — skip this link only.
+                # ModuleNotFoundError (rtree missing) and other "this is
+                # broken at the package level" errors are caught by the
+                # one-shot sanity check in _build_occlusion_mesh; if we
+                # reach here for one, it's a per-call quirk worth a debug
+                # log but not silent skip.
+                logger.debug(
+                    "ray.intersects_location skipped for %s: %s: %s",
+                    link_name, type(e).__name__, e,
+                )
                 continue
             if len(locations) == 0:
                 continue
