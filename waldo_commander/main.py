@@ -135,6 +135,19 @@ async def initialize_urdf_scene() -> None:
     urdf_path = Path(robot.urdf_path)
     mesh_dir = Path(robot.mesh_dir)
 
+    # parol6-vision: hijack the SSG-48 BODY mesh to embed the user's merged
+    # camera-bracket STL. Pass the active_robot so its tools collection
+    # (snapshotted at Robot.__init__ time) gets rebuilt from the mutated
+    # registry. Must run BEFORE UrdfScene.show() reads tool meshes.
+    try:
+        from waldo_commander.components.calibration_overlays import (
+            hijack_ssg48_body_mesh as _calib_hijack_ssg48,
+        )
+
+        _calib_hijack_ssg48(active_robot=robot)
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("SSG-48 mesh hijack failed: %s", _e)
+
     # Detect theme and set appropriate colors
     is_dark = is_dark_theme()
     bg_color = (
@@ -220,6 +233,19 @@ async def initialize_urdf_scene() -> None:
         scene.line([0, 0, 0], [0, 0, world_axes_size]).material(
             SceneColors.AXIS_Z_HEX
         )  # Z
+
+    # parol6-vision: hand-eye calibration overlays + control panel (optional).
+    # Safe to call even if parol6-vision isn't installed — function is a no-op.
+    try:
+        from waldo_commander.components.calibration_overlays import (
+            add_control_panel as _calib_add_control_panel,
+            add_overlays as _calib_add_overlays,
+        )
+
+        _calib_add_overlays(ui_state.urdf_scene)
+        _calib_add_control_panel()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("calibration overlays failed: %s", e)
 
     # Cache joint names for mapping
     ui_state.urdf_joint_names = list(ui_state.urdf_scene.get_joint_names())

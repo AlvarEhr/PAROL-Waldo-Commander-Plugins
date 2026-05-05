@@ -19,6 +19,10 @@ test-results.xml
 # MkDocs build output
 site/
 
+# parol6-vision calibration integration (fork-only)
+Results/
+waldo_commander/_calib_cache/
+
 # Local development directories
 PAROL6-Desktop-robot-arm/
 PAROL6-python-API/

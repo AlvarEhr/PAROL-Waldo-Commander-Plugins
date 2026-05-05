@@ -388,7 +388,13 @@ class SettingsContent:
                 self._cam_select.options = new_options
                 self._cam_select.update()
 
-        self._cam_refresh_timer = ui.timer(10.0, _refresh_camera_devices)
+        # Auto-refresh disabled — on Windows, ``cv2.VideoCapture(i)`` actually
+        # opens each camera device for a moment, which causes user-visible
+        # flicker on USB cameras (especially Intel RealSense). The user can
+        # click the Settings panel to trigger a one-shot refresh instead.
+        self._cam_refresh_timer = ui.timer(
+            10.0, _refresh_camera_devices, active=False
+        )
 
         if stored_cam is not None and stored_cam != -1:
             camera_service.start(stored_cam)
