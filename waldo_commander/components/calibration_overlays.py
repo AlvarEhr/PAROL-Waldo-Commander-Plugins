@@ -86,15 +86,16 @@ _MERGED_STL_FIT_TRANSLATE_M: tuple[float, float, float] = (13.95538, -0.00737, 0
 #
 # Edit these two tunables and restart waldo-commander to reposition / reorient
 # the board. _BOARD_TRANSLATE_M is the position in metres (X, Y, Z in the robot
-# base frame). _BOARD_RPY_RAD is the orientation as XYZ-extrinsic Euler angles
-# in radians — same convention as scipy.spatial.transform.Rotation.from_euler("XYZ", ...).
+# base frame) of the board's CORNER-anchored origin (OpenCV ChArUco convention).
+# _BOARD_RPY_RAD is the orientation as XYZ-extrinsic Euler angles in radians —
+# same convention as scipy.spatial.transform.Rotation.from_euler("XYZ", ...).
 #
 # Examples:
 #   90° rotation about base Z (lay board "sideways"): _BOARD_RPY_RAD = (0.0, 0.0, np.pi/2)
 #   Tilt board 30° upward toward the robot: _BOARD_RPY_RAD = (np.deg2rad(30), 0.0, 0.0)
 #   Mount on a vertical wall facing -X: _BOARD_RPY_RAD = (0.0, np.pi/2, 0.0)
 #   Along X: (0.25, -0.1, 0.0), (0.0, 0.0, np.deg2rad(90))
-#   Diagnoal: (0, 0.15, 0.0), (0.0, 0.0, np.deg2rad(-45))
+#   Diagonal: (0, 0.15, 0.0), (0.0, 0.0, np.deg2rad(-45))
 _BOARD_TRANSLATE_M: tuple[float, float, float] = (0.25, -0.1, 0.0)
 _BOARD_RPY_RAD: tuple[float, float, float] = (0.0, 0.0, np.deg2rad(90))
 
@@ -130,6 +131,20 @@ _HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (25.0, 90.0)
 # silently rejects those, so widening here is safe.
 _HEMI_AZIMUTH_SPREAD_DEG: float = 150.0
 
+# Hemisphere centre override — when set, the hemisphere wireframe + reachability
+# sampler + pose-generator hemisphere CENTRE all use this fixed world-frame
+# point instead of the board centre. The look-at target (where cameras aim)
+# stays the actual board centre regardless. This decouples the hemisphere's
+# spatial anchor from the board pose, so changing _BOARD_RPY_RAD doesn't
+# shift the hemisphere (the centre offset = R · (w/2, h/2, 0) depends on
+# rotation, so without an override the hemisphere shifts ~10 cm when yaw
+# changes).
+#
+# Set to e.g. (0.30, 0.0, 0.014) to pin the hemisphere forward of the robot
+# at typical workable-space position. Set to None to use the board centre
+# (legacy / sim-default behaviour).
+_HEMI_CENTRE_OVERRIDE_M: tuple[float, float, float] | None = None
+
 # Reachability sampling: at scene-build time we densely sample the hemisphere
 # volume, run IK + workspace-hull check on each candidate, and render the
 # actually-reachable subset as small green spheres. Lets you see at a glance
@@ -157,12 +172,147 @@ _REACHABILITY_GRID = (7, 6, 20)
 # along grid lines. None = no thinning, show every reachable point.
 _REACHABILITY_KEEP_COUNT: int | None = 30
 
+# Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
+#
+# Each entry is a (u, v) pair in board-local UV coordinates ∈ [0, 1]² where
+# (0.5, 0.5) is the geometric centre of the board. For every hemisphere
+# camera position, the pose generator runs IK against EACH of these targets
+# and accumulates all IK-feasible candidates. Multi-target raises bootstrap
+# detection rate (single-centre observed at 25-50% on tilt_x=180; expected
+# 60-80% with the 5-point grid below) at the cost of a 5× longer pose-
+# generation pass (~5 s extra at startup).
+#
+# The default ((0.5, 0.5),) is single-centre and identical to the original
+# behaviour. To enable multi-target, replace with e.g.:
+#     ((0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7), (0.5, 0.5))
+# which targets the four off-centre quadrants plus centre.
+_BOARD_TARGET_OFFSETS_LOCAL: tuple[tuple[float, float], ...] = (
+    (0.3, 0.3), (0.7, 0.3), (0.3, 0.7), (0.7, 0.7), (0.5, 0.5),
+)
+
+# Multi-ray occlusion sampling — partial-frame robot-body occlusion.
+# Single-ray (camera → board centre) misses cases where part of the FOV is
+# blocked by a robot link but the centre line is clear. We cast rays to
+# multiple sample points spread across the board face and reject the pose
+# if more than _OCCLUSION_MAX_BLOCKED rays are blocked. Each (u, v) is in
+# board-local UV ∈ [0, 1]². Default 5-point sampling: centre + 4 corners.
+_OCCLUSION_BOARD_SAMPLES_LOCAL: tuple[tuple[float, float], ...] = (
+    (0.5, 0.5),                                 # centre
+    (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0),  # corners
+)
+# Reject if MORE than this many of the sampled rays are blocked. With 5
+# samples and threshold=1, we accept up to 1/5 = 20% partial occlusion;
+# beyond that the captured frame won't have enough usable corners.
+_OCCLUSION_MAX_BLOCKED: int = 1
+
+# Viewing-angle filter — reject candidates where the camera optical axis is
+# more than this many degrees off the board surface normal. At extreme
+# angles the board projection is heavily foreshortened, ChArUco corners are
+# detected at low count + high reproj error, and the calibration's effective
+# spatial resolution drops. With _HEMI_ELEVATION_RANGE_DEG = (25, 90), an
+# elevation of 25° already puts the camera at 65° off-normal; multi-target
+# look-at with off-centre targets can push that another ~10°. Tune downward
+# (more aggressive filtering) if you see oblique poses making it through.
+_MAX_CAM_BOARD_ANGLE_DEG: float = 65.0
+
+# Floor-collision primitive — add a flat collision box at z<0 to the
+# CollisionManager. Any gripper / arm link that dips below the workbench
+# surface is then caught by the same mesh-collision check that handles
+# self-collision. More accurate than the TCP-point check (which can miss
+# gripper-finger-clipping when the wrist is rolled). Keep True unless
+# python-fcl breaks against thin box geometry.
+_FLOOR_PRIMITIVE_ENABLED: bool = True
+
+# Tablet collision primitive — the physical ChArUco display (Galaxy Tab S9
+# Ultra: 208.6 × 326.4 × 5.5 mm bare; ~11 mm with the case) is added as a
+# static collision box at the current _T_BOARD2BASE pose. Anything (gripper,
+# camera bracket, arm link) clipping into the tablet body during a
+# calibration move is rejected. Dimensions below include a small margin
+# over the case-on tablet so brushing contacts get caught too. The box is
+# centred on the ChArUco geometric centre with its top face at z=0 (the
+# screen surface), extending in board-local -Z by the tablet thickness.
+_TABLET_PRIMITIVE_ENABLED: bool = True
+# Board-local axes: +X = ChArUco LONG edge (squares_x direction, 7×30mm = 210mm
+# for the default Tab S9 Ultra board), +Y = ChArUco SHORT edge (squares_y, 150mm),
+# +Z = out of board surface. Tablet in landscape mode → tablet's LONG edge
+# (326.4mm) lines up with the board's +X axis, tablet's SHORT edge (208.6mm)
+# along +Y. Thickness extends in +Z (above the bench, where the body sits).
+_TABLET_DIMENSIONS_M: tuple[float, float, float] = (
+    0.340,  # along board-local +X (ChArUco long edge / 7-square direction)
+    0.215,  # along board-local +Y (ChArUco short edge / 5-square direction)
+    0.014,  # along board-local +Z (thickness — Tab S9 Ultra with case)
+)
+# Offset of the tablet's geometric centre from the ChArUco geometric centre,
+# in board-local (+X, +Y) coordinates. Default (0, 0) places the tablet
+# centred on the printed ChArUco, which is right when the printed pattern
+# fills the tablet screen. If the ChArUco is rendered with extra screen real
+# estate on one side (e.g. the long Tab S9 Ultra has ~190 mm of "leftover"
+# tablet length past the 150 mm ChArUco height), the tablet body extends
+# further in that direction:
+#   • Set Y > 0 (e.g. +0.090) if leftover tablet is on the +Y side of the ChArUco.
+#   • Set Y < 0 (e.g. -0.090) if leftover tablet is on the -Y side.
+# Wrong offsets only matter for collision filtering precision, not for
+# detection — the calibration will still converge if the tablet model is
+# slightly off. Set _SHOW_TABLET_OVERLAY=True to render the modelled box
+# in the GUI as a translucent overlay so you can dial this in visually.
+_TABLET_OFFSET_FROM_CHARUCO_LOCAL_M: tuple[float, float] = (0.0, 0.0)
+# Render the tablet collision box as a translucent overlay in the GUI for
+# visual debugging. The drawn box matches the collision primitive's pose
+# and dimensions exactly, so once it lines up with where you've placed
+# your physical tablet, the collision check is using the right model.
+_SHOW_TABLET_OVERLAY: bool = True
+
+# Auto-localise board (DEFERRED_FEATURES.md §3) — the workspace scan used
+# by the "Localise Board" button. The button drives the robot through a
+# coarse XY grid of scan target points, each pose looking down at one
+# point from _LOCALISE_SCAN_DISTANCE_M above. The board can be ANYWHERE
+# in the reachable workspace — some pose's FOV will overlap it and detect
+# the ChArUco. Successful detections are median-filtered and used to
+# update _T_BOARD2BASE. The board, hemisphere wireframe, and reachability
+# dots all refresh to match the new pose.
+#
+# Scan targets are (x, y) world-frame points. Z is auto-computed from the
+# configured board height (auto-lifted by tablet thickness). Default grid
+# covers PAROL6's typical reachable workspace: 2 distances × 3 angles =
+# 6 points covering radii 0.20-0.40 m and azimuths ±25°. Add or remove
+# entries to change the search pattern.
+_LOCALISE_SCAN_TARGETS_M: tuple[tuple[float, float], ...] = (
+    (0.20, -0.15),  # close-left
+    (0.20,  0.00),  # close-centre
+    (0.20, +0.15),  # close-right
+    (0.40, -0.15),  # far-left
+    (0.40,  0.00),  # far-centre
+    (0.40, +0.15),  # far-right
+)
+# Distance from each scan target to the camera (camera sits this far above
+# the target, looking down). 0.30 m gives ~33 cm × 25 cm FOV at the floor
+# with the default fx=fy=615 intrinsics — wide enough that consecutive
+# scan points overlap, so a board near the boundary between two grid
+# points gets seen from both.
+_LOCALISE_SCAN_DISTANCE_M: float = 0.30
+# Elevation angle for each scan pose. 90° = pure overhead (camera looks
+# straight down); lower values tilt the camera forward. Pure overhead can
+# cause IK failures with tilt_x=180 wrist-flip, so we default to 85°
+# (mostly overhead with a slight forward tilt) which has higher IK success.
+_LOCALISE_SCAN_ELEVATION_DEG: float = 85.0
+# Minimum number of successful detections to accept the localise. With
+# workspace scan, only the 1-3 scan poses whose FOV overlap the actual
+# board succeed; lowering this to 1 lets us accept a single confident
+# detection. Increase for more robustness against false positives.
+_LOCALISE_MIN_DETECTIONS: int = 1
+# RANSAC inlier threshold (metres) — detections within this distance of the
+# inlier-set median count as agreeing on the board location. 1 cm is loose
+# enough that the cold-start mount's ~2 mm / 2° error doesn't reject good
+# detections, tight enough that an outlier 5 cm off doesn't fool us.
+_LOCALISE_INLIER_THRESHOLD_M: float = 0.01
+
 
 def _hemi_azimuth_center_deg() -> float:
-    """Direction from the robot base origin to the board center, in degrees
-    measured from world +X (CCW). Used so the hemisphere naturally faces
-    "away from the robot" toward where the board sits."""
-    cx, cy, _ = _board_center_world().tolist()
+    """Direction from the robot base origin to the hemisphere anchor, in
+    degrees measured from world +X (CCW). Used so the hemisphere naturally
+    faces "away from the robot" toward where the workable space (board)
+    sits."""
+    cx, cy, _ = _hemi_centre_world().tolist()
     return float(np.degrees(np.arctan2(cy, cx)))
 
 
@@ -174,11 +324,29 @@ def _hemi_azimuth_world_range_deg() -> tuple[float, float]:
 
 
 def _build_T_board2base() -> NDArray[np.float64]:
-    """Compose the SE(3) board→base matrix from the position + RPY tunables."""
-    T = np.eye(4, dtype=np.float64)
+    """Compose the SE(3) board→base matrix from the position + RPY tunables.
+
+    When ``_TABLET_PRIMITIVE_ENABLED`` is set, the board origin is
+    auto-lifted along its local +Z by ``_TABLET_DIMENSIONS_M[2]``. This
+    matches the physical reality of a tablet lying screen-up on a bench:
+    the bench surface is at world z=0, the tablet body sits on the bench,
+    and the ChArUco screen is at z = tablet_thickness above the bench.
+    The user-facing ``_BOARD_TRANSLATE_M`` continues to describe where
+    the board sits IF the tablet had zero thickness — ergonomic because
+    it preserves the natural mental model "the board's at this XY".
+    """
+    R = np.eye(3, dtype=np.float64)
     if any(abs(a) > 1e-9 for a in _BOARD_RPY_RAD):
-        T[:3, :3] = SciRotation.from_euler("XYZ", _BOARD_RPY_RAD).as_matrix()
-    T[:3, 3] = _BOARD_TRANSLATE_M
+        R = SciRotation.from_euler("XYZ", _BOARD_RPY_RAD).as_matrix()
+
+    translation = np.asarray(_BOARD_TRANSLATE_M, dtype=np.float64).copy()
+    if _TABLET_PRIMITIVE_ENABLED:
+        # Lift along board's +Z (out of the screen face) by tablet thickness.
+        translation += R[:, 2] * _TABLET_DIMENSIONS_M[2]
+
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = R
+    T[:3, 3] = translation
     return T
 
 
@@ -189,17 +357,27 @@ def _board_center_world() -> NDArray[np.float64]:
     """Compute the board's geometric center in world coordinates.
 
     The ChArUco config places the board's local origin at one corner and the
-    board extends to (w_m, h_m, 0) in board-local coordinates. The hemisphere
-    + pose-generator targets need the board CENTER, not the corner — using
-    the corner makes the pose generator aim its candidates at the corner
-    rather than at the middle of the board, which is visible in the GUI as a
-    hemisphere wireframe that's offset to one side of the visible board.
+    board extends to (w_m, h_m, 0) in board-local coordinates. The
+    pose-generator look-at target uses the board CENTRE (not the corner);
+    aiming at the corner would make the pose generator aim cameras at one
+    edge of the board, leaving most of the printed pattern outside FOV.
     """
     from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
     w_m = _cfg.squares_x * _cfg.square_length
     h_m = _cfg.squares_y * _cfg.square_length
     center_local = np.array([w_m / 2.0, h_m / 2.0, 0.0, 1.0], dtype=np.float64)
     return (_T_BOARD2BASE @ center_local)[:3]
+
+
+def _hemi_centre_world() -> NDArray[np.float64]:
+    """Hemisphere anchor — `_HEMI_CENTRE_OVERRIDE_M` if set, board centre
+    otherwise. This is the SPATIAL anchor of the hemisphere (where the dome
+    of camera positions sits in world frame). Distinct from the look-at
+    target, which is always the actual board centre regardless of override.
+    """
+    if _HEMI_CENTRE_OVERRIDE_M is not None:
+        return np.asarray(_HEMI_CENTRE_OVERRIDE_M, dtype=np.float64)
+    return _board_center_world()
 
 # Camera intrinsics for the frustum size (matches sim).
 _INTR_FX, _INTR_FY = 615.0, 615.0
@@ -261,6 +439,7 @@ _state: dict[str, Any] = {
     "board_png_path": None,
     "frustum_objects": [],
     "is_running": False,
+    "is_localising": False,  # board-localise thread guard, separate from is_running
     "result_label": None,
     "status_label": None,
     "current_mount": None,  # CameraMount, set by orchestrator
@@ -272,6 +451,23 @@ _state: dict[str, Any] = {
     "envelope_planes_b": None,  # (n_faces,) face-offset constants
     "envelope_max_reach": None, # scalar bounding sphere radius
     "envelope_loaded": False,
+    # Scene-overlay handles for refresh-after-auto-localise.
+    "scene_root": None,        # urdf_scene.scene root for re-attaching groups
+    "board_group": None,       # ChArUco board overlay (deletable scene group)
+    "hemisphere_group": None,  # hemisphere wireframe + reachability dots group
+    "tablet_group": None,      # translucent tablet collision-box visual
+    # Reachable hemisphere candidates cached by _add_reachability_points; the
+    # board-localise thread reuses these as lookout joint configurations so we
+    # don't have to re-run pose generation just to pick scan poses.
+    "reachable_candidates": [],
+    # Multi-target relaxed look-at: when set to a (3,) world point, the
+    # pose-generator's look-at uses THIS point instead of self.target_world.
+    # The hemisphere centre stays anchored on self.target_world (board centre)
+    # so we get the same camera positions but with relaxed look-at directions.
+    "look_at_target_override": None,
+    # Cached collision-manager pair for validate_joint_trajectory(); built
+    # lazily on first call so users importing this module pay nothing.
+    "trajectory_collision_mgr_pair": None,
 }
 
 
@@ -326,14 +522,26 @@ def _ensure_workspace_envelope() -> bool:
         return False
 
 
-def _build_collision_manager() -> tuple[Any, set[tuple[str, str]]] | None:
+def _build_collision_manager(
+    tablet_T_board2base: NDArray[np.float64] | None = None,
+) -> tuple[Any, set[tuple[str, str]]] | None:
     """Build a trimesh CollisionManager populated with PAROL6's link meshes
-    + the merged SSG-48 gripper body (which has the camera bracket fused in).
+    + the merged SSG-48 gripper body (which has the camera bracket fused in)
+    + optional FLOOR and TABLET static collision primitives.
 
-    Returns (manager, adjacent_pairs) on success, None if python-fcl or any
-    of the meshes is missing. The adjacent_pairs set lists (link_a, link_b)
-    pairs that are EXPECTED to touch (e.g. base_link↔L1 at the joint) and
-    should NOT be flagged as self-collisions.
+    Args:
+        tablet_T_board2base: Optional 4×4 board→base transform. When
+            provided AND ``_TABLET_PRIMITIVE_ENABLED`` is True, a box of
+            ``_TABLET_DIMENSIONS_M`` is placed at the ChArUco centre, with
+            its top face on the board's z=0 surface and the body extending
+            in board-local -Z. When None, no tablet primitive is added.
+
+    Returns:
+        (manager, adjacent_pairs) on success, None if python-fcl or any
+        link mesh is missing. ``adjacent_pairs`` whitelists (link_a, link_b)
+        pairs whose collisions should NOT count as self-collisions — joint
+        neighbours that always touch, plus the FLOOR-vs-base / FLOOR-vs-
+        TABLET background pairs.
     """
     try:
         import trimesh  # noqa: PLC0415
@@ -369,14 +577,81 @@ def _build_collision_manager() -> tuple[Any, set[tuple[str, str]]] | None:
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for gripper: %s", e)
 
+    # FLOOR collision primitive — wide flat box at z ∈ [-0.05, 0]. Anything
+    # dipping below z=0 collides with FLOOR. Catches gripper-finger and
+    # camera-bracket clipping that the per-pose TCP-point check misses.
+    floor_added = False
+    if _FLOOR_PRIMITIVE_ENABLED:
+        try:
+            floor_box = trimesh.creation.box(extents=(10.0, 10.0, 0.05))
+            floor_pose = np.eye(4, dtype=np.float64)
+            floor_pose[2, 3] = -0.025  # box top at z=0
+            mgr.add_object("FLOOR", floor_box, transform=floor_pose)
+            floor_added = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("FLOOR primitive add failed: %s", e)
+
+    # TABLET collision primitive — the physical ChArUco display, sized per
+    # _TABLET_DIMENSIONS_M and placed at the supplied board pose. Centred on
+    # (ChArUco centre + _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M). Box extends in
+    # board-local -Z by the tablet thickness (the body sits BELOW the screen).
+    # The board pose is auto-lifted by tablet thickness in _build_T_board2base,
+    # so in WORLD frame the box ends up between z=0 (bench) and z=+t_h (screen).
+    tablet_added = False
+    if _TABLET_PRIMITIVE_ENABLED and tablet_T_board2base is not None:
+        try:
+            from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
+            t_w, t_l, t_h = _TABLET_DIMENSIONS_M
+            t_off_x, t_off_y = _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M
+            tablet_box = trimesh.creation.box(extents=(t_w, t_l, t_h))
+            tablet_centre_local = np.array(
+                [
+                    _cfg.squares_x * _cfg.square_length / 2.0 + t_off_x,
+                    _cfg.squares_y * _cfg.square_length / 2.0 + t_off_y,
+                    -t_h / 2.0,  # box centre below the screen plane
+                    1.0,
+                ],
+                dtype=np.float64,
+            )
+            T_b2b = np.asarray(tablet_T_board2base, dtype=np.float64)
+            centre_world = T_b2b @ tablet_centre_local
+            tablet_pose = np.eye(4, dtype=np.float64)
+            tablet_pose[:3, :3] = T_b2b[:3, :3]
+            tablet_pose[:3, 3] = centre_world[:3]
+            mgr.add_object("TABLET", tablet_box, transform=tablet_pose)
+            tablet_added = True
+        except Exception as e:  # noqa: BLE001
+            logger.warning("TABLET primitive add failed: %s", e)
+
     adjacent: set[tuple[str, str]] = {
         ("base_link", "L1"), ("L1", "L2"), ("L2", "L3"),
         ("L3", "L4"), ("L4", "L5"), ("L5", "L6"),
         ("L6", "gripper"),
     }
+    # The robot base sits at z=0 by definition, so base_link / FLOOR "collide"
+    # at the contact patch. The tablet sits ON the floor too (back of tablet
+    # box clips the floor box).
+    if floor_added:
+        adjacent |= {("base_link", "FLOOR")}
+        if tablet_added:
+            adjacent |= {("FLOOR", "TABLET")}
+    # Tablet collision is GRIPPER-ONLY by user request. The realistic danger
+    # is the gripper (with its camera bracket) hitting the tablet during a
+    # calibration move; arm-link-vs-tablet collisions are mostly false
+    # positives caused by tablet model imprecision (asymmetric ChArUco
+    # placement on the screen, case thickness uncertainty, etc.). Whitelist
+    # every arm link vs TABLET so only (gripper, TABLET) fires as a real
+    # rejection.
+    if tablet_added:
+        for _link in ("base_link", "L1", "L2", "L3", "L4", "L5", "L6"):
+            adjacent |= {(_link, "TABLET")}
     # Add reverse pairs for symmetric lookup.
     adjacent |= {(b, a) for a, b in adjacent}
-    logger.info("self-collision manager loaded: 7 links + gripper")
+    logger.info(
+        "self-collision manager loaded: 7 links + gripper%s%s",
+        " + FLOOR" if floor_added else "",
+        " + TABLET" if tablet_added else "",
+    )
     return mgr, adjacent
 
 
@@ -431,6 +706,106 @@ def _trajectory_collides(
     return False
 
 
+def validate_joint_trajectory(
+    q_from: NDArray[np.float64] | list[float] | tuple[float, ...],
+    q_to: NDArray[np.float64] | list[float] | tuple[float, ...],
+    *,
+    n_samples: int = 10,
+    degrees: bool = True,
+) -> dict[str, Any]:
+    """Pre-validate a joint-space move for self-collision before dispatching it.
+
+    This is the public face of the same self-collision machinery the
+    calibration filter pipeline uses internally (filters 3 + 6). The intended
+    use is to check any move you're about to send to the controller:
+
+        result = validate_joint_trajectory(current_q_deg, target_q_deg)
+        if not result["safe"]:
+            print("Move would collide:", result["reason"])
+            return
+        client.move_j(target_q_deg, ...)
+
+    Args:
+        q_from: 6-vector start joint angles. Either degrees (default) or
+            radians depending on ``degrees=``.
+        q_to: 6-vector target joint angles.
+        n_samples: Number of interior interpolation points to check between
+            ``q_from`` and ``q_to``. The endpoints themselves are also checked.
+            Default 10 matches the calibration-time pairwise-trajectory filter.
+        degrees: If True, ``q_from`` / ``q_to`` are interpreted as degrees.
+            If False, radians.
+
+    Returns:
+        dict with keys:
+            ``safe`` (bool): True iff every checked sample (start, end, and
+                ``n_samples`` interior) is collision-free.
+            ``start_safe`` (bool): start config is collision-free.
+            ``end_safe`` (bool): end config is collision-free.
+            ``interior_safe`` (bool): every interior sample is collision-free.
+            ``manager_ready`` (bool): False if python-fcl or the link meshes
+                are unavailable — in that case nothing was actually checked
+                and ``safe`` defaults to True (fail-open, with a warning logged).
+            ``reason`` (str): empty on success, short explanation on failure.
+
+    Mesh fidelity caveat: the simplified link STLs ship with parol6 and are
+    designed for collision queries (~80k tris total), so the verdict is
+    accurate to within a few millimetres of mesh outline. Approximate; not a
+    substitute for soft-stop / current-limit hardware safeties.
+    """
+    q_from_arr = np.asarray(q_from, dtype=np.float64).reshape(-1)
+    q_to_arr = np.asarray(q_to, dtype=np.float64).reshape(-1)
+    if degrees:
+        q_from_arr = np.deg2rad(q_from_arr)
+        q_to_arr = np.deg2rad(q_to_arr)
+
+    pair = _state.get("trajectory_collision_mgr_pair")
+    if pair is None:
+        # Include the tablet primitive at the current _T_BOARD2BASE so any
+        # move that would clip the physical ChArUco display gets caught.
+        # The cache is invalidated by _localise_board_thread after it
+        # mutates _T_BOARD2BASE so subsequent calls see the new pose.
+        pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
+        if pair is None:
+            logger.warning(
+                "validate_joint_trajectory: collision manager unavailable; "
+                "returning safe=True (fail-open). Install python-fcl + "
+                "ensure parol6 link meshes are present to enable real checks."
+            )
+            return {
+                "safe": True,
+                "start_safe": True,
+                "end_safe": True,
+                "interior_safe": True,
+                "manager_ready": False,
+                "reason": "collision-manager unavailable",
+            }
+        _state["trajectory_collision_mgr_pair"] = pair
+
+    mgr, adjacent = pair
+    start_safe = not _self_collides(mgr, adjacent, q_from_arr)
+    end_safe = not _self_collides(mgr, adjacent, q_to_arr)
+    interior_safe = not _trajectory_collides(
+        mgr, adjacent, q_from_arr, q_to_arr, n_samples=n_samples,
+    )
+    safe = start_safe and end_safe and interior_safe
+    if safe:
+        reason = ""
+    elif not start_safe:
+        reason = "start config self-collides"
+    elif not end_safe:
+        reason = "end config self-collides"
+    else:
+        reason = "trajectory interior self-collides"
+    return {
+        "safe": safe,
+        "start_safe": start_safe,
+        "end_safe": end_safe,
+        "interior_safe": interior_safe,
+        "manager_ready": True,
+        "reason": reason,
+    }
+
+
 def _build_occlusion_mesh() -> Any | None:
     """Load all PAROL6 LINK meshes (NOT the gripper) into a single combined
     trimesh for line-of-sight occlusion queries. The gripper is excluded
@@ -457,18 +832,39 @@ def _build_occlusion_mesh() -> Any | None:
     return meshes_with_link
 
 
-def _camera_occluded(
+def _camera_occlusion_count(
     link_meshes: list[tuple[str, Any]],
     joint_angles_rad: NDArray[np.float64],
     camera_pos_world: NDArray[np.float64],
-    target_world: NDArray[np.float64],
-) -> bool:
-    """Cast a ray from camera position to target (board centre); return True
-    if any robot link mesh blocks the line of sight before the target.
+    target_points_world: list[NDArray[np.float64]] | NDArray[np.float64],
+    *,
+    early_termination_after: int | None = None,
+) -> int:
+    """Count how many rays from the camera to each board sample point pass
+    through a robot link mesh.
 
-    Computes per-link FK to get each link's world-frame transform, then
-    transforms the ray into each link's local frame for the intersect query
-    (cheaper than transforming every triangle of every mesh into world frame).
+    For each target point, we cast a ray from ``camera_pos_world`` toward
+    that point and check intersection against each robot link mesh in its
+    local frame (cheaper than transforming triangles into world frame).
+    Per-link transforms + their inverses are computed ONCE per pose and
+    reused across all target rays.
+
+    Args:
+        link_meshes: List of (link_name, trimesh.Trimesh) for the robot
+            arm links. The gripper is intentionally NOT in this list — it
+            holds the camera, so it can't occlude the camera's view of the
+            scene.
+        joint_angles_rad: Current joint configuration.
+        camera_pos_world: (3,) world-frame camera optical centre.
+        target_points_world: Iterable of (3,) world points to test
+            line-of-sight against. Typical use: the board centre + 4 corners.
+        early_termination_after: If set, return as soon as the blocked
+            count strictly EXCEEDS this number (saves work when the caller
+            only cares whether it's "too many").
+
+    Returns:
+        Count of rays blocked by any robot link. ``0`` means full
+        line-of-sight to every target point.
     """
     from parol6_vision.sim.robot_kinematics import link_poses  # noqa: PLC0415
     poses = link_poses(np.asarray(joint_angles_rad, dtype=np.float64))
@@ -481,35 +877,50 @@ def _camera_occluded(
         "L5": poses.l5,
         "L6": poses.l6_visual,
     }
-    direction = target_world - camera_pos_world
-    target_distance = float(np.linalg.norm(direction))
-    if target_distance < 1e-6:
-        return False
-    direction_unit = direction / target_distance
+    # Pre-invert each link transform once — saves a 4×4 inverse per ray.
+    inv_transforms = {
+        k: np.linalg.inv(v) for k, v in link_transforms.items()
+    }
 
+    blocked = 0
     safety_margin_m = 0.01  # ignore intersections within 1cm of target
-    for link_name, mesh in link_meshes:
-        T_link2base = link_transforms[link_name]
-        # Inverse-transform the ray into the link's local frame.
-        T_base2link = np.linalg.inv(T_link2base)
-        ray_origin_local = (T_base2link @ np.append(camera_pos_world, 1.0))[:3]
-        ray_direction_local = T_base2link[:3, :3] @ direction_unit
-        try:
-            locations, _, _ = mesh.ray.intersects_location(
-                ray_origins=ray_origin_local.reshape(1, 3),
-                ray_directions=ray_direction_local.reshape(1, 3),
-                multiple_hits=False,
-            )
-        except Exception:  # noqa: BLE001
+    for target in target_points_world:
+        target_arr = np.asarray(target, dtype=np.float64).reshape(3)
+        direction = target_arr - camera_pos_world
+        target_distance = float(np.linalg.norm(direction))
+        if target_distance < 1e-6:
             continue
-        if len(locations) == 0:
-            continue
-        # Distance from ray origin (camera) to first intersection in LOCAL frame
-        # is the same as in world frame (rigid transforms preserve distances).
-        intersection_dist = float(np.linalg.norm(locations[0] - ray_origin_local))
-        if intersection_dist < target_distance - safety_margin_m:
-            return True
-    return False
+        direction_unit = direction / target_distance
+
+        ray_blocked = False
+        for link_name, mesh in link_meshes:
+            T_base2link = inv_transforms[link_name]
+            ray_origin_local = (T_base2link @ np.append(camera_pos_world, 1.0))[:3]
+            ray_direction_local = T_base2link[:3, :3] @ direction_unit
+            try:
+                locations, _, _ = mesh.ray.intersects_location(
+                    ray_origins=ray_origin_local.reshape(1, 3),
+                    ray_directions=ray_direction_local.reshape(1, 3),
+                    multiple_hits=False,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            if len(locations) == 0:
+                continue
+            # Distance from ray origin (camera) to first intersection in LOCAL frame
+            # is the same as in world frame (rigid transforms preserve distances).
+            intersection_dist = float(np.linalg.norm(locations[0] - ray_origin_local))
+            if intersection_dist < target_distance - safety_margin_m:
+                ray_blocked = True
+                break
+        if ray_blocked:
+            blocked += 1
+            if (
+                early_termination_after is not None
+                and blocked > early_termination_after
+            ):
+                return blocked
+    return blocked
 
 
 def envelope_contains(points: NDArray[np.float64]) -> NDArray[np.bool_]:
@@ -907,10 +1318,36 @@ def add_overlays(urdf_scene: Any) -> None:
     # z-fight with it, and bordered with a coloured outline so it's easy
     # to spot even if the texture fails to load.
     # ------------------------------------------------------------------
+    scene_root = urdf_scene.scene
+    _state["scene_root"] = scene_root
+
+    _state["board_group"] = _build_board_overlay_group(scene_root, png_url)
+    _state["tablet_group"] = _build_tablet_overlay_group(scene_root)
+
+    # ------------------------------------------------------------------
+    # Hemisphere wireframe — shows the (distance × elevation × azimuth)
+    # region around the board where the pose generator places camera
+    # candidates. Drawn in WORLD frame because hemisphere_camera_position()
+    # uses world Z-up regardless of board rotation. Anchor is the hemisphere
+    # centre (override-aware via _HEMI_CENTRE_OVERRIDE_M; falls back to the
+    # board centre when no override is set).
+    # ------------------------------------------------------------------
+    if _SHOW_HEMISPHERE_WIREFRAME:
+        _add_hemisphere_wireframe(scene_root, _hemi_centre_world())
+
+
+def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
+    """Build the ChArUco board scene group at the current ``_T_BOARD2BASE``.
+
+    Extracted from ``add_overlays`` so ``refresh_board_dependent_overlays``
+    can rebuild the group after auto-localise mutates ``_T_BOARD2BASE``.
+    Returns the group handle (call ``.delete()`` to remove).
+    """
+    from parol6_vision.calibration.board import BOARD_TABLET_30MM  # noqa: PLC0415
+
     cfg = BOARD_TABLET_30MM
     w_m = cfg.squares_x * cfg.square_length
     h_m = cfg.squares_y * cfg.square_length
-    scene_root = urdf_scene.scene
 
     board_pos = _T_BOARD2BASE[:3, 3].copy()
     board_pos[2] += 0.001  # nudge above the floor grid to avoid z-fight
@@ -952,17 +1389,98 @@ def add_overlays(urdf_scene: Any) -> None:
         ui.scene.line([w_m, h_m, 0.0010], [0, h_m, 0.0010]).material("#ff8800")
         ui.scene.line([0, h_m, 0.0010], [0, 0, 0.0010]).material("#ff8800")
 
-    logger.info("parol6-vision calibration overlays added (board at %s)", board_pos.tolist())
+    logger.info("parol6-vision calibration overlay: board at %s", board_pos.tolist())
+    return board_group
 
-    # ------------------------------------------------------------------
-    # Hemisphere wireframe — shows the (distance × elevation × azimuth)
-    # region around the board where the pose generator places camera
-    # candidates. Drawn in WORLD frame because hemisphere_camera_position()
-    # uses world Z-up regardless of board rotation. Centered on the board
-    # CENTRE (not the corner-anchored origin in _T_BOARD2BASE).
-    # ------------------------------------------------------------------
-    if _SHOW_HEMISPHERE_WIREFRAME:
-        _add_hemisphere_wireframe(scene_root, _board_center_world())
+
+def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
+    """Build a translucent box overlay matching the TABLET collision primitive.
+
+    Position, orientation, and dimensions match _build_collision_manager's
+    tablet exactly, so what you see in the GUI is what's being collision-
+    checked. Returns the group handle (``.delete()`` to remove), or None if
+    rendering is disabled. Driven by _TABLET_PRIMITIVE_ENABLED + _SHOW_TABLET_OVERLAY.
+    """
+    if not (_TABLET_PRIMITIVE_ENABLED and _SHOW_TABLET_OVERLAY):
+        return None
+
+    from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
+
+    t_w, t_l, t_h = _TABLET_DIMENSIONS_M
+    t_off_x, t_off_y = _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M
+
+    # Tablet centre in board-local frame, then push to world via _T_BOARD2BASE.
+    # Board pose is auto-lifted by t_h in _build_T_board2base, so placing the
+    # box centre at board-local z=-t_h/2 puts it between world z=0 (bench)
+    # and world z=+t_h (screen). Matches the collision primitive exactly.
+    tablet_centre_local = np.array(
+        [
+            _cfg.squares_x * _cfg.square_length / 2.0 + t_off_x,
+            _cfg.squares_y * _cfg.square_length / 2.0 + t_off_y,
+            -t_h / 2.0,
+            1.0,
+        ],
+        dtype=np.float64,
+    )
+    centre_world = (_T_BOARD2BASE @ tablet_centre_local)[:3]
+    rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("XYZ").tolist()
+
+    grp = scene_root.group().move(*centre_world.tolist()).with_name("calib:tablet")
+    if any(abs(a) > 1e-6 for a in rpy):
+        grp = grp.rotate(*rpy)
+    with grp:
+        # Translucent rusty-orange box — distinct from the gray board backing
+        # so it's easy to tell where the modelled tablet body extends past
+        # the printed ChArUco area.
+        ui.scene.box(t_w, t_l, t_h).material("#cc7733", opacity=0.30)
+
+    logger.info(
+        "tablet overlay: centre=%s, dims=%s, offset=%s",
+        np.round(centre_world, 3).tolist(),
+        _TABLET_DIMENSIONS_M,
+        _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M,
+    )
+    return grp
+
+
+def refresh_board_dependent_overlays() -> None:
+    """Rebuild the board, hemisphere wireframe, reachability dots, and
+    tablet visual.
+
+    Call this after ``_T_BOARD2BASE`` is mutated (e.g. by auto-localise) so
+    the visualisation reflects the new board pose. Frustum stays correct
+    automatically (it's parented to ``tcp_anchor``).
+
+    Safe to call from a background thread: it schedules the actual scene
+    surgery on the asyncio loop captured during ``add_overlays``. Returns
+    immediately; the redraw happens at the next event-loop tick.
+    """
+    scene_root = _state.get("scene_root")
+    png_url = _state.get("png_url")
+    loop = _state.get("main_loop")
+    if scene_root is None or png_url is None:
+        logger.warning("refresh_board_dependent_overlays: scene not initialised yet")
+        return
+
+    def _do_refresh() -> None:
+        for key in ("board_group", "hemisphere_group", "tablet_group"):
+            old = _state.get(key)
+            if old is not None:
+                try:
+                    old.delete()
+                except Exception:  # noqa: BLE001
+                    pass
+                _state[key] = None
+        _state["board_group"] = _build_board_overlay_group(scene_root, png_url)
+        _state["tablet_group"] = _build_tablet_overlay_group(scene_root)
+        if _SHOW_HEMISPHERE_WIREFRAME:
+            _add_hemisphere_wireframe(scene_root, _hemi_centre_world())
+
+    if loop is None:
+        # No event loop captured — caller is on the main thread.
+        _do_refresh()
+    else:
+        loop.call_soon_threadsafe(_do_refresh)
 
 
 def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]) -> None:
@@ -994,6 +1512,7 @@ def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]
     elevations = np.linspace(ev_min, ev_max, n_ev_segments + 1)
 
     grp = scene_root.group().move(*target_world.tolist()).with_name("calib:hemisphere")
+    _state["hemisphere_group"] = grp
 
     def offset(d: float, elev_deg: float, az_deg: float) -> tuple[float, float, float]:
         elev = np.radians(elev_deg)
@@ -1114,8 +1633,11 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
     cands, stats = gen.generate(max_count=n_d * n_ev * n_az)
 
     # Extract the camera position implied by each accepted candidate's flange
-    # pose (T_cam2base = T_flange2base @ T_cam2flange).
+    # pose (T_cam2base = T_flange2base @ T_cam2flange). Track the candidate
+    # alongside its camera position so the board-localise sweep can reuse the
+    # joint angles directly (skips a redundant pose-generation pass).
     reachable_cam_world: list[NDArray[np.float64]] = []
+    reachable_candidates: list = []
     for c in cands:
         T_cam2base = cold_start.cam_pose_for_flange_pose(np.asarray(c.flange_pose))
         cam_pos = T_cam2base[:3, 3]
@@ -1124,6 +1646,7 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         if not bool(envelope_contains(np.asarray(c.flange_pose)[:3, 3])[0]):
             continue
         reachable_cam_world.append(cam_pos)
+        reachable_candidates.append(c)
 
     logger.info(
         "reachability sampling: %d reachable (considered=%d, IK fails=%d, "
@@ -1141,16 +1664,31 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
     # spread across the reachable region instead of clustered along grid
     # lines. Approximates Poisson-disc sampling without an explicit minimum-
     # distance threshold — instead we pick a target count and let the
-    # algorithm maximise minimum pairwise distance for that count.
-    points_to_render = reachable_cam_world
-    if _REACHABILITY_KEEP_COUNT is not None and len(points_to_render) > _REACHABILITY_KEEP_COUNT:
-        points_to_render = _greedy_farthest_first(
-            points_to_render, _REACHABILITY_KEEP_COUNT
+    # algorithm maximise minimum pairwise distance for that count. Run on the
+    # candidate list (key=cam_pos) so the surviving CANDIDATES stay in lockstep
+    # with the surviving points.
+    selected_candidates = reachable_candidates
+    if (
+        _REACHABILITY_KEEP_COUNT is not None
+        and len(reachable_candidates) > _REACHABILITY_KEEP_COUNT
+    ):
+        # Build (point, candidate) tuples for thinning, then unzip.
+        paired = list(zip(reachable_cam_world, reachable_candidates))
+        paired = _greedy_farthest_first(
+            paired, _REACHABILITY_KEEP_COUNT, key=lambda p: p[0],
         )
+        points_to_render = [p[0] for p in paired]
+        selected_candidates = [p[1] for p in paired]
         logger.info(
             "farthest-first thinning: %d -> %d points",
             len(reachable_cam_world), len(points_to_render),
         )
+    else:
+        points_to_render = reachable_cam_world
+
+    # Cache the selected candidates so the board-localise thread can reuse
+    # their joint angles as scan poses.
+    _state["reachable_candidates"] = selected_candidates
 
     # Render points as small green spheres, in scene_group's local frame
     # (which is already translated to target_world).
@@ -1252,24 +1790,38 @@ def _calibration_thread() -> None:
             _flange_pose_from_client,
         )
 
-        # Ground truth = cold-start tunable + a small fixed perturbation, so
-        # the simulated calibration always has something realistic to converge
-        # to regardless of how the user sets _CAM_MOUNT_TRANSLATE_MM. The
-        # perturbation is small (±2 mm, ±2°) so convergence is reliable.
-        ground_truth_mount = CameraMount.from_eyeball_estimate(
-            x_mm=_CAM_MOUNT_TRANSLATE_MM[0] + 2.0,
-            y_mm=_CAM_MOUNT_TRANSLATE_MM[1] + 2.0,
-            z_mm=_CAM_MOUNT_TRANSLATE_MM[2] - 2.0,
-            tilt_x_deg=_CAM_MOUNT_TILT_DEG[0] + 2.0,
-            tilt_y_deg=_CAM_MOUNT_TILT_DEG[1] - 1.0,
-            tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
-        )
+        # Mode dispatch: piggyback off Waldo-Commander's existing real/sim
+        # toggle (the orange-when-sim "robot" button at the top of the page).
+        # robot_state.simulator_active=True means the user is in simulator
+        # mode → use VirtualCamera; False means real-hardware mode → use
+        # RealSenseCamera. Default to sim if the import fails (defensive).
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+            is_sim_mode = bool(robot_state.simulator_active)
+        except Exception:  # noqa: BLE001
+            is_sim_mode = True
+
         T_BOARD2BASE = _T_BOARD2BASE
-        intrinsics = Intrinsics(
-            fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
-            width=_INTR_W, height=_INTR_H,
-            dist_coeffs=np.zeros(5, dtype=np.float64),
-        )
+        if is_sim_mode:
+            # Sim ground truth: cold-start tunable + small fixed perturbation
+            # (±2 mm / ±2°) so the simulated calibration always has something
+            # realistic to converge to.
+            ground_truth_mount = CameraMount.from_eyeball_estimate(
+                x_mm=_CAM_MOUNT_TRANSLATE_MM[0] + 2.0,
+                y_mm=_CAM_MOUNT_TRANSLATE_MM[1] + 2.0,
+                z_mm=_CAM_MOUNT_TRANSLATE_MM[2] - 2.0,
+                tilt_x_deg=_CAM_MOUNT_TILT_DEG[0] + 2.0,
+                tilt_y_deg=_CAM_MOUNT_TILT_DEG[1] - 1.0,
+                tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+            )
+            intrinsics = Intrinsics(
+                fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
+                width=_INTR_W, height=_INTR_H,
+                dist_coeffs=np.zeros(5, dtype=np.float64),
+            )
+        else:
+            ground_truth_mount = None  # not used in real mode
+            intrinsics = None  # set below from the actual RealSense device
 
         robot = Robot()
 
@@ -1304,15 +1856,35 @@ def _calibration_thread() -> None:
         def flange_pose():
             return _flange_pose_from_client(client)
 
-        virtual_camera = VirtualCamera(
-            intrinsics=intrinsics,
-            image_width=_INTR_W,
-            image_height=_INTR_H,
-            ground_truth_mount=ground_truth_mount,
-            flange_pose_provider=flange_pose,
-            board=VirtualBoard(config=BOARD_TABLET_30MM, T_board2base=T_BOARD2BASE),
-            noise_std=0.0,
-        )
+        if is_sim_mode:
+            camera: Any = VirtualCamera(
+                intrinsics=intrinsics,
+                image_width=_INTR_W,
+                image_height=_INTR_H,
+                ground_truth_mount=ground_truth_mount,
+                flange_pose_provider=flange_pose,
+                board=VirtualBoard(config=BOARD_TABLET_30MM, T_board2base=T_BOARD2BASE),
+                noise_std=0.0,
+            )
+            logger.info("calibration camera: VirtualCamera (simulator mode)")
+        else:
+            from parol6_vision.camera.realsense import RealSenseCamera  # noqa: PLC0415
+            camera = RealSenseCamera(
+                width=_INTR_W,
+                height=_INTR_H,
+                fps=30,
+                enable_depth=False,  # calibration only needs color frames
+                enable_color=True,
+            )
+            camera.start()
+            intrinsics = camera.intrinsics
+            _state["real_camera"] = camera  # for finally cleanup on STOP / crash
+            logger.info(
+                "calibration camera: RealSenseCamera (real-hardware mode), "
+                "intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f, dist=%s",
+                intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
+                intrinsics.dist_coeffs.tolist(),
+            )
         detector = BoardDetector(BOARD_TABLET_30MM)
         cold_start = CameraMount.from_eyeball_estimate(
             x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
@@ -1323,11 +1895,11 @@ def _calibration_thread() -> None:
             tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
         )
 
-        # The hemisphere + pose generator must aim at the board CENTER, not
-        # the board origin (corner) stored in T_BOARD2BASE[:3, 3]. The viz
-        # uses the same center via _board_center_world() so what's drawn in
-        # the GUI matches what the calibration math actually targets.
-        target_world = _board_center_world()
+        # Hemisphere CENTRE — also the calibration's look-at target. Uses the
+        # hemisphere override if set (decouples from board rotation), else
+        # falls back to the board centre. With no override (sim default), this
+        # is the board's geometric centre as before.
+        target_world = _hemi_centre_world()
 
         # Diagnostic: confirm the board CENTER is reachable per waldo-commander's
         # workspace hull. If not, the orchestrator will struggle to find any
@@ -1363,9 +1935,12 @@ def _calibration_thread() -> None:
         TCP_OFFSET_FLANGE = np.array([0.0, 0.0, -0.105, 1.0])  # SSG-48 TCP point in flange frame
 
         # Build collision manager + occlusion meshes once (loads 7 link meshes
-        # + gripper for collision; 7 link meshes for occlusion).
+        # + gripper for collision; 7 link meshes for occlusion). The tablet
+        # primitive is placed at the current _T_BOARD2BASE so the robot won't
+        # drive into the physical ChArUco display.
         collision_mgr_pair = (
-            _build_collision_manager() if _ENABLE_SELF_COLLISION_CHECK else None
+            _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
+            if _ENABLE_SELF_COLLISION_CHECK else None
         )
         occlusion_meshes = (
             _build_occlusion_mesh() if _ENABLE_SELF_COLLISION_CHECK else None
@@ -1376,7 +1951,43 @@ def _calibration_thread() -> None:
                 max_count = kwargs.get("max_count", args[0] if args else 8)
                 # Over-request so we have a pool to thin from.
                 kwargs["max_count"] = max_count * 5
-                cands, stats = super().generate(**kwargs)  # type: ignore[arg-type]
+
+                # Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
+                # When _BOARD_TARGET_OFFSETS_LOCAL has more than one entry,
+                # run super().generate() once per board-local target offset
+                # and merge candidate lists. The hemisphere CENTRE stays
+                # anchored on self.target_world (board centre); only the
+                # look-at direction changes, via the look_at_target_override
+                # picked up by the patched pose_generator.look_at_pose.
+                if len(_BOARD_TARGET_OFFSETS_LOCAL) > 1:
+                    cfg = BOARD_TABLET_30MM
+                    w_m_b = cfg.squares_x * cfg.square_length
+                    h_m_b = cfg.squares_y * cfg.square_length
+                    all_cands: list = []
+                    last_stats = None
+                    try:
+                        for offset_u, offset_v in _BOARD_TARGET_OFFSETS_LOCAL:
+                            target_local = np.array(
+                                [offset_u * w_m_b, offset_v * h_m_b, 0.0, 1.0],
+                                dtype=np.float64,
+                            )
+                            _state["look_at_target_override"] = (
+                                _T_BOARD2BASE @ target_local
+                            )[:3]
+                            cands_pass, stats_pass = super().generate(**kwargs)  # type: ignore[arg-type]
+                            all_cands.extend(cands_pass)
+                            last_stats = stats_pass
+                    finally:
+                        _state["look_at_target_override"] = None
+                    cands = all_cands
+                    stats = last_stats
+                    logger.info(
+                        "multi-target look-at: %d targets, %d raw candidates "
+                        "(pre-filter)",
+                        len(_BOARD_TARGET_OFFSETS_LOCAL), len(cands),
+                    )
+                else:
+                    cands, stats = super().generate(**kwargs)  # type: ignore[arg-type]
 
                 # 1. Hull filter.
                 if _state.get("envelope_planes_A") is not None:
@@ -1421,27 +2032,80 @@ def _calibration_thread() -> None:
                             pre - len(cands), pre,
                         )
 
-                # 4. Camera-occlusion filter — line of sight from the camera
-                # to the board centre must not pass through any robot link.
+                # 4. Camera-occlusion filter — multi-ray sampling across the
+                # board face. Cast a ray from the camera position to each of
+                # _OCCLUSION_BOARD_SAMPLES_LOCAL (default centre + 4 corners,
+                # in board-local UV ∈ [0, 1]²). If MORE than
+                # _OCCLUSION_MAX_BLOCKED rays hit a robot link before reaching
+                # the target, reject the pose. Catches partial-frame occlusion
+                # (e.g. arm body blocks the side of the FOV but not the centre).
                 if occlusion_meshes is not None:
                     cold_T = self.mount.T_cam2flange
+                    cfg = BOARD_TABLET_30MM
+                    w_m_b = cfg.squares_x * cfg.square_length
+                    h_m_b = cfg.squares_y * cfg.square_length
+                    sample_world = [
+                        (
+                            _T_BOARD2BASE
+                            @ np.array([u * w_m_b, v * h_m_b, 0.0, 1.0],
+                                       dtype=np.float64)
+                        )[:3]
+                        for u, v in _OCCLUSION_BOARD_SAMPLES_LOCAL
+                    ]
                     pre = len(cands)
                     survivors = []
                     for c in cands:
                         T_flange2base = np.asarray(c.flange_pose, dtype=np.float64)
                         T_cam2base = T_flange2base @ cold_T
                         cam_pos_world = T_cam2base[:3, 3]
-                        if not _camera_occluded(
+                        n_blocked = _camera_occlusion_count(
                             occlusion_meshes, c.joint_angles_rad,
-                            cam_pos_world, np.asarray(self.target_world),
-                        ):
+                            cam_pos_world, sample_world,
+                            early_termination_after=_OCCLUSION_MAX_BLOCKED,
+                        )
+                        if n_blocked <= _OCCLUSION_MAX_BLOCKED:
                             survivors.append(c)
                     cands = survivors
                     if pre - len(cands) > 0:
                         logger.info(
                             "occlusion filter: %d/%d candidates rejected "
-                            "(robot body blocks camera view of board)",
+                            "(>%d/%d sample rays blocked by robot body)",
                             pre - len(cands), pre,
+                            _OCCLUSION_MAX_BLOCKED,
+                            len(_OCCLUSION_BOARD_SAMPLES_LOCAL),
+                        )
+
+                # 4.5. Viewing-angle filter — reject candidates whose camera
+                # optical axis is more than _MAX_CAM_BOARD_ANGLE_DEG off the
+                # board surface normal. At extreme angles the board projects
+                # as a thin sliver, ChArUco corner detection works but reproj
+                # error is high and the calibration's effective resolution
+                # drops. Threshold defaults to 65° — admits the bottom of the
+                # configured 25°-elevation hemisphere, rejects anything worse.
+                if _MAX_CAM_BOARD_ANGLE_DEG < 90.0:
+                    cold_T = self.mount.T_cam2flange
+                    board_z_world = _T_BOARD2BASE[:3, 2]
+                    cos_threshold = float(
+                        np.cos(np.radians(_MAX_CAM_BOARD_ANGLE_DEG))
+                    )
+                    pre = len(cands)
+                    survivors = []
+                    for c in cands:
+                        T_flange2base = np.asarray(c.flange_pose, dtype=np.float64)
+                        T_cam2base = T_flange2base @ cold_T
+                        cam_z_world = T_cam2base[:3, 2]
+                        # Use abs() — board normal could point either way
+                        # depending on board placement; we care about the
+                        # angle, not the orientation.
+                        if abs(float(cam_z_world @ board_z_world)) >= cos_threshold:
+                            survivors.append(c)
+                    cands = survivors
+                    if pre - len(cands) > 0:
+                        logger.info(
+                            "viewing-angle filter: %d/%d rejected "
+                            "(camera axis > %.0f° off board normal)",
+                            pre - len(cands), pre,
+                            _MAX_CAM_BOARD_ANGLE_DEG,
                         )
 
                 # 5. Farthest-first thinning on flange positions.
@@ -1490,33 +2154,36 @@ def _calibration_thread() -> None:
         _state["orig_pose_generator"] = _orch_mod.PoseGenerator
         _orch_mod.PoseGenerator = HullFilteredPoseGenerator
 
-        # Monkey-patch `board_position_from_sample` to return the BOARD CENTER
-        # rather than the BOARD ORIGIN (corner). The orchestrator uses the
-        # bootstrap result as the look-at target for the main hemisphere pass;
-        # without this fix the camera ends up aimed at one corner of the
-        # board, not the geometric centre, so off-axis poses see a heavily
-        # cropped view (or miss the board entirely).
-        import parol6_vision.calibration.refinement as _refinement_mod  # noqa: PLC0415
-        from parol6_vision.calibration.board import board_pose_to_matrix as _board_pose_to_matrix  # noqa: PLC0415
-        _state["orig_board_position_from_sample"] = _refinement_mod.board_position_from_sample
-        _bcfg = BOARD_TABLET_30MM
-        _board_center_offset_local = np.array(
-            [_bcfg.squares_x * _bcfg.square_length / 2.0,
-             _bcfg.squares_y * _bcfg.square_length / 2.0,
-             0.0, 1.0]
-        )
+        # Multi-target relaxed look-at infrastructure — DEFERRED_FEATURES.md §6.
+        # Wrap pose_generator.look_at_pose so it consults
+        # _state["look_at_target_override"]. When the override is None
+        # (default) we forward verbatim, so single-centre mode is unaffected.
+        # When set, the override REPLACES the target_world arg, leaving
+        # self.target_world untouched (so hemisphere_camera_position keeps
+        # its original board-centre anchoring).
+        import parol6_vision.calibration.pose_generator as _pg_mod  # noqa: PLC0415
+        _orig_look_at = _pg_mod.look_at_pose
+        _state["orig_look_at_pose"] = _orig_look_at
 
-        def _board_center_from_sample(T_flange2base, detection, mount):
-            """Return the board CENTER (not the origin/corner) in base frame."""
-            T_board2cam = _board_pose_to_matrix(detection)
-            T_board2base = (
-                np.asarray(T_flange2base, dtype=np.float64)
-                @ mount.T_cam2flange
-                @ T_board2cam
-            )
-            return (T_board2base @ _board_center_offset_local)[:3]
+        def _multi_target_look_at_pose(
+            camera_position_world,
+            target_world,
+            world_up=np.array([0.0, 0.0, 1.0]),
+        ):
+            override = _state.get("look_at_target_override")
+            effective_target = override if override is not None else target_world
+            return _orig_look_at(camera_position_world, effective_target, world_up)
 
-        _refinement_mod.board_position_from_sample = _board_center_from_sample
+        _pg_mod.look_at_pose = _multi_target_look_at_pose
+
+        # NB: prior to 2026-05-05 we monkey-patched
+        # ``parol6_vision.calibration.refinement.board_position_from_sample``
+        # here to return the board CENTRE instead of the corner-anchored
+        # origin. The upstream now takes a ``board: BoardConfig`` kwarg and
+        # the orchestrator passes it explicitly, so the patch is no longer
+        # needed. Two monkey-patches remain (PoseGenerator class swap +
+        # look_at_pose); both have outstanding upstream proposals — see
+        # parol6-vision Docs/DEFERRED_FEATURES.md.
 
         # Hemisphere params for the bootstrap pass and the main pass.
         #
@@ -1585,7 +2252,7 @@ def _calibration_thread() -> None:
 
         orchestrator = CalibrationOrchestrator(
             robot=robot, client=client,
-            camera=virtual_camera, detector=detector,
+            camera=camera, detector=detector,
             cold_start_mount=cold_start, config=config,
         )
 
@@ -1626,15 +2293,345 @@ def _calibration_thread() -> None:
             except Exception:  # noqa: BLE001
                 pass
             _state["orig_pose_generator"] = None
-        # Restore the board-position function if we patched it.
-        if _state.get("orig_board_position_from_sample") is not None:
+        # Restore look_at_pose if we patched it.
+        if _state.get("orig_look_at_pose") is not None:
             try:
-                import parol6_vision.calibration.refinement as _refinement_mod  # noqa: PLC0415
-                _refinement_mod.board_position_from_sample = _state["orig_board_position_from_sample"]
+                import parol6_vision.calibration.pose_generator as _pg_mod  # noqa: PLC0415
+                _pg_mod.look_at_pose = _state["orig_look_at_pose"]
             except Exception:  # noqa: BLE001
                 pass
-            _state["orig_board_position_from_sample"] = None
+            _state["orig_look_at_pose"] = None
+        # Clear any lingering target override (defensive — should be None
+        # already after the multi-target loop's own finally clause).
+        _state["look_at_target_override"] = None
+        # Stop the RealSenseCamera if we started one in real-hardware mode.
+        real_cam = _state.get("real_camera")
+        if real_cam is not None:
+            try:
+                real_cam.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RealSenseCamera stop failed: %s", e)
+            _state["real_camera"] = None
         _state["is_running"] = False
+
+
+def _localise_board_thread() -> None:
+    """Workspace scan that auto-locates the ChArUco board's centre in base frame.
+
+    DEFERRED_FEATURES.md §3 (board auto-localisation). Drives the robot
+    through a coarse XY grid of workspace points (`_LOCALISE_SCAN_TARGETS_M`),
+    each pose looking down at one point from `_LOCALISE_SCAN_DISTANCE_M`
+    above, captures a frame at each, runs ChArUco detection. Successful
+    detections (typically 1-2 of N scan poses, depending on where the board
+    actually sits) are median-filtered and used to update `_T_BOARD2BASE` in
+    place (translation only — rotation stays at the configured
+    `_BOARD_RPY_RAD`). The board, hemisphere wireframe, and reachability
+    dots all refresh to match.
+
+    The board can be ANYWHERE in the robot's reachable workspace — the
+    scan grid is defined relative to the robot base, NOT to the configured
+    board location, so it works whether or not the user's existing
+    `_BOARD_TRANSLATE_M` matches reality.
+
+    This is a sim-mode runner — uses `VirtualCamera` with the same
+    perturbation scheme as `_calibration_thread`. On hardware, swap to
+    `RealSenseCamera`.
+    """
+    try:
+        from parol6 import Robot, RobotClient  # noqa: PLC0415
+
+        from parol6_vision.calibration.board import (  # noqa: PLC0415
+            BOARD_TABLET_30MM,
+            BoardDetector,
+            board_pose_to_matrix,
+        )
+        from parol6_vision.calibration.camera_mount import CameraMount  # noqa: PLC0415
+        from parol6_vision.calibration.pose_generator import (  # noqa: PLC0415
+            HemisphereParams,
+            PoseGenerator,
+        )
+        from parol6_vision.camera.intrinsics import Intrinsics  # noqa: PLC0415
+        from parol6_vision.sim.tracing_client import (  # noqa: PLC0415
+            _flange_pose_from_client,
+        )
+        from parol6_vision.sim.virtual_camera import (  # noqa: PLC0415
+            VirtualBoard,
+            VirtualCamera,
+        )
+
+        # Build the workspace scan poses fresh each time the button is
+        # pressed. Each scan target gets a single overhead pose generated
+        # by the standard PoseGenerator (one distance, one elevation, one
+        # azimuth — the azimuth is irrelevant at near-overhead elevations).
+        # The board can be ANYWHERE in the workspace; we don't depend on
+        # the user's `_BOARD_TRANSLATE_M` being accurate.
+        scan_z = _BOARD_TRANSLATE_M[2]
+        if _TABLET_PRIMITIVE_ENABLED:
+            scan_z += _TABLET_DIMENSIONS_M[2]
+
+        cold_start = CameraMount.from_eyeball_estimate(
+            x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
+            y_mm=_CAM_MOUNT_TRANSLATE_MM[1],
+            z_mm=_CAM_MOUNT_TRANSLATE_MM[2],
+            tilt_x_deg=_CAM_MOUNT_TILT_DEG[0],
+            tilt_y_deg=_CAM_MOUNT_TILT_DEG[1],
+            tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+        )
+        scan_robot = Robot()
+        candidates: list = []
+        for tx, ty in _LOCALISE_SCAN_TARGETS_M:
+            target_world = np.array([tx, ty, scan_z], dtype=np.float64)
+            params = HemisphereParams(
+                distances_m=(_LOCALISE_SCAN_DISTANCE_M,),
+                elevations_deg=(_LOCALISE_SCAN_ELEVATION_DEG,),
+                azimuth_counts=(1,),
+                # Azimuth=0 (looking from +X side) is fine since elevation
+                # is near-overhead — the camera position barely depends on
+                # azimuth when ev is close to 90°.
+                azimuth_range_deg=(0.0, 0.0),
+                workspace_xy_max_m=0.55,
+                max_joint_change_deg=180.0,
+            )
+            gen = PoseGenerator(
+                robot=scan_robot,
+                mount=cold_start,
+                target_world=target_world,
+                params=params,
+            )
+            pose_cands, _ = gen.generate(max_count=1)
+            if pose_cands:
+                candidates.append(pose_cands[0])
+            else:
+                logger.info(
+                    "localise scan target (%.2f, %.2f) — IK failed, skipping",
+                    tx, ty,
+                )
+
+        if not candidates:
+            _post_status(
+                f"Localise: 0 reachable scan poses out of "
+                f"{len(_LOCALISE_SCAN_TARGETS_M)} targets. Check that "
+                f"_LOCALISE_SCAN_TARGETS_M lies within PAROL6's workspace."
+            )
+            return
+        logger.info(
+            "localise: %d/%d scan poses generated",
+            len(candidates), len(_LOCALISE_SCAN_TARGETS_M),
+        )
+
+        # Mode dispatch: same as _calibration_thread — pick VirtualCamera vs
+        # RealSenseCamera based on Waldo-Commander's robot-mode toggle.
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+            is_sim_mode = bool(robot_state.simulator_active)
+        except Exception:  # noqa: BLE001
+            is_sim_mode = True
+
+        raw_client = RobotClient(host="127.0.0.1", port=5001)
+        _state["client"] = raw_client
+
+        def flange_pose_provider():
+            return _flange_pose_from_client(raw_client)
+
+        if is_sim_mode:
+            intrinsics = Intrinsics(
+                fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
+                width=_INTR_W, height=_INTR_H,
+                dist_coeffs=np.zeros(5, dtype=np.float64),
+            )
+            # Sim ground truth: same perturbation scheme as _calibration_thread.
+            ground_truth_mount = CameraMount.from_eyeball_estimate(
+                x_mm=_CAM_MOUNT_TRANSLATE_MM[0] + 2.0,
+                y_mm=_CAM_MOUNT_TRANSLATE_MM[1] + 2.0,
+                z_mm=_CAM_MOUNT_TRANSLATE_MM[2] - 2.0,
+                tilt_x_deg=_CAM_MOUNT_TILT_DEG[0] + 2.0,
+                tilt_y_deg=_CAM_MOUNT_TILT_DEG[1] - 1.0,
+                tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+            )
+            # The VirtualBoard sees the CURRENT _T_BOARD2BASE as ground truth.
+            camera: Any = VirtualCamera(
+                intrinsics=intrinsics,
+                image_width=_INTR_W,
+                image_height=_INTR_H,
+                ground_truth_mount=ground_truth_mount,
+                flange_pose_provider=flange_pose_provider,
+                board=VirtualBoard(config=BOARD_TABLET_30MM, T_board2base=_T_BOARD2BASE),
+                noise_std=0.0,
+            )
+            logger.info("localise camera: VirtualCamera (simulator mode)")
+        else:
+            from parol6_vision.camera.realsense import RealSenseCamera  # noqa: PLC0415
+            camera = RealSenseCamera(
+                width=_INTR_W,
+                height=_INTR_H,
+                fps=30,
+                enable_depth=False,
+                enable_color=True,
+            )
+            camera.start()
+            intrinsics = camera.intrinsics
+            _state["real_camera"] = camera
+            logger.info(
+                "localise camera: RealSenseCamera (real-hardware mode), "
+                "intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
+            )
+        detector = BoardDetector(BOARD_TABLET_30MM)
+
+        cfg = BOARD_TABLET_30MM
+        center_local = np.array(
+            [cfg.squares_x * cfg.square_length / 2.0,
+             cfg.squares_y * cfg.square_length / 2.0,
+             0.0, 1.0],
+            dtype=np.float64,
+        )
+
+        K = intrinsics.as_camera_matrix()
+        D = intrinsics.dist_coeffs
+
+        # Per-detection: keep the full T_board2base SE(3) so we can recover
+        # the board's rotation, not just its centre point. This handles
+        # tablets that aren't perfectly aligned with the configured
+        # _BOARD_RPY_RAD (real-life setups will be slightly tilted / yawed
+        # from "perfectly square" no matter how careful the placement).
+        detected_centres: list[NDArray[np.float64]] = []
+        detected_poses: list[NDArray[np.float64]] = []
+        detected_qualities: list[int] = []  # corner count, for picking best rotation
+        for i, c in enumerate(candidates):
+            if _state.get("stop_requested"):
+                _post_status("Localise stopped by user")
+                return
+            joint_deg = tuple(np.degrees(c.joint_angles_rad).tolist())
+            _post_status(f"Localise: scan {i + 1}/{len(candidates)} — moving")
+            try:
+                # speed/accel match the orchestrator's defaults
+                # (OrchestratorConfig.move_speed=0.3, move_accel=0.5). The
+                # protocol default speed=0.0 causes the parol6-server to
+                # reject the request with "MOVEJ requires either duration > 0
+                # or speed > 0".
+                rc = raw_client.move_j(
+                    angles=list(joint_deg),
+                    speed=0.3,
+                    accel=0.5,
+                    wait=True,
+                    timeout=15.0,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning("localise scan %d move_j failed: %s", i, e)
+                continue
+            # parol6's move_j convention: rc < 0 = failure, rc >= 0 = success.
+            # Mirrors orchestrator._move_to_joints (parol6_vision/calibration/
+            # orchestrator.py:593).
+            if rc < 0:
+                logger.info("localise scan %d returned rc=%d; skipping", i, rc)
+                continue
+            time.sleep(0.2)  # let the camera frame stabilise after motion
+            frame = camera.capture_color()
+            detection = detector.detect(frame, K, D)
+            if detection is None:
+                logger.info("localise scan %d: no board detected", i)
+                continue
+            T_board2cam = board_pose_to_matrix(detection)
+            T_flange2base = _flange_pose_from_client(raw_client)
+            if T_flange2base is None:
+                continue
+            T_board2base_obs = T_flange2base @ cold_start.T_cam2flange @ T_board2cam
+            board_centre_obs = (T_board2base_obs @ center_local)[:3]
+            detected_centres.append(board_centre_obs)
+            detected_poses.append(T_board2base_obs)
+            detected_qualities.append(int(detection.num_corners_detected))
+            _post_status(
+                f"Localise: {len(detected_centres)} detection"
+                f"{'s' if len(detected_centres) != 1 else ''} so far ({i + 1} attempted)"
+            )
+
+        if len(detected_centres) < _LOCALISE_MIN_DETECTIONS:
+            _post_status(
+                f"Localise FAILED: only {len(detected_centres)} detections "
+                f"out of {len(candidates)} scan poses (need "
+                f"≥{_LOCALISE_MIN_DETECTIONS}). Board may be outside the "
+                f"workspace scan region — check _LOCALISE_SCAN_TARGETS_M."
+            )
+            return
+
+        # Median-then-inlier-mean on CENTRES: robust to a single outlier
+        # without needing full RANSAC. Mirrors the orchestrator's own
+        # bootstrap consensus (parol6_vision.calibration.refinement.board_position_ransac).
+        det_arr = np.asarray(detected_centres, dtype=np.float64)
+        median = np.median(det_arr, axis=0)
+        residuals = np.linalg.norm(det_arr - median, axis=1)
+        inlier_mask = residuals < _LOCALISE_INLIER_THRESHOLD_M
+        n_inliers = int(inlier_mask.sum())
+        if n_inliers < _LOCALISE_MIN_DETECTIONS:
+            _post_status(
+                f"Localise FAILED: {n_inliers} inliers within "
+                f"{_LOCALISE_INLIER_THRESHOLD_M * 1000:.0f} mm of median "
+                f"(need ≥{_LOCALISE_MIN_DETECTIONS}). "
+                "Detections too inconsistent — try repositioning the board."
+            )
+            return
+
+        new_centre = det_arr[inlier_mask].mean(axis=0)
+
+        # Pick rotation from the BEST inlier (most ChArUco corners detected
+        # → most stable solvePnP). Averaging rotations across noisy detections
+        # is fiddly (rotations don't average linearly); using the single
+        # best-quality detection's rotation is robust and simple. With
+        # workspace-scan elevations near 90°, the camera-to-board angle is
+        # nearly normal so solvePnP rotation accuracy is good.
+        inlier_indices = np.where(inlier_mask)[0]
+        best_inlier_idx = int(max(inlier_indices, key=lambda j: detected_qualities[j]))
+        R_detected = np.asarray(detected_poses[best_inlier_idx], dtype=np.float64)[:3, :3]
+
+        # Mutate _T_BOARD2BASE in place (rotation + translation) so existing
+        # closure references see the update. Translation: re-compute the
+        # corner-anchored origin from the inlier-mean centre using the NEWLY
+        # DETECTED rotation, not the old configured rotation.
+        old_origin = _T_BOARD2BASE[:3, 3].copy()
+        center_offset_world = R_detected @ center_local[:3]
+        new_origin = new_centre - center_offset_world
+        _T_BOARD2BASE[:3, :3] = R_detected
+        _T_BOARD2BASE[:3, 3] = new_origin
+
+        delta_mm = float(np.linalg.norm(new_origin - old_origin)) * 1000.0
+        # Approximate rotation delta via Frobenius norm of (R_detected - R_old).
+        # Quick-and-dirty: ‖R_a − R_b‖_F ≈ 2√2 sin(θ/2) for small angles.
+        R_old = _build_T_board2base()[:3, :3]  # configured rotation (re-derive)
+        rot_frob = float(np.linalg.norm(R_detected - R_old, ord="fro"))
+        rot_delta_deg = float(np.degrees(2.0 * np.arcsin(min(1.0, rot_frob / (2.0 * np.sqrt(2))))))
+        _post_status(
+            f"Localise OK: {n_inliers}/{len(detected_centres)} inliers, "
+            f"centre ({new_centre[0]:.3f}, {new_centre[1]:.3f}, "
+            f"{new_centre[2]:.3f}) m, shift {delta_mm:.1f} mm / {rot_delta_deg:.1f}°"
+        )
+
+        # Invalidate the cached collision manager used by
+        # validate_joint_trajectory — the tablet primitive embedded in it
+        # references the OLD board pose. Next call rebuilds with the new pose.
+        _state["trajectory_collision_mgr_pair"] = None
+
+        # Refresh visual overlays so board, hemisphere, and reachability dots
+        # all reflect the new pose. Schedules on the asyncio loop.
+        refresh_board_dependent_overlays()
+
+    except Exception as e:  # noqa: BLE001
+        if _state.get("stop_requested"):
+            logger.info("Localise stopped by user (caught %s: %s)",
+                        type(e).__name__, e)
+            _post_status("Localise stopped by user")
+        else:
+            logger.exception("Localise thread crashed")
+            _post_status(f"Localise ERROR: {e}")
+    finally:
+        # Stop the RealSenseCamera if we started one in real-hardware mode.
+        real_cam = _state.get("real_camera")
+        if real_cam is not None:
+            try:
+                real_cam.stop()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("RealSenseCamera stop failed: %s", e)
+            _state["real_camera"] = None
+        _state["is_localising"] = False
 
 
 def _post_status(text: str) -> None:
@@ -1680,13 +2677,27 @@ def add_control_panel() -> None:
     Call this from inside the page context after the scene is built.
     """
 
-    def _on_click() -> None:
+    def _busy_warn(msg: str) -> bool:
+        """Reject button press if either the calibration or the localise thread
+        is already running. Returns True if a warning was issued."""
         if _state.get("is_running"):
             ui.notify(
-                "Calibration is already running — wait for it to finish",
+                f"{msg}: calibration already running — wait for it to finish",
                 color="warning",
                 position="top",
             )
+            return True
+        if _state.get("is_localising"):
+            ui.notify(
+                f"{msg}: board localise already running — wait for it to finish",
+                color="warning",
+                position="top",
+            )
+            return True
+        return False
+
+    def _on_click() -> None:
+        if _busy_warn("Run"):
             return
         _state["is_running"] = True
         _state["stop_requested"] = False
@@ -1694,8 +2705,17 @@ def add_control_panel() -> None:
         _post_status("Running calibration via parol6-server...")
         threading.Thread(target=_calibration_thread, daemon=True).start()
 
+    def _on_localise() -> None:
+        """Drive a small lookout sweep + auto-locate the board centre."""
+        if _busy_warn("Localise"):
+            return
+        _state["is_localising"] = True
+        _state["stop_requested"] = False
+        _post_status("Localising board — driving lookout sweep...")
+        threading.Thread(target=_localise_board_thread, daemon=True).start()
+
     def _on_stop() -> None:
-        """Abort the running calibration: halt the controller + flag the thread.
+        """Abort the running calibration OR localise: halt + flag the thread.
 
         ``RobotClient.halt()`` is a sync UDP call that refuses to run inside
         an active asyncio event loop. The NiceGUI callback runs in the main
@@ -1703,10 +2723,10 @@ def add_control_panel() -> None:
         ``RobotClient was used while an event loop is running``. Workaround:
         dispatch halt() to a daemon thread which has no event loop attached.
         The flag (_state["stop_requested"]) is set immediately so subsequent
-        move_j calls in the calibration thread short-circuit even if the
+        move_j calls in the running thread short-circuit even if the
         thread-dispatched halt hasn't fired yet.
         """
-        if not _state.get("is_running"):
+        if not (_state.get("is_running") or _state.get("is_localising")):
             return
         _state["stop_requested"] = True
         client = _state.get("client")
@@ -1717,7 +2737,7 @@ def add_control_panel() -> None:
                 except Exception as e:  # noqa: BLE001
                     logger.warning("halt() in worker thread failed: %s", e)
             threading.Thread(target=_halt_in_thread, daemon=True).start()
-            ui.notify("Calibration HALTED — robot motion stopped", color="warning")
+            ui.notify("HALTED — robot motion stopped", color="warning")
         _post_status("Stop requested — wait for current move to finish")
 
     with ui.element("div").style(
@@ -1730,6 +2750,9 @@ def add_control_panel() -> None:
         _state["status_label"] = ui.label("Idle.").classes("text-xs opacity-80")
         with ui.row().classes("gap-1"):
             ui.button("Run", on_click=_on_click, color="primary").props("size=sm")
+            ui.button(
+                "Localise Board", on_click=_on_localise, color="secondary",
+            ).props("size=sm")
             ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
 
     # 4 Hz tick to apply the calibrated mount once calibration finishes.
