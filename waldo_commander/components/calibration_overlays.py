@@ -113,13 +113,16 @@ _BOARD_RPY_RAD: tuple[float, float, float] = (0.0, 0.0, np.deg2rad(90))
 #            hemisphere covers ±60° around that base→board ray.
 # Set _SHOW_HEMISPHERE_WIREFRAME=False to hide the visualisation.
 _SHOW_HEMISPHERE_WIREFRAME: bool = True
-_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.22, 0.35)  # (min, max) radial distance
-# 25° → 90°. ev_min=25° avoids heavily-foreshortened low-angle poses where
-# the ChArUco detector struggles to find ≥6 corners; ev_max=90° closes the
-# dome at the top. Earlier we tried (10, 90) but the orchestrator generated
-# 24 candidates and got 0 useful samples — too many extreme poses where
-# board detection failed at runtime.
-_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (25.0, 90.0)
+_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.20, 0.30)  # (min, max) radial distance
+# 30° → 75°. The previous (25°, 90°) range had two problems: (a) the
+# outer-shell wireframe at d_max × ev_max = 90° put the top of the dome
+# higher than PAROL6 can practically reach with the wrist-flip mount,
+# making that part of the dome forever empty of dots, and (b) elevations
+# above ~80° almost never produce IK-feasible poses on the cold-start
+# mount (verified empirically: of 1024 Sobol samples, fewer than 10
+# survivors had elev > 80°). Narrowing to (30°, 75°) keeps the dome
+# inside the actually-reachable region.
+_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (30.0, 75.0)
 # Distance lower bound 0.22 m: at fx=fy=615 the camera covers ~230 mm of
 # horizontal scene at this distance, just enough for the 210 mm-wide board
 # to fit with safety margin. Closer than this and the board falls outside
@@ -2003,6 +2006,36 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         stats.rejection_log.get("workspace_xy", 0) + stats.rejection_log.get("workspace_z", 0),
         stats.rejection_log.get("singular", 0),
     )
+
+    # Sanity check: every surviving dot's distance from target_world should
+    # lie inside [d_min, d_max], the same range the wireframe is drawn at.
+    # If any survivors are outside the shell, the dots will visually appear
+    # "above" or "below" the dome — surface that mismatch loudly so we can
+    # debug rather than silently rendering inconsistent geometry.
+    if reachable_cam_world:
+        cam_arr = np.asarray(reachable_cam_world, dtype=np.float64)
+        rel = cam_arr - target_world
+        dists = np.linalg.norm(rel, axis=1)
+        elevs_deg = np.degrees(np.arcsin(np.clip(rel[:, 2] / np.maximum(dists, 1e-9), -1.0, 1.0)))
+        out_of_shell = ((dists < d_min - 1e-3) | (dists > d_max + 1e-3)).sum()
+        logger.info(
+            "reachability dots distance range %.3f - %.3f m (shell %.3f - %.3f), "
+            "elevation range %.1f - %.1f° (shell %.1f - %.1f); out-of-shell: %d",
+            float(dists.min()), float(dists.max()), d_min, d_max,
+            float(elevs_deg.min()), float(elevs_deg.max()), ev_min, ev_max,
+            int(out_of_shell),
+        )
+        if out_of_shell > 0:
+            logger.warning(
+                "%d reachability dot(s) lie OUTSIDE the wireframe shell — "
+                "this means the dots and wireframe disagree about the "
+                "hemisphere. Likely cause: target_world drifted between "
+                "wireframe and dot rendering, or the cold-start mount's "
+                "T_cam2flange differs from the one used by the pose "
+                "generator. Tight numerical mismatches (sub-mm) are "
+                "expected from FK-verify tolerance.",
+                int(out_of_shell),
+            )
 
     # Greedy farthest-first thinning so the rendered points form a uniform
     # spread across the reachable region instead of clustered along grid
