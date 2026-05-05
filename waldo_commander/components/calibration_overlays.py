@@ -196,15 +196,32 @@ _BOARD_TARGET_OFFSETS_LOCAL: tuple[tuple[float, float], ...] = (
 # blocked by a robot link but the centre line is clear. We cast rays to
 # multiple sample points spread across the board face and reject the pose
 # if more than _OCCLUSION_MAX_BLOCKED rays are blocked. Each (u, v) is in
-# board-local UV ∈ [0, 1]². Default 5-point sampling: centre + 4 corners.
+# board-local UV ∈ [0, 1]². Default 9-point sampling: centre + 4 corners +
+# 4 mid-edges. Denser sampling catches "robot link clipping one quadrant"
+# cases that the 5-point grid let through.
 _OCCLUSION_BOARD_SAMPLES_LOCAL: tuple[tuple[float, float], ...] = (
-    (0.5, 0.5),                                 # centre
-    (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0),  # corners
+    (0.5, 0.5),                                       # centre
+    (0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0),   # corners
+    (0.5, 0.0), (0.5, 1.0), (0.0, 0.5), (1.0, 0.5),   # mid-edges
 )
-# Reject if MORE than this many of the sampled rays are blocked. With 5
-# samples and threshold=1, we accept up to 1/5 = 20% partial occlusion;
-# beyond that the captured frame won't have enough usable corners.
-_OCCLUSION_MAX_BLOCKED: int = 1
+# Reject if more than this many sampled rays are blocked. With 9 samples
+# and threshold=0, ANY robot-link occlusion of the board area rejects the
+# pose — strict but justified: ChArUco needs ≥6 visible corners for a
+# reliable pose, and any robot-body occlusion of even one mid-edge usually
+# means a corner is also occluded. Bump to 1 if you find this rejecting
+# poses that look fine in the GUI; bump further only if hardware testing
+# shows ChArUco coping with heavier partial-occlusion than expected.
+_OCCLUSION_MAX_BLOCKED: int = 0
+
+# Per-pose settle time. The orchestrator pauses for this long after each
+# move_j completes before capturing a frame, letting vibration die out
+# (mechanical, camera-mount flex, gripper sway) and the camera's auto-
+# exposure settle. Sim mode can be aggressive (the controller's motion
+# physics is already discrete-time so there's no real ringing); on real
+# hardware PAROL6's belt-driven joints + the camera bracket flex want a
+# couple of seconds to fully stabilise.
+_SETTLE_TIME_SIM_S: float = 0.2
+_SETTLE_TIME_REAL_S: float = 2.5
 
 # Viewing-angle filter — reject candidates where the camera optical axis is
 # more than this many degrees off the board surface normal. At extreme
@@ -293,9 +310,19 @@ _LOCALISE_SCAN_TARGETS_M: tuple[tuple[float, float], ...] = (
 _LOCALISE_SCAN_DISTANCE_M: float = 0.30
 # Elevation angle for each scan pose. 90° = pure overhead (camera looks
 # straight down); lower values tilt the camera forward. Pure overhead can
-# cause IK failures with tilt_x=180 wrist-flip, so we default to 85°
-# (mostly overhead with a slight forward tilt) which has higher IK success.
-_LOCALISE_SCAN_ELEVATION_DEG: float = 85.0
+# cause IK failures with tilt_x=180 wrist-flip, so we default to a sweep
+# from 75° down to 50° — the pose generator tries each elevation in turn
+# per scan target and accepts the first that yields a reachable pose. The
+# board still ends up roughly centered in the camera frame at any of
+# these (FOV is wide enough at 30 cm distance).
+_LOCALISE_SCAN_ELEVATIONS_DEG: tuple[float, ...] = (75.0, 65.0, 55.0)
+# Number of azimuth samples per (target, elevation). With the cold-start
+# mount's flange offset, different azimuths put the wrist in different
+# physical configurations — some IK-solvable, some not. Sampling 4
+# azimuths per target × 3 elevations = up to 12 candidates per scan
+# target, dramatically improving the success rate vs the original
+# single-azimuth + single-elevation.
+_LOCALISE_SCAN_AZIMUTH_COUNT: int = 4
 # Minimum number of successful detections to accept the localise. With
 # workspace scan, only the 1-3 scan poses whose FOV overlap the actual
 # board succeed; lowering this to 1 lets us accept a single confident
@@ -2422,16 +2449,18 @@ def _calibration_thread() -> None:
                 params=params,
             )
 
-        # Reduced sample count + zero settle time — the controller's motion
-        # physics already enforces realistic timing, so we don't need
-        # additional settling. Sample count trades calibration quality for
-        # wallclock time; 12 is enough for a watchable demo.
+        # Sample count trades calibration quality for wallclock time; 12 is
+        # enough for a watchable demo. Settle time is short in sim (the
+        # controller's motion physics is already discrete) but bumped on
+        # real hardware so PAROL6's belt-driven joints + camera bracket
+        # flex have time to fully stabilise before each capture.
+        settle_s = _SETTLE_TIME_SIM_S if is_sim_mode else _SETTLE_TIME_REAL_S
         config = OrchestratorConfig(
             bootstrap_joint_configs_deg=boot_cfg,
             target_sample_count=12,
             min_sample_count=6,
             enable_second_pass=False,
-            settle_time_s=0.2,
+            settle_time_s=settle_s,
             hemisphere=main_params,
             pose_generator_factory=_hull_filtered_factory,
         )
@@ -2548,14 +2577,19 @@ def _localise_board_thread() -> None:
         candidates: list = []
         for tx, ty in _LOCALISE_SCAN_TARGETS_M:
             target_world = np.array([tx, ty, scan_z], dtype=np.float64)
+            # Try multiple (elevation, azimuth) combinations per target. With
+            # tilt_x=180 + the mount offset, IK feasibility varies wildly with
+            # the wrist's azimuthal orientation; sampling several azimuths +
+            # a few elevations gives the pose generator real options instead
+            # of one make-or-break shot.
             params = HemisphereParams(
                 distances_m=(_LOCALISE_SCAN_DISTANCE_M,),
-                elevations_deg=(_LOCALISE_SCAN_ELEVATION_DEG,),
-                azimuth_counts=(1,),
-                # Azimuth=0 (looking from +X side) is fine since elevation
-                # is near-overhead — the camera position barely depends on
-                # azimuth when ev is close to 90°.
-                azimuth_range_deg=(0.0, 0.0),
+                elevations_deg=_LOCALISE_SCAN_ELEVATIONS_DEG,
+                azimuth_counts=tuple(
+                    _LOCALISE_SCAN_AZIMUTH_COUNT
+                    for _ in _LOCALISE_SCAN_ELEVATIONS_DEG
+                ),
+                azimuth_range_deg=(-180.0, 180.0),
                 workspace_xy_max_m=0.55,
                 max_joint_change_deg=180.0,
             )
@@ -2566,10 +2600,11 @@ def _localise_board_thread() -> None:
                 params=params,
             )
             try:
-                pose_cands, _ = gen.generate(max_count=1)
+                # Take just one — any reachable pose at this target is enough,
+                # since they all see the board (camera looks at the same world
+                # point regardless of which side it's on).
+                pose_cands, gen_stats = gen.generate(max_count=1)
             except Exception as e:  # noqa: BLE001
-                # A single bad target (numba JIT issue, IK numerical break)
-                # shouldn't kill the whole scan. Log and continue.
                 logger.warning(
                     "localise scan target (%.2f, %.2f) — pose generation "
                     "raised %s: %s. Skipping target.",
@@ -2579,9 +2614,16 @@ def _localise_board_thread() -> None:
             if pose_cands:
                 candidates.append(pose_cands[0])
             else:
+                # gen_stats has rejection counts (ik_failed, workspace_xy,
+                # etc.) — surface them so the user can diagnose at a glance.
+                rej = getattr(gen_stats, "rejection_log", None) or {}
                 logger.info(
-                    "localise scan target (%.2f, %.2f) — IK failed, skipping",
+                    "localise scan target (%.2f, %.2f) — no reachable pose "
+                    "across %d candidates (rejections: %s)",
                     tx, ty,
+                    len(_LOCALISE_SCAN_ELEVATIONS_DEG)
+                    * _LOCALISE_SCAN_AZIMUTH_COUNT,
+                    dict(rej),
                 )
 
         if not candidates:
@@ -2703,7 +2745,10 @@ def _localise_board_thread() -> None:
             if rc < 0:
                 logger.info("localise scan %d returned rc=%d; skipping", i, rc)
                 continue
-            time.sleep(0.2)  # let the camera frame stabilise after motion
+            # Let the camera frame stabilise after motion — short in sim
+            # (motion physics is discrete) but a couple of seconds on real
+            # hardware (vibration + auto-exposure settle).
+            time.sleep(_SETTLE_TIME_SIM_S if is_sim_mode else _SETTLE_TIME_REAL_S)
             try:
                 frame = camera.capture_color()
             except Exception as e:  # noqa: BLE001
