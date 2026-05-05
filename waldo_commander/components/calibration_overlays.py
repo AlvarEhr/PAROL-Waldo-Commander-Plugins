@@ -178,6 +178,22 @@ _REACHABILITY_GRID = (7, 6, 20)
 # bisecting if anything regresses.
 _REACHABILITY_USE_CONTINUOUS: bool = True
 _REACHABILITY_N_CANDIDATES: int = 1024
+
+# Calibration hemisphere sampling — same Sobol vs discrete toggle as the
+# reachability viz, applied to the actual calibration run. The bootstrap
+# pass and main pass both feed through HullFilteredPoseGenerator, which
+# inherits the base PoseGenerator's continuous-mode plumbing. Default to
+# continuous so the calibration samples come from the same provably-
+# uniform distribution the viz shows.
+_CALIBRATION_USE_CONTINUOUS: bool = True
+# Bootstrap pass — needs only enough survivors to seat consensus (~6-8
+# detections); 512 Sobol candidates × ~15 % IK pass rate on tilt_x=180 ≈
+# 75 reachable, plenty.
+_BOOTSTRAP_N_CANDIDATES: int = 512
+# Main pass — denser than bootstrap, used for the actual calibration
+# samples; ~1024 Sobol × ~15 % ≈ 150 reachable, then thinned to
+# target_sample_count by farthest-first and trajectory filters.
+_MAIN_N_CANDIDATES: int = 1024
 # Greedy farthest-first selection: thin the dense reachable set down to a
 # spatially well-spread subset, so visualisation (and, optionally,
 # calibration) gets points that are far enough apart instead of clustered
@@ -2484,22 +2500,52 @@ def _calibration_thread() -> None:
         d_min, d_max = _HEMI_DISTANCE_RANGE_M
         ev_min, ev_max = _HEMI_ELEVATION_RANGE_DEG
         az_world_range = _hemi_azimuth_world_range_deg()
-        bootstrap_params = HemisphereParams(
-            distances_m=(0.22, 0.26, 0.30, 0.34),
-            elevations_deg=(30.0, 45.0, 60.0, 75.0, 88.0),
-            azimuth_counts=(16, 14, 12, 10, 8),  # 60 az per distance × 4 = 240
-            azimuth_range_deg=az_world_range,
-            workspace_xy_max_m=0.55,
-            max_joint_change_deg=180.0,
-        )
-        main_params = HemisphereParams(
-            distances_m=tuple(np.linspace(d_min, d_max, 6).tolist()),
-            elevations_deg=tuple(np.linspace(ev_min, ev_max, 6).tolist()),
-            azimuth_counts=(20, 16, 12, 9, 6, 4),  # 67 azimuths per distance × 6 = 402
-            azimuth_range_deg=az_world_range,
-            max_joint_change_deg=180.0,
-            workspace_xy_max_m=0.55,
-        )
+        if _CALIBRATION_USE_CONTINUOUS:
+            # Sobol low-discrepancy sampling — same volume as the discrete
+            # grids below, but provably uniform 3D coverage. Avoids the
+            # "ring" artefacts where discrete grids put grid corners at
+            # specific azimuths and IK feasibility correlates with those
+            # corners; survivors come from genuine reachability rather
+            # than grid alignment. Bootstrap's elevation range is bumped
+            # up (45° lower bound, 88° upper) to match the dense bootstrap
+            # config's intent of capturing mostly-overhead views.
+            bootstrap_params = HemisphereParams(
+                n_candidates=_BOOTSTRAP_N_CANDIDATES,
+                distance_range_m=(0.22, 0.34),
+                elevation_range_deg=(30.0, 88.0),
+                azimuth_range_deg=az_world_range,
+                workspace_xy_max_m=0.55,
+                max_joint_change_deg=180.0,
+            )
+            main_params = HemisphereParams(
+                n_candidates=_MAIN_N_CANDIDATES,
+                distance_range_m=(d_min, d_max),
+                elevation_range_deg=(ev_min, ev_max),
+                azimuth_range_deg=az_world_range,
+                workspace_xy_max_m=0.55,
+                max_joint_change_deg=180.0,
+            )
+        else:
+            # Legacy discrete grids — kept for bisection if continuous
+            # ever regresses. Both grids are dense because tilt_x=180
+            # forces wrist-flip configurations and only ~15% of grid
+            # points pass IK.
+            bootstrap_params = HemisphereParams(
+                distances_m=(0.22, 0.26, 0.30, 0.34),
+                elevations_deg=(30.0, 45.0, 60.0, 75.0, 88.0),
+                azimuth_counts=(16, 14, 12, 10, 8),  # 60 az per distance × 4 = 240
+                azimuth_range_deg=az_world_range,
+                workspace_xy_max_m=0.55,
+                max_joint_change_deg=180.0,
+            )
+            main_params = HemisphereParams(
+                distances_m=tuple(np.linspace(d_min, d_max, 6).tolist()),
+                elevations_deg=tuple(np.linspace(ev_min, ev_max, 6).tolist()),
+                azimuth_counts=(20, 16, 12, 9, 6, 4),  # 67 az per distance × 6 = 402
+                azimuth_range_deg=az_world_range,
+                max_joint_change_deg=180.0,
+                workspace_xy_max_m=0.55,
+            )
 
 
         bg = HullFilteredPoseGenerator(
