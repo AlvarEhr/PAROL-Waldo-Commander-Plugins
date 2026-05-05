@@ -27,6 +27,7 @@ To remove this integration: delete the imports + calls in ``main.py``.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import threading
 import time
@@ -429,6 +430,19 @@ _FRUSTUM_DEPTH_M: float = 0.20
 _FRUSTUM_FAR_DEPTH_M: float | None = 0.50
 
 
+# === Detection overlay (live perception viz) ===
+# JSON snapshot written by parol6-vision's find_object.py. From this file at
+# Waldo-Commander/waldo_commander/components/calibration_overlays.py, four
+# parents up = "Project Files/" (the directory that contains both
+# Waldo-Commander/ and parol6-vision/), then sibling parol6-vision/Results/...
+_DETECTION_JSON_PATH: Path = (
+    Path(__file__).resolve().parent.parent.parent.parent
+    / "parol6-vision" / "Results" / "perception" / "last_detection.json"
+)
+_DETECTION_POLL_INTERVAL_S: float = 0.5
+_DETECTION_OVERLAY_COLOR: str = "#ff8800"  # orange — distinct from board (textured) and frustum (cyan)
+
+
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
@@ -472,6 +486,15 @@ _state: dict[str, Any] = {
     # _busy_warn checks this so the user can't start a parallel Localise
     # while the dialog is awaiting their answer.
     "dialog_open": False,
+    # Detection-overlay (live perception viz). The group handle is the
+    # NiceGUI scene group containing the wireframe boxes + labels for the
+    # most recent set of detections; we delete + rebuild it on each poll
+    # tick where the JSON has changed. detection_last_mtime caches the
+    # file mtime so we skip unchanged polls cheaply. detection_overlay_timer
+    # is the ui.timer handle from add_overlays.
+    "detection_overlay_group": None,  # NiceGUI group handle
+    "detection_last_mtime": 0.0,       # for change detection
+    "detection_overlay_timer": None,
 }
 
 
@@ -1339,6 +1362,12 @@ def add_overlays(urdf_scene: Any) -> None:
     if _SHOW_HEMISPHERE_WIREFRAME:
         _add_hemisphere_wireframe(scene_root, _hemi_centre_world())
 
+    # Detection-overlay polling — repaints AABB boxes from the perception
+    # pipeline's last_detection.json snapshot when its mtime changes.
+    _state["detection_overlay_timer"] = ui.timer(
+        _DETECTION_POLL_INTERVAL_S, _poll_detection_json,
+    )
+
 
 def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
     """Build the ChArUco board scene group at the current ``_T_BOARD2BASE``.
@@ -1503,6 +1532,142 @@ def refresh_board_dependent_overlays() -> None:
                 "skipping scene refresh",
                 e,
             )
+
+
+def _render_detection_overlay(detections_payload: dict[str, Any]) -> None:
+    """Rebuild the perception-detection overlay group from a parsed JSON payload.
+
+    Deletes the previous group (if any), then for each detection in the payload
+    draws a wireframe AABB + a 2D text label at the box top centre. Skips
+    rendering entirely when the payload's frame is not "base" (camera-frame
+    detections don't belong in the base-frame URDF scene).
+
+    Schedules the actual scene mutation on the asyncio loop captured during
+    ``add_overlays``, mirroring ``refresh_board_dependent_overlays``.
+    """
+    scene_root = _state.get("scene_root")
+    loop = _state.get("main_loop")
+    if scene_root is None:
+        return  # add_overlays hasn't run yet
+
+    frame = detections_payload.get("frame")
+    detections = detections_payload.get("detections") or []
+    refinement = detections_payload.get("refinement")
+    refining = bool(refinement and refinement.get("in_progress"))
+    refine_done = (refinement or {}).get("frames_done")
+    refine_target = (refinement or {}).get("frames_target")
+
+    def _do_render() -> None:
+        # Always tear down the previous group before deciding whether to
+        # rebuild — that way a frame switch from "base" to "camera" still
+        # clears stale boxes.
+        old = _state.get("detection_overlay_group")
+        if old is not None:
+            try:
+                old.delete()
+            except Exception as e:  # noqa: BLE001 - NiceGUI raises various types on torn-down scenes
+                logger.debug("detection overlay delete failed: %s", e)
+            _state["detection_overlay_group"] = None
+
+        if frame != "base":
+            return  # only render base-frame detections in the URDF scene
+        if not detections:
+            return
+
+        grp = scene_root.group().with_name("calib:detections")
+        _state["detection_overlay_group"] = grp
+        with grp:
+            for det in detections:
+                mins = det.get("aabb_mins_mm")
+                maxs = det.get("aabb_maxs_mm")
+                if mins is None or maxs is None or len(mins) != 3 or len(maxs) != 3:
+                    continue
+                mins_m = np.asarray(mins, dtype=np.float64) / 1000.0
+                maxs_m = np.asarray(maxs, dtype=np.float64) / 1000.0
+                centre_m = (mins_m + maxs_m) / 2.0
+                size_m = maxs_m - mins_m
+                # Guard against degenerate bboxes (zero or negative extent).
+                if not np.all(size_m > 0):
+                    continue
+
+                confidence = float(det.get("confidence") or 0.0)
+                opacity = float(np.clip(0.3 + 0.7 * confidence, 0.0, 1.0))
+
+                # Wireframe AABB. NiceGUI's Box has wireframe=True support
+                # (Jepson2k fork), which renders the 12 edges as line segments.
+                ui.scene.box(
+                    width=float(size_m[0]),
+                    height=float(size_m[1]),
+                    depth=float(size_m[2]),
+                    wireframe=True,
+                ).move(*centre_m.tolist()).material(
+                    _DETECTION_OVERLAY_COLOR, opacity=opacity
+                )
+
+                label = str(det.get("label") or f"obj{det.get('index', '?')}")
+                if len(label) > 32:
+                    label = label[:29] + "..."
+                pct = int(round(confidence * 100))
+                text_lines = [f"{label} ({pct}%)"]
+                if refining and refine_done is not None and refine_target is not None:
+                    text_lines.insert(0, f"[refining {refine_done}/{refine_target}]")
+                # Text element always faces the camera; place it slightly
+                # above the box top face so it doesn't z-fight the wireframe.
+                text_pos = (
+                    float(centre_m[0]),
+                    float(centre_m[1]),
+                    float(centre_m[2] + size_m[2] / 2.0 + 0.02),
+                )
+                ui.scene.text(
+                    " ".join(text_lines),
+                    style=f"color: {_DETECTION_OVERLAY_COLOR}; font-size: 12px;",
+                ).move(*text_pos)
+
+    if loop is None:
+        # No event loop captured — caller is on the main thread.
+        _do_render()
+    else:
+        try:
+            loop.call_soon_threadsafe(_do_render)
+        except RuntimeError as e:
+            logger.debug(
+                "_render_detection_overlay: loop unavailable (%s); skipping",
+                e,
+            )
+
+
+def _poll_detection_json() -> None:
+    """Timer tick: re-read the detection JSON if its mtime has changed.
+
+    Designed to be cheap on the common case where the file is missing
+    (perception not running) or unchanged since the last tick. Logs at
+    DEBUG level on any error so we don't spam the log when no perception
+    pipeline has run yet.
+    """
+    path = _DETECTION_JSON_PATH
+    try:
+        if not path.exists():
+            return
+        mtime = path.stat().st_mtime
+    except OSError as e:
+        logger.debug("_poll_detection_json: stat failed: %s", e)
+        return
+
+    if mtime == _state.get("detection_last_mtime"):
+        return
+
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, ValueError) as e:
+        logger.debug("_poll_detection_json: read/parse failed: %s", e)
+        return
+
+    _state["detection_last_mtime"] = mtime
+    try:
+        _render_detection_overlay(payload)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("_poll_detection_json: render failed: %s", e)
 
 
 def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]) -> None:
