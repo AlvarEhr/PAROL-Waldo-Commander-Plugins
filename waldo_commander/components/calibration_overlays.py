@@ -171,7 +171,7 @@ _REACHABILITY_GRID = (7, 6, 20)
 # spatially well-spread subset, so visualisation (and, optionally,
 # calibration) gets points that are far enough apart instead of clustered
 # along grid lines. None = no thinning, show every reachable point.
-_REACHABILITY_KEEP_COUNT: int | None = 30
+_REACHABILITY_KEEP_COUNT: int | None = 80
 
 # Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
 #
@@ -294,34 +294,36 @@ _SHOW_TABLET_OVERLAY: bool = True
 # covers PAROL6's typical reachable workspace: 2 distances × 3 angles =
 # 6 points covering radii 0.20-0.40 m and azimuths ±25°. Add or remove
 # entries to change the search pattern.
+# Default 9-cell grid — 3 X positions × 3 Y positions covering 0.20-0.40 m
+# radii × ±0.15 m sideways. Add or remove entries to change the search
+# pattern.
 _LOCALISE_SCAN_TARGETS_M: tuple[tuple[float, float], ...] = (
-    (0.20, -0.15),  # close-left
-    (0.20,  0.00),  # close-centre
-    (0.20, +0.15),  # close-right
-    (0.40, -0.15),  # far-left
-    (0.40,  0.00),  # far-centre
-    (0.40, +0.15),  # far-right
+    (0.20, -0.15), (0.20,  0.00), (0.20, +0.15),
+    (0.30, -0.15), (0.30,  0.00), (0.30, +0.15),
+    (0.40, -0.15), (0.40,  0.00), (0.40, +0.15),
 )
 # Distance from each scan target to the camera (camera sits this far above
 # the target, looking down). 0.30 m gives ~33 cm × 25 cm FOV at the floor
 # with the default fx=fy=615 intrinsics — wide enough that consecutive
 # scan points overlap, so a board near the boundary between two grid
-# points gets seen from both.
-_LOCALISE_SCAN_DISTANCE_M: float = 0.30
+# points gets seen from both. Tuple form: try each in order until one
+# yields a reachable pose.
+_LOCALISE_SCAN_DISTANCES_M: tuple[float, ...] = (0.28, 0.32)
 # Elevation angle for each scan pose. 90° = pure overhead (camera looks
 # straight down); lower values tilt the camera forward. Pure overhead can
-# cause IK failures with tilt_x=180 wrist-flip, so we default to a sweep
-# from 75° down to 50° — the pose generator tries each elevation in turn
-# per scan target and accepts the first that yields a reachable pose. The
-# board still ends up roughly centered in the camera frame at any of
-# these (FOV is wide enough at 30 cm distance).
-_LOCALISE_SCAN_ELEVATIONS_DEG: tuple[float, ...] = (75.0, 65.0, 55.0)
-# Number of azimuth samples per (target, elevation). With the cold-start
-# mount's flange offset, different azimuths put the wrist in different
-# physical configurations — some IK-solvable, some not. Sampling 4
-# azimuths per target × 3 elevations = up to 12 candidates per scan
-# target, dramatically improving the success rate vs the original
-# single-azimuth + single-elevation.
+# cause IK failures with tilt_x=180 wrist-flip. The sweep covers 70° down
+# to 45° — the pose generator tries each elevation in turn per scan target
+# and accepts the first that yields a reachable, occlusion-free pose.
+# Wider sweep than before because some workspace targets only have a
+# reachable pose at the lower elevations.
+_LOCALISE_SCAN_ELEVATIONS_DEG: tuple[float, ...] = (70.0, 60.0, 50.0, 45.0)
+# Azimuth range for the per-target search. Wider than (-90, 90) because the
+# robot's reach is asymmetric in azimuth (the cold-start mount's offset
+# means some viewpoints work from the side but not the front). 4 azimuth
+# samples within this range per (distance, elevation), so a single target
+# gets up to 4 dist × 4 elev × 4 az = 64 candidates evaluated. Pinokin's
+# IK is fast enough (~5 ms per call) that this is well under a second.
+_LOCALISE_SCAN_AZIMUTH_RANGE_DEG: tuple[float, float] = (-100.0, 100.0)
 _LOCALISE_SCAN_AZIMUTH_COUNT: int = 4
 # Minimum number of successful detections to accept the localise. With
 # workspace scan, only the 1-3 scan poses whose FOV overlap the actual
@@ -2624,21 +2626,22 @@ def _localise_board_thread() -> None:
         )
         scan_robot = Robot()
         candidates: list = []
+        # Per-target candidate generation with a "look-AT-target" preference:
+        # given multiple IK-feasible candidates, pick the one whose camera
+        # position is geometrically closest to "directly above the target".
+        # That means the camera's optical axis stays nearly vertical and the
+        # robot body is on the OPPOSITE side from the workspace — minimising
+        # both occlusion and oblique-view ChArUco failures.
         for tx, ty in _LOCALISE_SCAN_TARGETS_M:
             target_world = np.array([tx, ty, scan_z], dtype=np.float64)
-            # Try multiple (elevation, azimuth) combinations per target. With
-            # tilt_x=180 + the mount offset, IK feasibility varies wildly with
-            # the wrist's azimuthal orientation; sampling several azimuths +
-            # a few elevations gives the pose generator real options instead
-            # of one make-or-break shot.
             params = HemisphereParams(
-                distances_m=(_LOCALISE_SCAN_DISTANCE_M,),
+                distances_m=_LOCALISE_SCAN_DISTANCES_M,
                 elevations_deg=_LOCALISE_SCAN_ELEVATIONS_DEG,
                 azimuth_counts=tuple(
                     _LOCALISE_SCAN_AZIMUTH_COUNT
                     for _ in _LOCALISE_SCAN_ELEVATIONS_DEG
                 ),
-                azimuth_range_deg=(-180.0, 180.0),
+                azimuth_range_deg=_LOCALISE_SCAN_AZIMUTH_RANGE_DEG,
                 workspace_xy_max_m=0.55,
                 max_joint_change_deg=180.0,
             )
@@ -2649,10 +2652,10 @@ def _localise_board_thread() -> None:
                 params=params,
             )
             try:
-                # Take just one — any reachable pose at this target is enough,
-                # since they all see the board (camera looks at the same world
-                # point regardless of which side it's on).
-                pose_cands, gen_stats = gen.generate(max_count=1)
+                # Get ALL feasible candidates, not just the first — we want
+                # to choose the BEST one (most-overhead camera position),
+                # not the first one IK happened to converge on.
+                pose_cands, gen_stats = gen.generate(max_count=None)
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "localise scan target (%.2f, %.2f) — pose generation "
@@ -2661,18 +2664,40 @@ def _localise_board_thread() -> None:
                 )
                 continue
             if pose_cands:
-                candidates.append(pose_cands[0])
+                # Score by how vertical the camera-to-target vector is.
+                # Cosine of the angle between (target - camera_pos) and -Z is
+                # 1.0 for a perfectly-overhead camera, 0.0 for a horizontal
+                # one. Pick the highest cos value among reachable candidates
+                # — that's the most "looks straight down at the workspace"
+                # pose, with minimal foreshortening and minimal robot-body
+                # occlusion.
+                def _vertical_score(c: Any) -> float:
+                    cam_pos = cold_start.cam_pose_for_flange_pose(
+                        np.asarray(c.flange_pose),
+                    )[:3, 3]
+                    forward = target_world - cam_pos
+                    fn = float(np.linalg.norm(forward))
+                    if fn < 1e-6:
+                        return 0.0
+                    forward = forward / fn
+                    # cos(angle from -Z) — bigger is more straight-down.
+                    return float(-forward[2])
+
+                pose_cands_sorted = sorted(
+                    pose_cands, key=_vertical_score, reverse=True,
+                )
+                candidates.append(pose_cands_sorted[0])
             else:
-                # gen_stats has rejection counts (ik_failed, workspace_xy,
-                # etc.) — surface them so the user can diagnose at a glance.
                 rej = getattr(gen_stats, "rejection_log", None) or {}
+                n_total = (
+                    len(_LOCALISE_SCAN_DISTANCES_M)
+                    * len(_LOCALISE_SCAN_ELEVATIONS_DEG)
+                    * _LOCALISE_SCAN_AZIMUTH_COUNT
+                )
                 logger.info(
                     "localise scan target (%.2f, %.2f) — no reachable pose "
                     "across %d candidates (rejections: %s)",
-                    tx, ty,
-                    len(_LOCALISE_SCAN_ELEVATIONS_DEG)
-                    * _LOCALISE_SCAN_AZIMUTH_COUNT,
-                    dict(rej),
+                    tx, ty, n_total, dict(rej),
                 )
 
         if not candidates:
