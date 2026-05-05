@@ -167,11 +167,22 @@ _SHOW_REACHABILITY_POINTS: bool = True
 # reachable. We compensate with a denser grid (~840 samples → ~33 reachable)
 # and the farthest-first thinning below picks the best spread from those.
 _REACHABILITY_GRID = (7, 6, 20)
+# Reachability sampling for the green-dot viz. Two modes:
+#   _REACHABILITY_USE_CONTINUOUS = False  -> use _REACHABILITY_GRID above
+#       (legacy discrete sampling, 7×6×20 = 840 candidates considered)
+#   _REACHABILITY_USE_CONTINUOUS = True   -> Sobol low-discrepancy sampling
+#       within the hemisphere ranges, _REACHABILITY_N_CANDIDATES total.
+# Continuous gives provably uniform 3D coverage; discrete clumps at grid
+# corners and tends to produce visible "rings" of survivors after IK
+# filtering. Default to continuous; the discrete path is kept for
+# bisecting if anything regresses.
+_REACHABILITY_USE_CONTINUOUS: bool = True
+_REACHABILITY_N_CANDIDATES: int = 1024
 # Greedy farthest-first selection: thin the dense reachable set down to a
 # spatially well-spread subset, so visualisation (and, optionally,
 # calibration) gets points that are far enough apart instead of clustered
 # along grid lines. None = no thinning, show every reachable point.
-_REACHABILITY_KEEP_COUNT: int | None = 80
+_REACHABILITY_KEEP_COUNT: int | None = None
 
 # Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
 #
@@ -1869,14 +1880,9 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
     )
 
-    n_d, n_ev, n_az = _REACHABILITY_GRID
     d_min, d_max = _HEMI_DISTANCE_RANGE_M
     ev_min, ev_max = _HEMI_ELEVATION_RANGE_DEG
     az_min, az_max = _hemi_azimuth_world_range_deg()
-
-    distances = tuple(np.linspace(d_min, d_max, n_d).tolist())
-    elevations = tuple(np.linspace(ev_min, ev_max, n_ev).tolist())
-    azimuth_counts = tuple([n_az] * n_ev)  # same number of azimuths at every elevation
 
     try:
         robot = Robot()
@@ -1884,18 +1890,40 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         logger.warning("could not instantiate Robot for reachability viz: %s", e)
         return
 
-    params = HemisphereParams(
-        distances_m=distances,
-        elevations_deg=elevations,
-        azimuth_counts=azimuth_counts,
-        azimuth_range_deg=(az_min, az_max),
-        workspace_xy_max_m=0.55,
-        max_joint_change_deg=180.0,  # relax for viz — we just want reachability, not smoothness
-    )
+    if _REACHABILITY_USE_CONTINUOUS:
+        # Sobol low-discrepancy sampling — provably uniform 3D coverage of
+        # the hemisphere volume. Discrete-grid sampling produces visible
+        # "ring" artefacts in the surviving set when IK feasibility
+        # correlates with grid axes (which it does on PAROL6 with
+        # tilt_x=180 — survivors cluster along specific azimuth bands).
+        params = HemisphereParams(
+            n_candidates=_REACHABILITY_N_CANDIDATES,
+            distance_range_m=(d_min, d_max),
+            elevation_range_deg=(ev_min, ev_max),
+            azimuth_range_deg=(az_min, az_max),
+            workspace_xy_max_m=0.55,
+            max_joint_change_deg=180.0,
+        )
+        max_count = _REACHABILITY_N_CANDIDATES
+    else:
+        n_d, n_ev, n_az = _REACHABILITY_GRID
+        distances = tuple(np.linspace(d_min, d_max, n_d).tolist())
+        elevations = tuple(np.linspace(ev_min, ev_max, n_ev).tolist())
+        azimuth_counts = tuple([n_az] * n_ev)
+        params = HemisphereParams(
+            distances_m=distances,
+            elevations_deg=elevations,
+            azimuth_counts=azimuth_counts,
+            azimuth_range_deg=(az_min, az_max),
+            workspace_xy_max_m=0.55,
+            max_joint_change_deg=180.0,
+        )
+        max_count = n_d * n_ev * n_az
+
     gen = PoseGenerator(
         robot=robot, mount=cold_start, target_world=target_world, params=params,
     )
-    cands, stats = gen.generate(max_count=n_d * n_ev * n_az)
+    cands, stats = gen.generate(max_count=max_count)
 
     # Extract the camera position implied by each accepted candidate's flange
     # pose (T_cam2base = T_flange2base @ T_cam2flange). Track the candidate
@@ -1956,11 +1984,13 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
     _state["reachable_candidates"] = selected_candidates
 
     # Render points as small green spheres, in scene_group's local frame
-    # (which is already translated to target_world).
+    # (which is already translated to target_world). Smaller radius
+    # (3 mm instead of 6 mm) so dense reachable regions don't fuse into
+    # a single blob; semi-transparent so overlapping dots visibly stack.
     with scene_group:
         for cam_pos in points_to_render:
             local = (cam_pos - target_world).tolist()
-            ui.scene.sphere(0.006).move(*local).material("#33dd66", opacity=0.85)
+            ui.scene.sphere(0.003).move(*local).material("#33dd66", opacity=0.7)
 
 
 def _greedy_farthest_first(
