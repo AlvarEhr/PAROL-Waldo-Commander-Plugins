@@ -746,7 +746,7 @@ def _ensure_workspace_envelope() -> bool:
 
 def _build_collision_manager(
     tablet_T_board2base: NDArray[np.float64] | None = None,
-) -> tuple[Any, set[tuple[str, str]]] | None:
+) -> tuple[Any, set[tuple[str, str]], dict[str, Any]] | None:
     """Build a trimesh CollisionManager populated with PAROL6's link meshes
     + the merged SSG-48 gripper body (which has the camera bracket fused in)
     + optional FLOOR and TABLET static collision primitives.
@@ -759,11 +759,12 @@ def _build_collision_manager(
             in board-local -Z. When None, no tablet primitive is added.
 
     Returns:
-        (manager, adjacent_pairs) on success, None if python-fcl or any
+        (manager, adjacent_pairs, meshes) on success, None if python-fcl or any
         link mesh is missing. ``adjacent_pairs`` whitelists (link_a, link_b)
         pairs whose collisions should NOT count as self-collisions — joint
         neighbours that always touch, plus the FLOOR-vs-base / FLOOR-vs-
         TABLET background pairs.
+        ``meshes`` is a dict mapping object name to its ``trimesh.Trimesh`` instance.
     """
     try:
         import trimesh  # noqa: PLC0415
@@ -780,6 +781,7 @@ def _build_collision_manager(
     mesh_dir = parol6_root / "urdf_model" / "meshes"
 
     mgr = trimesh.collision.CollisionManager()
+    meshes: dict[str, Any] = {}
     link_names = ["base_link", "L1", "L2", "L3", "L4", "L5", "L6"]
     for name in link_names:
         path = mesh_dir / f"{name}_simplified.stl"
@@ -788,6 +790,7 @@ def _build_collision_manager(
         try:
             mesh = trimesh.load(path, force="mesh")
             mgr.add_object(name, mesh, transform=np.eye(4))
+            meshes[name] = mesh
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for %s: %s", path, e)
             return None
@@ -795,7 +798,9 @@ def _build_collision_manager(
     grip_path = mesh_dir / "ssg48_body_realsense.stl"
     if grip_path.exists():
         try:
-            mgr.add_object("gripper", trimesh.load(grip_path, force="mesh"), transform=np.eye(4))
+            grip_mesh = trimesh.load(grip_path, force="mesh")
+            mgr.add_object("gripper", grip_mesh, transform=np.eye(4))
+            meshes["gripper"] = grip_mesh
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for gripper: %s", e)
     # Gripper FINGERS — loaded as separate collision objects because they
@@ -820,8 +825,10 @@ def _build_collision_manager(
             )
             continue
         try:
-            mgr.add_object(jaw_name, trimesh.load(jaw_path, force="mesh"), transform=np.eye(4))
+            jaw_mesh = trimesh.load(jaw_path, force="mesh")
+            mgr.add_object(jaw_name, jaw_mesh, transform=np.eye(4))
             jaw_loaded.append(jaw_name)
+            meshes[jaw_name] = jaw_mesh
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for %s: %s", jaw_name, e)
 
@@ -841,6 +848,14 @@ def _build_collision_manager(
             # Position so box top is at +safety_margin: centre = top - h/2.
             floor_pose[2, 3] = _COLLISION_SAFETY_MARGIN_M - box_thickness / 2.0
             mgr.add_object("FLOOR", floor_box, transform=floor_pose)
+            meshes["FLOOR"] = floor_box
+            
+            visual_floor_box = trimesh.creation.box(extents=(10.0, 10.0, 0.05))
+            visual_floor_pose = np.eye(4, dtype=np.float64)
+            visual_floor_pose[2, 3] = -0.025
+            visual_floor_box.apply_transform(visual_floor_pose)
+            meshes["VISUAL_FLOOR"] = visual_floor_box
+            
             floor_added = True
         except Exception as e:  # noqa: BLE001
             logger.warning("FLOOR primitive add failed: %s", e)
@@ -879,6 +894,12 @@ def _build_collision_manager(
             tablet_pose[:3, :3] = T_b2b[:3, :3]
             tablet_pose[:3, 3] = centre_world[:3]
             mgr.add_object("TABLET", tablet_box, transform=tablet_pose)
+            meshes["TABLET"] = tablet_box
+            
+            visual_tablet_box = trimesh.creation.box(extents=(t_w, t_l, t_h))
+            visual_tablet_box.apply_transform(tablet_pose)
+            meshes["VISUAL_TABLET"] = visual_tablet_box
+            
             tablet_added = True
         except Exception as e:  # noqa: BLE001
             logger.warning("TABLET primitive add failed: %s", e)
@@ -934,7 +955,8 @@ def _build_collision_manager(
     # Stash the loaded jaw names on the manager so _self_collides can
     # apply the gripper transform to them too.
     mgr._loaded_jaw_names = list(jaw_loaded)  # type: ignore[attr-defined]
-    return mgr, adjacent
+    
+    return mgr, adjacent, meshes
 
 
 def _self_collides(
@@ -1070,7 +1092,7 @@ def validate_joint_trajectory(
             }
         _state["trajectory_collision_mgr_pair"] = pair
 
-    mgr, adjacent = pair
+    mgr, adjacent, _ = pair
     start_safe = not _self_collides(mgr, adjacent, q_from_arr)
     end_safe = not _self_collides(mgr, adjacent, q_to_arr)
     interior_safe = not _trajectory_collides(
@@ -1477,6 +1499,95 @@ def _frustum_corners_local(
     return pts
 
 
+def _raycast_frustum_footprint(
+    T_flange2base: NDArray[np.float64],
+    T_cam2flange: NDArray[np.float64],
+    T_gripper_visual2base: NDArray[np.float64],
+    mgr: Any,
+    meshes: dict[str, Any],
+    default_depth_m: float,
+) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], tuple[float, float, float]]:
+    """Cast rays from camera apex through the far plane edges against the static environment + gripper.
+    Returns (footprint_hits, camera_world_pos, center_hit) in WORLD coordinates."""
+    T_cam2base = T_flange2base @ T_cam2flange
+    cam_pos_world = T_cam2base[:3, 3]
+
+    # 4 far corners in camera frame, at the default maximum depth
+    corners_cam = _frustum_corners_local(default_depth_m)[1:]
+    
+    # Generate points along the edges of the far plane to handle hitting multiple surfaces smoothly
+    edge_points = []
+    num_segments = 10  # 10 segments per edge = 40 rays total for the perimeter
+    for i in range(4):
+        p_start = np.array(corners_cam[i])
+        p_end = np.array(corners_cam[(i + 1) % 4])
+        for t in np.linspace(0, 1, num_segments, endpoint=False):
+            edge_points.append(p_start * (1 - t) + p_end * t)
+            
+    # Add the center of the far plane for the optical axis line
+    edge_points.append(np.array([0.0, 0.0, default_depth_m]))
+            
+    num_rays = len(edge_points)
+    
+    # Rays in world frame
+    ray_origins = np.tile(cam_pos_world, (num_rays, 1))
+    ray_directions = []
+    for c in edge_points:
+        c_world = (T_cam2base @ np.array([c[0], c[1], c[2], 1.0]))[:3]
+        ray_directions.append(c_world - cam_pos_world)
+    ray_directions = np.array(ray_directions)
+    
+    # Norms is the distance from apex to the default_depth plane for each corner/point
+    norms = np.linalg.norm(ray_directions, axis=1, keepdims=True)
+    # Avoid division by zero
+    norms[norms < 1e-6] = 1.0
+    ray_directions /= norms
+    
+    best_t = np.full(num_rays, np.inf)
+
+    # We check against static scene elements (floor and tablet).
+    for name, mesh in meshes.items():
+        if name not in ("VISUAL_FLOOR", "VISUAL_TABLET"):
+            continue
+            
+        # These are already transformed to world space in _build_collision_manager
+        T_obj2base = np.eye(4, dtype=np.float64)
+            
+        T_base2obj = np.linalg.inv(T_obj2base)
+        
+        # Transform rays to object local frame
+        origins_local = (T_base2obj[:3, :3] @ ray_origins.T + T_base2obj[:3, 3:4]).T
+        dirs_local = (T_base2obj[:3, :3] @ ray_directions.T).T
+        
+        try:
+            locs, index_ray, index_tri = mesh.ray.intersects_location(
+                ray_origins=origins_local,
+                ray_directions=dirs_local,
+                multiple_hits=False
+            )
+            for i, ray_idx in enumerate(index_ray):
+                dist = float(np.linalg.norm(locs[i] - origins_local[ray_idx]))
+                if dist < best_t[ray_idx]:
+                    best_t[ray_idx] = dist
+        except Exception:
+            pass
+
+    hits_world = []
+    for i in range(num_rays):
+        t = min(best_t[i], float(norms[i][0]))
+        # Pull back slightly to avoid Z-fighting with surfaces,
+        # but only if we actually hit something (not at max depth)
+        if best_t[i] < np.inf:
+            t = max(0.0, t - 0.002)  # 2mm offset towards the camera
+        hit_world = ray_origins[i] + ray_directions[i] * t
+        hits_world.append(tuple(hit_world.tolist()))
+        
+    footprint_hits = hits_world[:-1]
+    center_hit = hits_world[-1]
+    
+    return footprint_hits, tuple(cam_pos_world.tolist()), center_hit
+
+
 def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> list[Any]:
     """Add frustum lines inside ``scene_group`` (parented to tcp_anchor).
 
@@ -1506,21 +1617,6 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
     near = to_flange(_frustum_corners_local(_FRUSTUM_DEPTH_M))
 
-    # Optical-axis center line: from camera apex straight along the optical
-    # axis to the far-plane center. Lets the user see at a glance what's at
-    # the center of the camera image, which is harder to read off four
-    # corner-edges alone.
-    apex_local = (0.0, 0.0, 0.0)
-    far_center_local = (0.0, 0.0, _FRUSTUM_DEPTH_M)
-    R = T_cam2flange[:3, :3]
-    t = T_cam2flange[:3, 3]
-    apex_flange = tuple((R @ np.asarray(apex_local) + t).tolist())
-    far_flange = tuple((R @ np.asarray(far_center_local) + t).tolist())
-    if _FRUSTUM_FAR_DEPTH_M is not None:
-        # Extend the centerline through the far cone too.
-        far_long_local = (0.0, 0.0, _FRUSTUM_FAR_DEPTH_M)
-        far_long_flange = tuple((R @ np.asarray(far_long_local) + t).tolist())
-
     # Diagnostic: log the actual far-plane span in flange frame so we can
     # confirm the tilt rotation is taking effect at the geometry level.
     far_corners = near[1:]
@@ -1535,12 +1631,6 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
     objects: list[Any] = []
     with scene_group:
-        # Centerline from apex along the optical axis.
-        cline_end = far_long_flange if _FRUSTUM_FAR_DEPTH_M is not None else far_flange
-        objects.append(
-            ui.scene.line(list(apex_flange), list(cline_end)).material("#ffff00")
-        )
-
         # --- Near cone: bright apex-to-corner + far-plane rectangle. ---
         for i in range(1, 5):
             objects.append(
@@ -1551,21 +1641,6 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
             objects.append(
                 ui.scene.line(list(near[i]), list(near[j])).material("#ff5050")
             )
-
-        # --- Far "laser pointer" cone, fainter, edge extensions only. ---
-        if _FRUSTUM_FAR_DEPTH_M is not None:
-            far = to_flange(_frustum_corners_local(_FRUSTUM_FAR_DEPTH_M))
-            # Extension lines: each near far-plane corner -> matching far corner.
-            for i in range(1, 5):
-                objects.append(
-                    ui.scene.line(list(near[i]), list(far[i])).material("#ff8080")
-                )
-            # Far-plane rectangle (the "footprint" projected onto your scene).
-            for i in range(1, 5):
-                j = 1 + (i % 4)
-                objects.append(
-                    ui.scene.line(list(far[i]), list(far[j])).material("#ffaaaa")
-                )
     return objects
 
 
@@ -2594,7 +2669,7 @@ def _calibration_thread() -> None:
 
                 # 3. Self-collision filter — gripper/bracket must not clip arm.
                 if collision_mgr_pair is not None:
-                    coll_mgr, adjacent_pairs = collision_mgr_pair
+                    coll_mgr, adjacent_pairs, _ = collision_mgr_pair
                     pre = len(cands)
                     cands = [
                         c for c in cands
@@ -2700,7 +2775,7 @@ def _calibration_thread() -> None:
                 # don't know where bootstrap landed (it'd over-reject if we
                 # assumed HOME).
                 if collision_mgr_pair is not None and len(cands) > 0:
-                    coll_mgr, adjacent_pairs = collision_mgr_pair
+                    coll_mgr, adjacent_pairs, _ = collision_mgr_pair
                     safe: list = [cands[0]]
                     n_traj_rejected = 0
                     for c in cands[1:]:
@@ -4235,10 +4310,111 @@ def _post_calibration_tick() -> None:
     The only remaining bit of plumbing is updating the frustum once the
     calibration finishes and we have a calibrated ``T_cam2flange``.
     """
-    if not _state.get("is_running") and _state.get("calibrated_mount") is not None:
-        update_frustum(_state["calibrated_mount"].T_cam2flange)
-        _state["current_mount"] = _state["calibrated_mount"]
-        _state["calibrated_mount"] = None
+    try:
+        if not _state.get("is_running") and _state.get("calibrated_mount") is not None:
+            update_frustum(_state["calibrated_mount"].T_cam2flange)
+            _state["current_mount"] = _state["calibrated_mount"]
+            _state["calibrated_mount"] = None
+    except RuntimeError as e:
+        # Catch "The parent slot of the element has been deleted."
+        if "parent slot" in str(e):
+            return
+        raise
+
+
+def _raycast_footprint_tick() -> None:
+    """Update the dynamic ray-projected footprint.
+    
+    Runs at 10 Hz. Projects rays from the camera through the far frustum corners
+    and draws the resulting polygon footprint in the world scene.
+    """
+    try:
+        scene_root = _state.get("scene_root")
+        if scene_root is None:
+            return
+        
+        # Check if scene is still "alive" to avoid parent slot errors
+        try:
+            if hasattr(scene_root, "id") and scene_root.id is None:
+                return
+        except Exception: # noqa: BLE001
+            return
+
+        mount = _state.get("current_mount")
+        if mount is None:
+            return
+            
+        pair = _state.get("trajectory_collision_mgr_pair")
+        if pair is None:
+            pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
+            if pair is None:
+                return
+            _state["trajectory_collision_mgr_pair"] = pair
+        mgr, adjacent, meshes = pair
+
+        try:
+            from waldo_commander.state import robot_state, ui_state  # noqa: PLC0415
+            from parol6_vision.sim.robot_kinematics import link_poses  # noqa: PLC0415
+            
+            n_joints = 6
+            if ui_state.active_robot is not None:
+                n_joints = ui_state.active_robot.joints.count
+                
+            if len(robot_state.angles.rad) < n_joints:
+                return
+                
+            q = np.asarray(robot_state.angles.rad[:n_joints], dtype=np.float64)
+            poses = link_poses(q)
+            T_flange2base = poses.l6
+            T_gripper_visual2base = poses.l6_visual
+        except Exception as e:  # noqa: BLE001
+            logger.warning("footprint tick skipped (kinematics error): %s", e)
+            return
+
+        try:
+            hits_world, cam_world, center_hit_world = _raycast_frustum_footprint(
+                T_flange2base, 
+                mount.T_cam2flange,
+                T_gripper_visual2base,
+                mgr,
+                meshes,
+                _FRUSTUM_FAR_DEPTH_M or 1.5
+            )
+
+            objects = []
+            # Parent the footprint to scene_root (world frame) so it stays fixed to the hit surface
+            # rather than sticking to the camera locally.
+            with scene_root:
+                # Clean up previous footprint inside the context manager to batch the websocket message
+                # and completely eliminate flickering.
+                for obj in _state.get("footprint_objects", []):
+                    try:
+                        obj.delete()
+                    except Exception:  # noqa: BLE001
+                        pass
+                
+                # Footprint perimeter - use a single Polyline for the entire perimeter
+                # to reduce the number of websocket messages and eliminate flickering.
+                perimeter_points = [list(p) for p in hits_world]
+                perimeter_points.append(list(hits_world[0])) # Close the loop
+                objects.append(
+                    ui.scene.polyline(perimeter_points).material("#ff00ff")
+                )
+                    
+                # Draw the centerline from the camera apex to the hit point
+                objects.append(
+                    ui.scene.line(list(cam_world), list(center_hit_world)).material("#ffff00")
+                )
+                    
+            _state["footprint_objects"] = objects
+        except Exception as e:
+            if "parent slot" not in str(e):
+                logger.error("footprint tick failed in raycast or render: %s", e, exc_info=True)
+                
+    except RuntimeError as e:
+        if "parent slot" in str(e):
+            return
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -4387,3 +4563,6 @@ def add_control_panel() -> None:
     # No joint-update plumbing needed — the parol6-server status broadcast
     # drives the URDF scene naturally.
     ui.timer(0.25, _post_calibration_tick, active=True)
+    
+    # 10 Hz tick for dynamic ray-projected frustum footprint
+    ui.timer(0.10, _raycast_footprint_tick, active=True)
