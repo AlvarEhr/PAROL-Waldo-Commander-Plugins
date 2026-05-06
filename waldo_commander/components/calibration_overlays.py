@@ -386,16 +386,9 @@ _LOCALISE_CONTINUOUS_SWEEP: bool = True
 # tighter circle around the base — covers more of the workspace per
 # unit of J0 rotation.
 _LOCALISE_SEED_TARGETS_XY: tuple[tuple[float, float], ...] = (
-    # Closer-than-0.30 seeds were dropped because the seed distance range
-    # below requires the camera to sit 0.28-0.36 m from the seed target,
-    # and PAROL6 with the wrist-flip mount can't reach a (0.22, 0) target
-    # at that distance — Sobol(128) gave 0/128 reachable on this combo.
-    # (0.30, 0) and (0.38, 0) are kept; their J0 sweeps still cover the
-    # full forward workspace once the wrist-flip clusters are accounted
-    # for, and they yield the necessary distance for the 0.21 m board to
-    # fit comfortably in the camera FOV plus the typical gaze offset.
+    (0.22, 0.0),  # close — workspaces near the base
     (0.30, 0.0),  # workspace centre
-    (0.38, 0.0),  # farther — fallback for outward-placed boards
+    (0.38, 0.0),  # farther — outward-placed boards
 )
 # Backwards-compat alias; consumers that wired _LOCALISE_SEED_TARGET_M
 # directly still work.
@@ -421,6 +414,18 @@ _LOCALISE_EARLY_STOP_DETECTIONS: int = 3
 # the controller naturally finished it. With 20° chunks at speed 0.10
 # (~1 s per chunk), halt response time is ≤1 s.
 _LOCALISE_J0_CHUNK_DEG: float = 20.0
+# Stage-2 refinement: after the J0 sweep finds the board, drive to N
+# overhead poses ABOVE the rough median centre and capture additional
+# frames. With the gaze pointed directly at the board (no offset), the
+# whole board fits comfortably in FOV, the markers are well-resolved,
+# and ChArUco interpolation gets ≥6 corners — much higher-quality
+# detections than the sweep frames where the board was off-axis. The
+# refined detections feed the same consensus pool as the sweep ones,
+# pulling the median toward the truth even when sweep detections were
+# noisy. Set to 0 to disable refinement.
+_LOCALISE_REFINE_N_POSES: int = 4
+_LOCALISE_REFINE_DISTANCE_M: float = 0.30
+_LOCALISE_REFINE_ELEVATION_DEG: float = 80.0
 # Time between captures during a continuous sweep (seconds). 150 ms →
 # ~7 captures per second; with sweep speed 10% of max joint, that's
 # roughly one capture every 1-2° of J0. Tune up (longer period) if the
@@ -438,23 +443,8 @@ _LOCALISE_CAPTURE_PERIOD_S: float = 0.15
 # search range misses every reachable seed. Empirically: same target,
 # same (d, ev), 0 reachable in (−90°, 90°) vs ~6 reachable in
 # (−180°, 180°).
-# Distance range chosen so the FULL 210 mm-wide board fits in the camera
-# FOV at the camera's gaze depth, with ~100 mm margin for the gaze being
-# offset from the actual board location during the J0 sweep. At
-# fx=fy=615 the FOV at distance d is ~1.04*d:
-#   d=0.22 m → FOV 230 mm → board takes 91 % (cropped on any tilt)
-#   d=0.28 m → FOV 291 mm → board takes 72 % + 100 mm offset margin (fits)
-#   d=0.34 m → FOV 354 mm → board takes 59 % (plenty of room)
-# The previous range (0.22, 0.34) was too close on its lower end —
-# capture diagnostic showed only 4 ArUco markers detected even when the
-# camera passed over the board, because cropped markers can't be decoded
-# (the script captured 4 detected + 13 REJECTED, the rejections being
-# markers whose quad fell partially outside the frame).
-# Elevation floor lowered from 60° to 45° because the higher distance
-# makes the wrist-flip kinematics tighter; allowing more oblique
-# elevations gives the IK enough freedom to find a reachable seed.
-_LOCALISE_SEED_DISTANCE_RANGE_M: tuple[float, float] = (0.28, 0.36)
-_LOCALISE_SEED_ELEVATION_RANGE_DEG: tuple[float, float] = (45.0, 80.0)
+_LOCALISE_SEED_DISTANCE_RANGE_M: tuple[float, float] = (0.22, 0.34)
+_LOCALISE_SEED_ELEVATION_RANGE_DEG: tuple[float, float] = (60.0, 85.0)
 _LOCALISE_SEED_N_CANDIDATES: int = 128
 # J0 sweep range (relative to the seed pose's J0 angle, in degrees) and
 # step count. ±90° covers the entire forward hemisphere; 13 steps at
@@ -468,11 +458,19 @@ _LOCALISE_J0_STEPS: int = 13
 # board succeed; lowering this to 1 lets us accept a single confident
 # detection. Increase for more robustness against false positives.
 _LOCALISE_MIN_DETECTIONS: int = 1
+# Early-stop requires both (a) total detections >=
+# _LOCALISE_EARLY_STOP_DETECTIONS, AND (b) at least
+# _LOCALISE_EARLY_STOP_INLIERS of those agreeing within
+# _LOCALISE_INLIER_THRESHOLD_M of the running median. Stopping on raw
+# count alone (the previous behaviour) was triggering after 3-4 noisy
+# low-corner detections that disagreed with each other by >10 mm —
+# downstream consensus then failed with "0 inliers within 10 mm".
+_LOCALISE_EARLY_STOP_INLIERS: int = 2
 # RANSAC inlier threshold (metres) — detections within this distance of the
-# inlier-set median count as agreeing on the board location. 1 cm is loose
+# inlier-set median count as agreeing on the board location. 5 cm is generous
 # enough that the cold-start mount's ~2 mm / 2° error doesn't reject good
 # detections, tight enough that an outlier 5 cm off doesn't fool us.
-_LOCALISE_INLIER_THRESHOLD_M: float = 0.01
+_LOCALISE_INLIER_THRESHOLD_M: float = 0.05
 
 
 def _hemi_azimuth_center_deg() -> float:
@@ -3276,17 +3274,24 @@ def _localise_board_thread() -> None:
                     raw_client.halt()
                     _post_status("Localise stopped by user")
                     return
-                # Skip remaining seeds once we've hit the early-stop
-                # threshold (the same threshold that halts a sweep
-                # mid-motion above).
+                # Skip remaining seeds only when we've gathered enough
+                # detections AND those detections agree on a board
+                # location (same gate as the in-sweep early stop above).
                 if len(detected_centres) >= _LOCALISE_EARLY_STOP_DETECTIONS:
-                    logger.info(
-                        "localise: skipping remaining seeds — already "
-                        "have %d detections (threshold %d)",
-                        len(detected_centres),
-                        _LOCALISE_EARLY_STOP_DETECTIONS,
+                    _det_arr = np.asarray(detected_centres, dtype=np.float64)
+                    _med = np.median(_det_arr, axis=0)
+                    _resid = np.linalg.norm(_det_arr - _med, axis=1)
+                    _n_inliers = int(
+                        (_resid < _LOCALISE_INLIER_THRESHOLD_M).sum()
                     )
-                    break
+                    if _n_inliers >= _LOCALISE_EARLY_STOP_INLIERS:
+                        logger.info(
+                            "localise: skipping remaining seeds — %d "
+                            "detections with %d inliers within %.0f mm",
+                            len(detected_centres), _n_inliers,
+                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
+                        )
+                        break
 
                 # Pick start of sweep based on current J0: whichever end of
                 # the [seed_J0 - half, seed_J0 + half] range is CLOSER to the
@@ -3460,23 +3465,50 @@ def _localise_board_thread() -> None:
                                     f"{'s' if len(detected_centres) != 1 else ''} "
                                     f"so far ({attempted} captures attempted)"
                                 )
-                                # Early stop within this chunk — halt
-                                # clears any queued work AND we break out
-                                # of the chunk-and-seed loops below.
+                                # Early stop ONLY if we have enough
+                                # detections AND those detections AGREE.
+                                # Stopping on raw count alone caused the
+                                # downstream consensus to fail when low-
+                                # corner detections disagreed by >5 cm.
+                                # Requirement: ≥N detections, ≥M of which
+                                # are within _LOCALISE_INLIER_THRESHOLD_M
+                                # of the median.
                                 if (
                                     len(detected_centres)
                                     >= _LOCALISE_EARLY_STOP_DETECTIONS
                                 ):
-                                    logger.info(
-                                        "localise: %d detections gathered "
-                                        "(threshold %d), halting sweep early",
-                                        len(detected_centres),
-                                        _LOCALISE_EARLY_STOP_DETECTIONS,
+                                    _det_arr = np.asarray(
+                                        detected_centres, dtype=np.float64,
                                     )
-                                    raw_client.halt()
-                                    done_event.wait(2.0)
-                                    stop_outer = True
-                                    break
+                                    _med = np.median(_det_arr, axis=0)
+                                    _resid = np.linalg.norm(
+                                        _det_arr - _med, axis=1,
+                                    )
+                                    _n_inliers = int(
+                                        (_resid < _LOCALISE_INLIER_THRESHOLD_M).sum()
+                                    )
+                                    if _n_inliers >= _LOCALISE_EARLY_STOP_INLIERS:
+                                        logger.info(
+                                            "localise: %d detections, %d "
+                                            "inliers within %.0f mm — "
+                                            "halting sweep early",
+                                            len(detected_centres), _n_inliers,
+                                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
+                                        )
+                                        raw_client.halt()
+                                        done_event.wait(2.0)
+                                        stop_outer = True
+                                        break
+                                    else:
+                                        logger.info(
+                                            "localise: %d detections but "
+                                            "only %d inliers within %.0f mm "
+                                            "of median (need ≥%d) — "
+                                            "continuing sweep",
+                                            len(detected_centres), _n_inliers,
+                                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
+                                            _LOCALISE_EARLY_STOP_INLIERS,
+                                        )
                         time.sleep(0.02)
                     waiter_thread.join(timeout=1.0)
                     if wait_error:
@@ -3615,6 +3647,143 @@ def _localise_board_thread() -> None:
                 "(or _LOCALISE_SCAN_TARGETS_M for legacy mode)."
             )
             return
+
+        # ---- Stage 2: refinement pass around the rough board centre ----
+        # Median of Stage-1 detections gives a rough board location. Drive
+        # to N high-quality overhead poses centred on that median: gaze
+        # straight down at the rough centre, distances/elevations chosen
+        # so the board fully fits the FOV. From these poses ChArUco gets
+        # the full board in view → 10-20 corners interpolated → much
+        # higher-precision detections than the off-axis sweep frames.
+        if _LOCALISE_REFINE_N_POSES > 0 and len(detected_centres) >= 1:
+            stage1_count = len(detected_centres)
+            rough_centre = np.median(
+                np.asarray(detected_centres, dtype=np.float64), axis=0,
+            )
+            _post_status(
+                f"Localise: stage 1 found {stage1_count} detections, "
+                f"refining around ({rough_centre[0]:.2f}, {rough_centre[1]:.2f})"
+            )
+            logger.info(
+                "localise stage 2: rough centre = %s, generating %d refinement poses",
+                rough_centre.tolist(), _LOCALISE_REFINE_N_POSES,
+            )
+            refine_target = rough_centre.copy()
+
+            # Sobol-search for IK-feasible refinement candidates around
+            # the rough centre. Wider candidate pool than we need so we
+            # can pick spatially-diverse picks.
+            refine_params = HemisphereParams(
+                n_candidates=128,
+                distance_range_m=(
+                    _LOCALISE_REFINE_DISTANCE_M - 0.04,
+                    _LOCALISE_REFINE_DISTANCE_M + 0.04,
+                ),
+                elevation_range_deg=(
+                    _LOCALISE_REFINE_ELEVATION_DEG - 8.0,
+                    _LOCALISE_REFINE_ELEVATION_DEG + 5.0,
+                ),
+                azimuth_range_deg=(-180.0, 180.0),
+                workspace_xy_max_m=0.55,
+                max_joint_change_deg=180.0,
+            )
+            refine_gen = PoseGenerator(
+                robot=scan_robot, mount=cold_start,
+                target_world=refine_target, params=refine_params,
+            )
+            try:
+                refine_cands, _ = refine_gen.generate(max_count=None)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "localise stage 2: pose generation raised %s: %s — "
+                    "skipping refinement", type(e).__name__, e,
+                )
+                refine_cands = []
+
+            if refine_cands:
+                # Greedy farthest-first thinning by camera azimuth around
+                # rough_centre, so the picks are spread across viewpoints
+                # rather than clustered.
+                def _refine_score(c) -> float:
+                    cam_pos = cold_start.cam_pose_for_flange_pose(
+                        np.asarray(c.flange_pose),
+                    )[:3, 3]
+                    forward = refine_target - cam_pos
+                    fn = float(np.linalg.norm(forward))
+                    return float(-(forward / fn)[2]) if fn > 1e-6 else 0.0
+
+                # Sort all by vertical-score, take top half, then thin by
+                # azimuth diversity to pick _LOCALISE_REFINE_N_POSES.
+                refine_cands.sort(key=_refine_score, reverse=True)
+                top_half = refine_cands[: max(_LOCALISE_REFINE_N_POSES * 4, 8)]
+
+                def _cam_azimuth_deg(c) -> float:
+                    cam_pos = cold_start.cam_pose_for_flange_pose(
+                        np.asarray(c.flange_pose),
+                    )[:3, 3]
+                    rel = cam_pos[:2] - refine_target[:2]
+                    return float(np.degrees(np.arctan2(rel[1], rel[0])))
+
+                # Greedy: pick first, then iteratively pick the one
+                # whose azimuth is farthest from the picks-so-far.
+                picks = [top_half[0]]
+                while len(picks) < _LOCALISE_REFINE_N_POSES and len(picks) < len(top_half):
+                    pick_azs = [_cam_azimuth_deg(p) for p in picks]
+                    def _min_az_dist(c, refs=pick_azs) -> float:
+                        a = _cam_azimuth_deg(c)
+                        return min(
+                            min(abs(a - r), 360 - abs(a - r)) for r in refs
+                        )
+                    remaining = [c for c in top_half if c not in picks]
+                    if not remaining:
+                        break
+                    picks.append(max(remaining, key=_min_az_dist))
+
+                logger.info(
+                    "localise stage 2: %d refinement poses selected (azimuths %s)",
+                    len(picks),
+                    ["%.0f" % _cam_azimuth_deg(p) for p in picks],
+                )
+
+                # Drive to each refinement pose, capture 1 frame.
+                for ri, c in enumerate(picks):
+                    if _state.get("stop_requested"):
+                        raw_client.halt()
+                        _post_status("Localise stopped by user")
+                        return
+                    refine_q_deg = list(np.degrees(c.joint_angles_rad).tolist())
+                    _post_status(
+                        f"Localise refine: pose {ri + 1}/{len(picks)} — moving"
+                    )
+                    try:
+                        rc = raw_client.move_j(
+                            angles=refine_q_deg,
+                            speed=0.3, accel=0.5, wait=True, timeout=15.0,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "localise refine pose %d move_j failed: %s", ri, e,
+                        )
+                        continue
+                    if rc < 0:
+                        continue
+                    time.sleep(
+                        _SETTLE_TIME_SIM_S if is_sim_mode else _SETTLE_TIME_REAL_S,
+                    )
+                    _capture_and_record(f"refine pose {ri + 1}/{len(picks)}")
+
+                stage2_count = len(detected_centres) - stage1_count
+                logger.info(
+                    "localise stage 2: gathered %d additional detections "
+                    "(total %d)",
+                    stage2_count, len(detected_centres),
+                )
+            else:
+                logger.info(
+                    "localise stage 2: no reachable refinement poses — "
+                    "proceeding with %d stage-1 detections",
+                    stage1_count,
+                )
 
         # Median-then-inlier-mean on CENTRES: robust to a single outlier
         # without needing full RANSAC. Mirrors the orchestrator's own
