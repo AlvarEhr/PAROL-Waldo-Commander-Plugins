@@ -3732,24 +3732,49 @@ def _localise_board_thread() -> None:
 
                 # Greedy: pick first, then iteratively pick the one
                 # whose azimuth is farthest from the picks-so-far.
-                picks = [top_half[0]]
-                while len(picks) < _LOCALISE_REFINE_N_POSES and len(picks) < len(top_half):
-                    pick_azs = [_cam_azimuth_deg(p) for p in picks]
-                    def _min_az_dist(c, refs=pick_azs) -> float:
-                        a = _cam_azimuth_deg(c)
+                # Track picks by INDEX into top_half — `c in picks` would
+                # try element-wise equality on the candidate's numpy
+                # fields and raise "truth value of array is ambiguous".
+                picked_indices: list[int] = [0]
+                while (
+                    len(picked_indices) < _LOCALISE_REFINE_N_POSES
+                    and len(picked_indices) < len(top_half)
+                ):
+                    pick_azs = [
+                        _cam_azimuth_deg(top_half[i]) for i in picked_indices
+                    ]
+                    def _min_az_dist(idx: int, refs: list[float] = pick_azs) -> float:
+                        a = _cam_azimuth_deg(top_half[idx])
                         return min(
                             min(abs(a - r), 360 - abs(a - r)) for r in refs
                         )
-                    remaining = [c for c in top_half if c not in picks]
-                    if not remaining:
+                    remaining_indices = [
+                        i for i in range(len(top_half)) if i not in picked_indices
+                    ]
+                    if not remaining_indices:
                         break
-                    picks.append(max(remaining, key=_min_az_dist))
+                    picked_indices.append(max(remaining_indices, key=_min_az_dist))
+                picks = [top_half[i] for i in picked_indices]
 
                 logger.info(
                     "localise stage 2: %d refinement poses selected (azimuths %s)",
                     len(picks),
                     ["%.0f" % _cam_azimuth_deg(p) for p in picks],
                 )
+
+                # halt() during stage-1 early-stop ALSO disabled the
+                # controller; subsequent move_j calls fail with
+                # "Controller disabled". resume() re-enables it before
+                # we send refinement moves. Without this, all 4
+                # refinement move_j calls return error code 50.
+                try:
+                    raw_client.resume()
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "localise refine: resume() raised %s: %s "
+                        "— refinement moves may fail",
+                        type(e).__name__, e,
+                    )
 
                 # Drive to each refinement pose, capture 1 frame.
                 for ri, c in enumerate(picks):
@@ -3820,18 +3845,47 @@ def _localise_board_thread() -> None:
         best_inlier_idx = int(max(inlier_indices, key=lambda j: detected_qualities[j]))
         R_detected = np.asarray(detected_poses[best_inlier_idx], dtype=np.float64)[:3, :3]
 
+        # SIM-MODE workaround for the VirtualCamera Y-flip pose artefact.
+        # virtual_camera.py Y-flips the canonical board image before the
+        # 4-corner homography warp — that flip is REQUIRED for ArUco to
+        # decode the marker bit patterns (verified: removing the flip
+        # drops detection from 16 markers to 2, rejected as undecodable).
+        # Side effect: the resulting solvePnP pose has the board's local
+        # frame Y-mirrored relative to the standard ChArUco convention,
+        # which in world frame manifests as the board's +Z axis flipped
+        # (pointing world DOWN instead of UP) AND a corresponding shift
+        # in the X/Y axes. Detected translation (board CENTRE in base
+        # frame) stays accurate because both the canonical and the
+        # 4-corner homography are consistent with each other; only the
+        # rotation is corrupted by the convention mismatch.
+        #
+        # On REAL hardware there's no Y-flip (live camera produces a
+        # real image of a real board), so the rotation is also correct
+        # and we use it. In sim, fall back to the configured RPY which
+        # represents the user's known board orientation.
+        if is_sim_mode:
+            R_to_use = old_R = _T_BOARD2BASE[:3, :3].copy()
+            logger.info(
+                "localise (sim): using configured board rotation (sim-mode "
+                "VirtualCamera Y-flip corrupts detected R); detected R[2, 2] "
+                "would have been %+.3f",
+                float(R_detected[2, 2]),
+            )
+        else:
+            R_to_use = R_detected
+            old_R = _T_BOARD2BASE[:3, :3].copy()
+
         # Build the new full 4x4 transform first, then assign atomically. The
         # previous in-memory rotation/translation are snapshotted for the
         # delta report so it shows the actual change since this update
         # (not the configured-vs-detected delta — that would be misleading
         # on repeat localise calls).
-        old_R = _T_BOARD2BASE[:3, :3].copy()
         old_origin = _T_BOARD2BASE[:3, 3].copy()
-        center_offset_world = R_detected @ center_local[:3]
+        center_offset_world = R_to_use @ center_local[:3]
         new_origin = new_centre - center_offset_world
 
         new_T = np.eye(4, dtype=np.float64)
-        new_T[:3, :3] = R_detected
+        new_T[:3, :3] = R_to_use
         new_T[:3, 3] = new_origin
         # Atomic-ish write: a concurrent reader of `_T_BOARD2BASE` either sees
         # the entire pre-update matrix or the entire post-update matrix, never
@@ -3844,7 +3898,7 @@ def _localise_board_thread() -> None:
         delta_mm = float(np.linalg.norm(new_origin - old_origin)) * 1000.0
         # ‖R_a − R_b‖_F = 2√2 sin(θ/2) is the exact identity (not approximate),
         # so this recovers the rotation angle in degrees.
-        rot_frob = float(np.linalg.norm(R_detected - old_R, ord="fro"))
+        rot_frob = float(np.linalg.norm(R_to_use - old_R, ord="fro"))
         rot_delta_deg = float(
             np.degrees(2.0 * np.arcsin(min(1.0, rot_frob / (2.0 * np.sqrt(2)))))
         )
