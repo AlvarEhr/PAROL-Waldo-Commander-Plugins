@@ -398,6 +398,13 @@ _LOCALISE_SEED_TARGET_M: tuple[float, float] = _LOCALISE_SEED_TARGETS_XY[1]
 # frame, so consecutive frames at the same detection event give similar
 # pose measurements that median-consensus well together.
 _LOCALISE_SWEEP_SPEED: float = 0.10
+# Early-stop threshold: once this many detections are gathered, halt the
+# in-progress sweep and skip remaining seeds. 3 gives the median
+# consensus enough samples to reject a single bad detection while
+# avoiding the full 3-seed × 18-second motion when the board is found
+# quickly. Set to a large number (e.g. 999) to disable early stop and
+# always run all seeds for the densest possible consensus sample set.
+_LOCALISE_EARLY_STOP_DETECTIONS: int = 3
 # Time between captures during a continuous sweep (seconds). 150 ms →
 # ~7 captures per second; with sweep speed 10% of max joint, that's
 # roughly one capture every 1-2° of J0. Tune up (longer period) if the
@@ -3066,10 +3073,30 @@ def _localise_board_thread() -> None:
         # Diagnostic state: counts of frame-level outcomes per sweep so the
         # post-sweep summary can tell us WHERE detection is breaking down
         # (blank frames vs no markers vs charuco interpolation vs pose fail).
-        _diag = {"blank": 0, "markers0": 0, "markers_some": 0, "detected": 0}
-        _diag_dump_dir: Path | None = None
-        _diag_dumped = 0
-        _DIAG_DUMP_LIMIT = 6  # save up to 6 sample frames total per localise run
+        # marker_counts / charuco_counts capture distributions to surface
+        # the "many markers visible but ChArUco interpolation produces too
+        # few corners" failure mode the previous dump couldn't show.
+        _diag = {
+            "blank": 0, "markers0": 0, "markers_some": 0, "detected": 0,
+            "marker_counts": [], "charuco_counts": [],
+        }
+        # Wipe any previous run's dumps so the saved frames are always
+        # the latest sweep's output.
+        import tempfile  # noqa: PLC0415
+        import shutil  # noqa: PLC0415
+        _diag_dump_dir: Path = Path(tempfile.gettempdir()) / "localise_frames"
+        if _diag_dump_dir.exists():
+            try:
+                shutil.rmtree(_diag_dump_dir)
+            except Exception:  # noqa: BLE001
+                pass  # don't crash localise on a permission glitch
+        _diag_dump_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("localise: diagnostic frames will be saved to %s", _diag_dump_dir)
+        _diag_dumped_blank = 0
+        _diag_dumped_content = 0
+        # Up to 3 blanks (for reference) + 20 content frames per run.
+        _DIAG_DUMP_BLANK_LIMIT = 3
+        _DIAG_DUMP_CONTENT_LIMIT = 20
 
         # Independent ArUco detector for the diagnostic probe — runs the
         # marker layer alone (skips ChArUco interpolation + solvePnP) so we
@@ -3080,20 +3107,26 @@ def _localise_board_thread() -> None:
         _aruco_probe = cv2.aruco.ArucoDetector(
             _aruco_dict_for_probe, cv2.aruco.DetectorParameters(),
         )
+        # Bare ChArUco detector to probe interpolation independently of
+        # solvePnP — some frames have many markers but ChArUco
+        # interpolation produces too few corners (e.g. all markers in a
+        # single row), and we want to surface that.
+        _charuco_board_for_probe = detector.board
+        _charuco_probe = cv2.aruco.CharucoDetector(_charuco_board_for_probe)
 
         def _capture_and_record(label: str) -> bool:
             """Capture one frame, run ChArUco detection, and on success
             append (board centre, full SE(3) pose, corner-count) to the
-            detection accumulators. Queries the live flange pose AFTER
-            capture so the joint angles match the captured frame within
-            ~10 ms — negligible drift at the configured sweep speeds.
-            Returns True on a successful detection.
+            detection accumulators. Returns True on a successful detection.
 
-            Also runs a low-level diagnostic probe on each frame (frame
-            stats + raw marker count) and saves up to _DIAG_DUMP_LIMIT
-            sample frames to a temp directory for visual inspection.
+            Per-frame diagnostic probe runs on every capture: frame stats,
+            raw ArUco marker count, ChArUco interpolated corner count.
+            Saves up to _DIAG_DUMP_CONTENT_LIMIT non-blank frames + a few
+            blanks for reference, with marker/corner counts in the
+            filename so the user can match a frame to its detection
+            outcome at a glance.
             """
-            nonlocal _diag_dumped, _diag_dump_dir
+            nonlocal _diag_dumped_blank, _diag_dumped_content
             try:
                 frame = camera.capture_color()
             except Exception as e:  # noqa: BLE001
@@ -3103,17 +3136,13 @@ def _localise_board_thread() -> None:
                 )
                 return False
 
-            # Frame stats — distinguishes blank (mean ≈ background) from
-            # filled frames where detection still fails.
-            frame_mean = float(frame.mean())
             frame_std = float(frame.std())
-            if frame_std < 2.0:
-                # Solid-grey blank — VirtualCamera bail path returns these
-                # when flange pose is None or board is out of view.
+            n_markers = 0
+            n_charuco_corners = 0
+            is_blank = frame_std < 2.0
+            if is_blank:
                 _diag["blank"] += 1
             else:
-                # Probe raw marker count without going through full board
-                # detection — tells us if ArUco itself can find markers.
                 gray = (
                     cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                     if frame.ndim == 3 else frame
@@ -3124,23 +3153,44 @@ def _localise_board_thread() -> None:
                     _diag["markers0"] += 1
                 else:
                     _diag["markers_some"] += 1
+                    _diag["marker_counts"].append(n_markers)
+                    # Probe ChArUco interpolation independently of solvePnP
+                    # — distinguishes "markers visible but interpolation
+                    # produced too few corners" from "interpolation OK but
+                    # solvePnP failed".
+                    try:
+                        ch_corners, ch_ids, _, _ = _charuco_probe.detectBoard(gray)
+                        if ch_ids is not None:
+                            n_charuco_corners = len(ch_ids)
+                            _diag["charuco_counts"].append(n_charuco_corners)
+                    except Exception:  # noqa: BLE001
+                        pass
 
-            # Save up to _DIAG_DUMP_LIMIT sample frames for visual inspection.
-            if _diag_dumped < _DIAG_DUMP_LIMIT:
-                if _diag_dump_dir is None:
-                    import tempfile  # noqa: PLC0415
-                    _diag_dump_dir = Path(tempfile.gettempdir()) / "localise_frames"
-                    _diag_dump_dir.mkdir(parents=True, exist_ok=True)
-                    logger.info(
-                        "localise: saving diagnostic frames to %s",
-                        _diag_dump_dir,
-                    )
-                fname = _diag_dump_dir / (
-                    f"frame_{_diag_dumped:02d}_{label.replace(' ', '_').replace('(', '').replace(')', '').replace(',', '')}.png"
+            # Dump strategy: save up to _DIAG_DUMP_BLANK_LIMIT blanks (for
+            # reference) and up to _DIAG_DUMP_CONTENT_LIMIT content frames
+            # (so we can visually verify what the detector is actually
+            # seeing). Filename encodes marker count + ChArUco corner
+            # count so a glance at the directory tells the story.
+            should_dump = (
+                (is_blank and _diag_dumped_blank < _DIAG_DUMP_BLANK_LIMIT)
+                or (not is_blank and _diag_dumped_content < _DIAG_DUMP_CONTENT_LIMIT)
+            )
+            if should_dump:
+                if is_blank:
+                    idx = _diag_dumped_blank
+                    tag = "blank"
+                    _diag_dumped_blank += 1
+                else:
+                    idx = _diag_dumped_content
+                    tag = f"m{n_markers}c{n_charuco_corners}"
+                    _diag_dumped_content += 1
+                safe_label = (
+                    label.replace(" ", "_").replace("(", "").replace(")", "")
+                    .replace(",", "")
                 )
+                fname = _diag_dump_dir / f"{tag}_{idx:02d}_{safe_label}.png"
                 try:
                     cv2.imwrite(str(fname), frame)
-                    _diag_dumped += 1
                 except Exception as e:  # noqa: BLE001
                     logger.debug("frame dump failed: %s", e)
 
@@ -3176,8 +3226,17 @@ def _localise_board_thread() -> None:
                     raw_client.halt()
                     _post_status("Localise stopped by user")
                     return
-                if len(detected_centres) >= _LOCALISE_MIN_DETECTIONS:
-                    break  # already enough
+                # Skip remaining seeds once we've hit the early-stop
+                # threshold (the same threshold that halts a sweep
+                # mid-motion above).
+                if len(detected_centres) >= _LOCALISE_EARLY_STOP_DETECTIONS:
+                    logger.info(
+                        "localise: skipping remaining seeds — already "
+                        "have %d detections (threshold %d)",
+                        len(detected_centres),
+                        _LOCALISE_EARLY_STOP_DETECTIONS,
+                    )
+                    break
 
                 # Pick start of sweep based on current J0: whichever end of
                 # the [seed_J0 - half, seed_J0 + half] range is CLOSER to the
@@ -3330,6 +3389,24 @@ def _localise_board_thread() -> None:
                                 f"{'s' if len(detected_centres) != 1 else ''} "
                                 f"so far ({attempted} captures attempted)"
                             )
+                            # Early-stop: once we have enough detections,
+                            # halt the sweep mid-motion. Median consensus
+                            # downstream prefers a few high-confidence
+                            # samples over many; running the full sweep
+                            # past that point just costs time.
+                            if (
+                                len(detected_centres)
+                                >= _LOCALISE_EARLY_STOP_DETECTIONS
+                            ):
+                                logger.info(
+                                    "localise: %d detections gathered "
+                                    "(threshold %d), halting sweep early",
+                                    len(detected_centres),
+                                    _LOCALISE_EARLY_STOP_DETECTIONS,
+                                )
+                                raw_client.halt()
+                                done_event.wait(2.0)
+                                break
                     # Short sleep so we don't pin the CPU between captures.
                     time.sleep(0.02)
 
@@ -3353,28 +3430,40 @@ def _localise_board_thread() -> None:
                     f"sweep ({seed_xy[0]:.2f}, {seed_xy[1]:.2f}) end"
                 )
 
-                # Per-sweep diagnostic summary. Goal: distinguish
-                # "camera never saw anything" from "camera saw things but
-                # detector kept failing", so the user can fix the right
-                # thing instead of guessing.
+                # Per-sweep diagnostic summary. Surfaces marker count
+                # distribution and ChArUco corner-count distribution so
+                # we can tell whether interpolation is the bottleneck.
+                marker_counts = _diag["marker_counts"]
+                charuco_counts = _diag["charuco_counts"]
+                marker_summary = (
+                    f"min={min(marker_counts)}, max={max(marker_counts)}, "
+                    f"mean={sum(marker_counts)/len(marker_counts):.1f}"
+                    if marker_counts else "(none)"
+                )
+                charuco_summary = (
+                    f"min={min(charuco_counts)}, max={max(charuco_counts)}, "
+                    f"mean={sum(charuco_counts)/len(charuco_counts):.1f}"
+                    if charuco_counts else "(none)"
+                )
                 logger.info(
                     "localise sweep (%.2f, %.2f) diagnostics: "
-                    "blank=%d (frame too uniform → camera likely returned "
-                    "_blank_frame, board out of view or flange-pose query "
-                    "failed); markers=0 in %d frames (frame had content but "
-                    "ArUco found no markers); markers≥1 in %d frames (markers "
-                    "visible, may need more for ChArUco interpolation); "
-                    "%d full detections succeeded",
+                    "blank=%d (camera bail); markers=0 in %d frames "
+                    "(content but no ArUco); markers≥1 in %d frames "
+                    "[count %s]; ChArUco corners interpolated %s; "
+                    "%d full detections (need ≥%d corners for pose)",
                     seed_xy[0], seed_xy[1],
                     _diag["blank"], _diag["markers0"],
-                    _diag["markers_some"], _diag["detected"],
+                    _diag["markers_some"], marker_summary, charuco_summary,
+                    _diag["detected"], detector.min_corners_for_pose,
                 )
                 # Reset counters so the next sweep starts clean — we keep
-                # _diag_dumped global to enforce the per-run dump limit.
+                # the dump counters global to enforce the per-run dump limit.
                 _diag["blank"] = 0
                 _diag["markers0"] = 0
                 _diag["markers_some"] = 0
                 _diag["detected"] = 0
+                _diag["marker_counts"] = []
+                _diag["charuco_counts"] = []
         elif _LOCALISE_USE_J0_SWEEP:
             # Discrete J0-sweep mode (continuous disabled). Per seed,
             # iterate _LOCALISE_J0_STEPS angles with stop+capture at each.
