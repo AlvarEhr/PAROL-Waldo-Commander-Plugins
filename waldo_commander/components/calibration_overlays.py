@@ -2881,6 +2881,15 @@ def _calibration_thread() -> None:
                 from parol6_vision.calibration.board import (  # noqa: PLC0415
                     BOARD_TABLET_30MM as _view_cfg,
                 )
+                from parol6_vision.calibration.view_pose import (  # noqa: PLC0415
+                    DEFAULT_MARGIN_PX as _VIEW_MARGIN_PX,
+                    DEFAULT_TARGET_FILL as _VIEW_TARGET_FILL,
+                    board_corners_world,
+                    score_view_candidate,
+                    view_distance_range,
+                )
+                from parol6_vision.camera.intrinsics import Intrinsics  # noqa: PLC0415
+
                 view_centre_local = np.array(
                     [
                         _view_cfg.squares_x * _view_cfg.square_length / 2.0,
@@ -2891,18 +2900,25 @@ def _calibration_thread() -> None:
                     dtype=np.float64,
                 )
                 view_target = (_T_BOARD2BASE @ view_centre_local)[:3]
-                # Range tuned for "board fits in FOV with margin" while
-                # keeping enough IK feasibility for typical workspace
-                # placements. (0.30, 0.36) m × (75°, 88°) was too tight
-                # — Sobol(128) returned 0 reachable on the user's
-                # board placement. Widening to (0.25, 0.34) m × (60°,
-                # 85°) yields ~15-25 reachable; the most-vertical pick
-                # is still close to overhead, board still fits FOV
-                # (FOV at 0.25 m ≈ 26 cm vs 21 cm board → 24 % margin).
+                view_corners_world = board_corners_world(_T_BOARD2BASE, _view_cfg)
+                view_intrinsics = Intrinsics(
+                    fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
+                    width=_INTR_W, height=_INTR_H,
+                    dist_coeffs=np.zeros(5, dtype=np.float64),
+                )
+                # Hemisphere range derived from intrinsics + board geometry —
+                # the score function picks the candidate that best frames the
+                # board (entire-board-in-frame is the priority, vertical
+                # overhead-ness + target-fill quality break ties). Wide range
+                # gives the pose generator IK headroom; PAROL6 typically can
+                # only reach the near end of the perfect-fit shell, so the
+                # "closest-to-fit" fallback in the scoring is what usually
+                # gets selected on this arm.
+                d_min, d_max = view_distance_range(view_intrinsics, _view_cfg)
                 view_params = HemisphereParams(
-                    n_candidates=128,
-                    distance_range_m=(0.25, 0.34),
-                    elevation_range_deg=(60.0, 85.0),
+                    n_candidates=512,
+                    distance_range_m=(d_min, d_max),
+                    elevation_range_deg=(50.0, 89.0),
                     azimuth_range_deg=(-180.0, 180.0),
                     workspace_xy_max_m=0.55,
                     max_joint_change_deg=180.0,
@@ -2913,25 +2929,34 @@ def _calibration_thread() -> None:
                 )
                 view_cands, _ = view_gen.generate(max_count=None)
 
-                def _view_vertical_score(
-                    c: Any,
-                    target: NDArray[np.float64] = view_target,
-                    mount: CameraMount = output.mount,
-                ) -> float:
-                    cp = mount.cam_pose_for_flange_pose(
-                        np.asarray(c.flange_pose),
-                    )[:3, 3]
-                    f = target - cp
-                    fn = float(np.linalg.norm(f))
-                    return float(-(f / fn)[2]) if fn > 1e-6 else 0.0
-
                 if view_cands:
-                    view_cands.sort(key=_view_vertical_score, reverse=True)
-                    best_view = view_cands[0]
-                    score = _view_vertical_score(best_view)
+                    scored = [
+                        (
+                            score_view_candidate(
+                                c, output.mount, view_target,
+                                view_corners_world, view_intrinsics,
+                                target_fill=_VIEW_TARGET_FILL,
+                                margin_px=_VIEW_MARGIN_PX,
+                            ),
+                            c,
+                        )
+                        for c in view_cands
+                    ]
+                    scored.sort(key=lambda sc: sc[0][0], reverse=True)
+                    (best_score, best_info), best_view = scored[0]
+                    n_in_frame = sum(
+                        1 for (_, info), _ in scored if info["in_frame"]
+                    )
                     logger.info(
-                        "post-calibration: driving to view-board pose "
-                        "(vertical-score=%.3f)", score,
+                        "post-calibration view pose: %d/%d in-frame, picked "
+                        "score=%.3f vertical=%.3f in_frame=%s "
+                        "max_fill=%.2f distance=%.0fmm "
+                        "(d_range=%.0f-%.0fmm, %d reachable)",
+                        n_in_frame, len(view_cands),
+                        best_score, best_info["vertical"],
+                        best_info["in_frame"], best_info["max_fill"],
+                        best_info["distance_m"] * 1000,
+                        d_min * 1000, d_max * 1000, len(view_cands),
                     )
                     _post_status("Calibrated — moving to view-board pose")
                     try:
@@ -2957,8 +2982,8 @@ def _calibration_thread() -> None:
                 else:
                     logger.info(
                         "post-calibration: no reachable view-board pose "
-                        "(0/%d candidates), going home",
-                        128,
+                        "(0/%d candidates, d_range=%.0f-%.0f mm), going home",
+                        view_params.n_candidates, d_min * 1000, d_max * 1000,
                     )
                     _post_status("Calibrated — view pose unreachable, homing")
                     try:
