@@ -3257,6 +3257,30 @@ def _localise_board_thread() -> None:
                 return False
             T_board2cam = board_pose_to_matrix(detection)
             T_board2base_obs = T_flange2base @ cold_start.T_cam2flange @ T_board2cam
+
+            # IPPE planar-PnP ambiguity disambiguation. cv2.solvePnP with
+            # SOLVEPNP_IPPE returns one of two valid solutions for a flat
+            # target — one with the board normal pointing toward the
+            # camera, one pointing away. With overhead views (camera looking
+            # straight down) the two solutions have similar reprojection
+            # error, and the detector sometimes picks the "wrong" one,
+            # producing a board pose with normal pointing DOWN instead of
+            # UP. Visually this manifests as the tablet+board overlay
+            # rendering inverted (tablet on top of board instead of below).
+            #
+            # Strong prior: the board is face-up on a horizontal surface,
+            # so the board's local +Z axis must have a positive component
+            # along world +Z. If the detected R[2, 2] is negative, swap to
+            # the alternate IPPE solution by negating board Y and Z columns
+            # of R — equivalent to rotating the board 180° about its local
+            # X axis, which is exactly the geometric reflection that
+            # relates the two IPPE solutions for planar targets.
+            if T_board2base_obs[2, 2] < 0.0:
+                R_corrected = T_board2base_obs[:3, :3].copy()
+                R_corrected[:, 1] = -R_corrected[:, 1]
+                R_corrected[:, 2] = -R_corrected[:, 2]
+                T_board2base_obs[:3, :3] = R_corrected
+
             board_centre_obs = (T_board2base_obs @ center_local)[:3]
             detected_centres.append(board_centre_obs)
             detected_poses.append(T_board2base_obs)
@@ -3673,15 +3697,21 @@ def _localise_board_thread() -> None:
             # Sobol-search for IK-feasible refinement candidates around
             # the rough centre. Wider candidate pool than we need so we
             # can pick spatially-diverse picks.
+            # Refinement search ranges are wide enough to find SOMETHING
+            # reachable for almost any rough_centre in the workspace —
+            # narrow ranges fail outright at e.g. (0.16, 0) where
+            # PAROL6's wrist-flip kinematics are tight. Wide elevation
+            # band (50°-85°) gives the IK enough freedom; wide distance
+            # band (0.22-0.36) covers near-base AND far-base targets.
             refine_params = HemisphereParams(
-                n_candidates=128,
+                n_candidates=256,
                 distance_range_m=(
-                    _LOCALISE_REFINE_DISTANCE_M - 0.04,
-                    _LOCALISE_REFINE_DISTANCE_M + 0.04,
+                    max(0.20, _LOCALISE_REFINE_DISTANCE_M - 0.10),
+                    _LOCALISE_REFINE_DISTANCE_M + 0.06,
                 ),
                 elevation_range_deg=(
-                    _LOCALISE_REFINE_ELEVATION_DEG - 8.0,
-                    _LOCALISE_REFINE_ELEVATION_DEG + 5.0,
+                    max(40.0, _LOCALISE_REFINE_ELEVATION_DEG - 30.0),
+                    min(85.0, _LOCALISE_REFINE_ELEVATION_DEG + 5.0),
                 ),
                 azimuth_range_deg=(-180.0, 180.0),
                 workspace_xy_max_m=0.55,
