@@ -386,9 +386,16 @@ _LOCALISE_CONTINUOUS_SWEEP: bool = True
 # tighter circle around the base — covers more of the workspace per
 # unit of J0 rotation.
 _LOCALISE_SEED_TARGETS_XY: tuple[tuple[float, float], ...] = (
-    (0.22, 0.0),  # closer to base — try first (catches workspaces "more inward")
-    (0.30, 0.0),  # centre — original default
-    (0.38, 0.0),  # farther — fallback (catches workspaces "more outward")
+    # Closer-than-0.30 seeds were dropped because the seed distance range
+    # below requires the camera to sit 0.28-0.36 m from the seed target,
+    # and PAROL6 with the wrist-flip mount can't reach a (0.22, 0) target
+    # at that distance — Sobol(128) gave 0/128 reachable on this combo.
+    # (0.30, 0) and (0.38, 0) are kept; their J0 sweeps still cover the
+    # full forward workspace once the wrist-flip clusters are accounted
+    # for, and they yield the necessary distance for the 0.21 m board to
+    # fit comfortably in the camera FOV plus the typical gaze offset.
+    (0.30, 0.0),  # workspace centre
+    (0.38, 0.0),  # farther — fallback for outward-placed boards
 )
 # Backwards-compat alias; consumers that wired _LOCALISE_SEED_TARGET_M
 # directly still work.
@@ -422,8 +429,23 @@ _LOCALISE_CAPTURE_PERIOD_S: float = 0.15
 # search range misses every reachable seed. Empirically: same target,
 # same (d, ev), 0 reachable in (−90°, 90°) vs ~6 reachable in
 # (−180°, 180°).
-_LOCALISE_SEED_DISTANCE_RANGE_M: tuple[float, float] = (0.22, 0.34)
-_LOCALISE_SEED_ELEVATION_RANGE_DEG: tuple[float, float] = (60.0, 85.0)
+# Distance range chosen so the FULL 210 mm-wide board fits in the camera
+# FOV at the camera's gaze depth, with ~100 mm margin for the gaze being
+# offset from the actual board location during the J0 sweep. At
+# fx=fy=615 the FOV at distance d is ~1.04*d:
+#   d=0.22 m → FOV 230 mm → board takes 91 % (cropped on any tilt)
+#   d=0.28 m → FOV 291 mm → board takes 72 % + 100 mm offset margin (fits)
+#   d=0.34 m → FOV 354 mm → board takes 59 % (plenty of room)
+# The previous range (0.22, 0.34) was too close on its lower end —
+# capture diagnostic showed only 4 ArUco markers detected even when the
+# camera passed over the board, because cropped markers can't be decoded
+# (the script captured 4 detected + 13 REJECTED, the rejections being
+# markers whose quad fell partially outside the frame).
+# Elevation floor lowered from 60° to 45° because the higher distance
+# makes the wrist-flip kinematics tighter; allowing more oblique
+# elevations gives the IK enough freedom to find a reachable seed.
+_LOCALISE_SEED_DISTANCE_RANGE_M: tuple[float, float] = (0.28, 0.36)
+_LOCALISE_SEED_ELEVATION_RANGE_DEG: tuple[float, float] = (45.0, 80.0)
 _LOCALISE_SEED_N_CANDIDATES: int = 128
 # J0 sweep range (relative to the seed pose's J0 angle, in degrees) and
 # step count. ±90° covers the entire forward hemisphere; 13 steps at
