@@ -3257,30 +3257,6 @@ def _localise_board_thread() -> None:
                 return False
             T_board2cam = board_pose_to_matrix(detection)
             T_board2base_obs = T_flange2base @ cold_start.T_cam2flange @ T_board2cam
-
-            # IPPE planar-PnP ambiguity disambiguation. cv2.solvePnP with
-            # SOLVEPNP_IPPE returns one of two valid solutions for a flat
-            # target — one with the board normal pointing toward the
-            # camera, one pointing away. With overhead views (camera looking
-            # straight down) the two solutions have similar reprojection
-            # error, and the detector sometimes picks the "wrong" one,
-            # producing a board pose with normal pointing DOWN instead of
-            # UP. Visually this manifests as the tablet+board overlay
-            # rendering inverted (tablet on top of board instead of below).
-            #
-            # Strong prior: the board is face-up on a horizontal surface,
-            # so the board's local +Z axis must have a positive component
-            # along world +Z. If the detected R[2, 2] is negative, swap to
-            # the alternate IPPE solution by negating board Y and Z columns
-            # of R — equivalent to rotating the board 180° about its local
-            # X axis, which is exactly the geometric reflection that
-            # relates the two IPPE solutions for planar targets.
-            if T_board2base_obs[2, 2] < 0.0:
-                R_corrected = T_board2base_obs[:3, :3].copy()
-                R_corrected[:, 1] = -R_corrected[:, 1]
-                R_corrected[:, 2] = -R_corrected[:, 2]
-                T_board2base_obs[:3, :3] = R_corrected
-
             board_centre_obs = (T_board2base_obs @ center_local)[:3]
             detected_centres.append(board_centre_obs)
             detected_poses.append(T_board2base_obs)
