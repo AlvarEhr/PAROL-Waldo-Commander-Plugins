@@ -3264,64 +3264,89 @@ def _localise_board_thread() -> None:
                         rc,
                     )
                     continue
-                # RACE FIX: there's a brief window between move_j(wait=False)
-                # returning and parol6-server actually starting the motion,
-                # during which all joint speeds are zero and is_robot_stopped()
-                # returns True. If we entered the polling loop directly the
-                # FIRST is_robot_stopped() check would fire and we'd exit
-                # before any motion happened (observed live: sweep completed
-                # in 5 s with only 2 captures, while a sweep that DID run took
-                # 22 s with 42 captures). Wait until the joints actually
-                # start moving (or 1 s timeout) before trusting "stopped".
-                start_wait_began = time.monotonic()
-                while time.monotonic() - start_wait_began < 1.0:
-                    try:
-                        if not raw_client.is_robot_stopped(threshold_speed=2.0):
-                            break  # motion has begun
-                    except Exception:  # noqa: BLE001
-                        break  # don't hang on a transient query failure
-                    time.sleep(0.05)
-                else:
-                    logger.warning(
-                        "localise sweep (%.2f, %.2f): motion didn't start "
-                        "within 1 s — robot may already be at the end-pose "
-                        "or move_j was rejected. Capturing what we can.",
-                        seed_xy[0], seed_xy[1],
-                    )
-
-                # Capture loop while motion executes. is_robot_stopped()
-                # uses joint speed below 2.0 °/s as the threshold —
-                # during the sweep at 10% max speed, joints move several
-                # °/s, so this stays False until the end-pose is reached.
+                # Capture loop while motion executes.
+                #
+                # COMPLETION DETECTION: previously used is_robot_stopped()
+                # (joint speed below 2 °/s threshold). Live diagnostic
+                # showed that lied — parol6's status broadcaster reports
+                # speeds at ~50 Hz and stale-status windows make
+                # is_robot_stopped() flip True while joints are still
+                # moving. Loop exited mid-motion, captured ~2 frames, and
+                # the user saw the "completed" log line appear well
+                # before the robot actually reached the target.
+                #
+                # New approach: check joint ANGLES against the target.
+                # That's deterministic — current angles update from the
+                # same status stream but their VALUE is what we care
+                # about, not their derivative. When max-per-joint
+                # angle error drops below 1°, motion is genuinely done.
+                # A stuck-progress watchdog (no movement >3 s while not
+                # at target) catches the rare case of move_j being
+                # rejected silently.
+                target_q_deg = np.degrees(end_q)
                 last_capture = 0.0
-                # Bound the loop with a time-out in case is_robot_stopped
-                # never flips True (e.g. parol6-server hung): assume max
-                # 30 s for any single sweep, then halt and move on.
                 sweep_started = time.monotonic()
                 sweep_max_duration_s = 30.0
+                last_progress_t = sweep_started
+                last_q_deg: NDArray[np.float64] | None = None
                 while True:
                     if _state.get("stop_requested"):
                         raw_client.halt()
                         _post_status("Localise stopped by user")
                         return
-                    if time.monotonic() - sweep_started > sweep_max_duration_s:
+                    now = time.monotonic()
+                    if now - sweep_started > sweep_max_duration_s:
                         logger.warning(
                             "localise sweep timed out after %.1f s, halting",
                             sweep_max_duration_s,
                         )
                         raw_client.halt()
                         break
+
                     try:
-                        if raw_client.is_robot_stopped(threshold_speed=2.0):
-                            break
+                        cur_angles = raw_client.angles()
                     except Exception as e:  # noqa: BLE001
                         logger.warning(
-                            "localise: is_robot_stopped raised %s: %s; "
-                            "halting and moving on", type(e).__name__, e,
+                            "localise: angles() raised %s: %s; halting",
+                            type(e).__name__, e,
                         )
                         raw_client.halt()
                         break
-                    now = time.monotonic()
+                    if cur_angles is None or len(cur_angles) < 6:
+                        time.sleep(0.05)
+                        continue
+                    cur_q_deg = np.asarray(cur_angles, dtype=np.float64)
+
+                    # Track progress: any joint moved by >0.3° since
+                    # last sample → robot is actively traversing the
+                    # trajectory, reset the stuck-progress timer.
+                    if (
+                        last_q_deg is not None
+                        and float(np.max(np.abs(cur_q_deg - last_q_deg))) > 0.3
+                    ):
+                        last_progress_t = now
+                    last_q_deg = cur_q_deg
+
+                    # Motion done — at the target within 1° per joint.
+                    angle_err_deg = float(
+                        np.max(np.abs(cur_q_deg - target_q_deg)),
+                    )
+                    if angle_err_deg < 1.0:
+                        break
+
+                    # Stuck-progress watchdog: no joint movement for
+                    # >3 s WHILE we're not at target. Means move_j was
+                    # rejected or parol6-server is genuinely hung;
+                    # halt + bail rather than waiting for the 30 s timeout.
+                    if now - last_progress_t > 3.0:
+                        logger.warning(
+                            "localise sweep stuck at angle err=%.1f° with "
+                            "no progress for >3 s; halting",
+                            angle_err_deg,
+                        )
+                        raw_client.halt()
+                        break
+
                     if now - last_capture >= _LOCALISE_CAPTURE_PERIOD_S:
                         last_capture = now
                         attempted += 1
