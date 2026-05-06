@@ -412,6 +412,15 @@ _LOCALISE_SWEEP_SPEED: float = 0.10
 # quickly. Set to a large number (e.g. 999) to disable early stop and
 # always run all seeds for the densest possible consensus sample set.
 _LOCALISE_EARLY_STOP_DETECTIONS: int = 3
+# Chunk size for the J0 sweep in degrees. The full sweep is broken into
+# back-to-back move_j commands of this size so that halt() (used both by
+# early-stop AND the user's Stop / E-Stop button) interrupts within at
+# most one chunk's worth of motion. parol6's halt() clears the command
+# queue but does NOT interrupt the trajectory currently being executed
+# by the controller — so a single 180° sweep was uninterruptible until
+# the controller naturally finished it. With 20° chunks at speed 0.10
+# (~1 s per chunk), halt response time is ≤1 s.
+_LOCALISE_J0_CHUNK_DEG: float = 20.0
 # Time between captures during a continuous sweep (seconds). 150 ms →
 # ~7 captures per second; with sweep speed 10% of max joint, that's
 # roughly one capture every 1-2° of J0. Tune up (longer period) if the
@@ -3352,115 +3361,140 @@ def _localise_board_thread() -> None:
                     f"Localise: continuous sweep at seed ({seed_xy[0]:.2f}, "
                     f"{seed_xy[1]:.2f}) — scanning"
                 )
-                # Issue non-blocking move to end of sweep. move_j returns
-                # the command_index — we'll pass that to wait_command()
-                # in a background thread to get an authoritative
-                # completion signal from the server.
-                cmd_idx = raw_client.move_j(
-                    angles=list(np.degrees(end_q)),
-                    speed=_LOCALISE_SWEEP_SPEED, accel=0.5, wait=False,
-                    timeout=30.0,
+                # CHUNKED SWEEP: break the J0 motion into back-to-back
+                # move_j commands of ~_LOCALISE_J0_CHUNK_DEG each. parol6's
+                # halt() clears the command queue but does not interrupt
+                # the trajectory currently being executed; chunking gives
+                # the user's Stop / E-Stop AND the early-stop-on-enough-
+                # detections logic a chance to take effect within ~1 s
+                # rather than waiting for the full 180° sweep to finish.
+                start_j0_rad = float(start_q[0])
+                end_j0_rad = float(end_q[0])
+                total_dj0_rad = end_j0_rad - start_j0_rad
+                chunk_step_rad = np.radians(_LOCALISE_J0_CHUNK_DEG) * np.sign(
+                    total_dj0_rad
                 )
-                if cmd_idx < 0:
-                    logger.info(
-                        "localise sweep continuous move returned rc=%d; skipping",
-                        cmd_idx,
-                    )
-                    continue
+                # Build the list of waypoint J0 angles, ending exactly at
+                # end_j0_rad even if the last step is shorter than a full
+                # chunk. range/linspace doesn't quite fit here, so step
+                # through manually.
+                chunk_targets: list[float] = []
+                cur = start_j0_rad
+                while abs(end_j0_rad - cur) > abs(chunk_step_rad) * 1.001:
+                    cur += chunk_step_rad
+                    chunk_targets.append(cur)
+                chunk_targets.append(end_j0_rad)
 
-                # COMPLETION DETECTION: use parol6's wait_command(), which
-                # waits on the server's `completed_command_index` from the
-                # status broadcast — a hard "command N has finished"
-                # guarantee from the controller, not derivative-based.
-                # Run it in a background thread so the foreground capture
-                # loop can keep capturing during motion. The sync client's
-                # persistent background event loop handles concurrent
-                # coroutines fine: wait_command() awaits a status
-                # condition, while angles()/pose() called from the capture
-                # loop run as separate UDP request/response coroutines.
-                done_event = threading.Event()
-                wait_error: list[Exception] = []
-
-                def _wait_for_completion(idx: int = cmd_idx) -> None:
-                    try:
-                        raw_client.wait_command(idx, timeout=35.0)
-                    except Exception as e:  # noqa: BLE001
-                        wait_error.append(e)
-                    finally:
-                        done_event.set()
-
-                waiter_thread = threading.Thread(
-                    target=_wait_for_completion, daemon=True,
-                    name=f"localise-waiter-cmd{cmd_idx}",
-                )
-                waiter_thread.start()
-
+                stop_outer = False
                 last_capture = 0.0
-                sweep_started = time.monotonic()
-                # Watchdog slightly longer than wait_command's 35 s timeout
-                # so the watchdog only fires if the waiter itself is hung
-                # (which would also mean status broadcasts are dropping).
-                sweep_max_duration_s = 40.0
-                while not done_event.is_set():
-                    if _state.get("stop_requested"):
-                        raw_client.halt()
-                        # Give the waiter a moment to observe the halt
-                        # and update completed_index, then exit.
-                        done_event.wait(2.0)
-                        _post_status("Localise stopped by user")
-                        return
-                    if time.monotonic() - sweep_started > sweep_max_duration_s:
-                        logger.warning(
-                            "localise sweep watchdog tripped after %.1f s "
-                            "(wait_command not finishing); halting",
-                            sweep_max_duration_s,
+                for chunk_idx, chunk_j0 in enumerate(chunk_targets):
+                    chunk_q = seed_q_rad.copy()
+                    chunk_q[0] = chunk_j0
+                    if not scan_robot.check_limits(chunk_q):
+                        logger.info(
+                            "localise sweep chunk %d/%d at J0=%.1f° out of "
+                            "limits, halting and skipping rest of sweep",
+                            chunk_idx + 1, len(chunk_targets),
+                            float(np.degrees(chunk_j0)),
                         )
-                        raw_client.halt()
-                        done_event.wait(2.0)
                         break
-                    now = time.monotonic()
-                    if now - last_capture >= _LOCALISE_CAPTURE_PERIOD_S:
-                        last_capture = now
-                        attempted += 1
-                        if _capture_and_record(
-                            f"sweep ({seed_xy[0]:.2f}, {seed_xy[1]:.2f})"
-                        ):
-                            _post_status(
-                                f"Localise: {len(detected_centres)} detection"
-                                f"{'s' if len(detected_centres) != 1 else ''} "
-                                f"so far ({attempted} captures attempted)"
-                            )
-                            # Early-stop: once we have enough detections,
-                            # halt the sweep mid-motion. Median consensus
-                            # downstream prefers a few high-confidence
-                            # samples over many; running the full sweep
-                            # past that point just costs time.
-                            if (
-                                len(detected_centres)
-                                >= _LOCALISE_EARLY_STOP_DETECTIONS
-                            ):
-                                logger.info(
-                                    "localise: %d detections gathered "
-                                    "(threshold %d), halting sweep early",
-                                    len(detected_centres),
-                                    _LOCALISE_EARLY_STOP_DETECTIONS,
-                                )
-                                raw_client.halt()
-                                done_event.wait(2.0)
-                                break
-                    # Short sleep so we don't pin the CPU between captures.
-                    time.sleep(0.02)
 
-                # Drain the waiter thread (should already be done).
-                waiter_thread.join(timeout=1.0)
-                if wait_error:
-                    logger.warning(
-                        "localise wait_command for sweep (%.2f, %.2f) raised "
-                        "%s: %s — sweep may have been halted or the server "
-                        "rejected the trajectory.",
-                        seed_xy[0], seed_xy[1],
-                        type(wait_error[0]).__name__, wait_error[0],
+                    cmd_idx = raw_client.move_j(
+                        angles=list(np.degrees(chunk_q)),
+                        speed=_LOCALISE_SWEEP_SPEED, accel=0.5, wait=False,
+                        timeout=10.0,
                     )
+                    if cmd_idx < 0:
+                        logger.info(
+                            "localise sweep chunk %d move_j returned rc=%d; "
+                            "skipping rest of sweep", chunk_idx + 1, cmd_idx,
+                        )
+                        break
+
+                    # wait_command on this chunk in a background thread.
+                    done_event = threading.Event()
+                    wait_error: list[Exception] = []
+
+                    def _wait_for_completion(idx: int = cmd_idx) -> None:
+                        try:
+                            raw_client.wait_command(idx, timeout=10.0)
+                        except Exception as e:  # noqa: BLE001
+                            wait_error.append(e)
+                        finally:
+                            done_event.set()
+
+                    waiter_thread = threading.Thread(
+                        target=_wait_for_completion, daemon=True,
+                        name=f"localise-waiter-cmd{cmd_idx}",
+                    )
+                    waiter_thread.start()
+
+                    chunk_started = time.monotonic()
+                    while not done_event.is_set():
+                        if _state.get("stop_requested"):
+                            raw_client.halt()
+                            done_event.wait(2.0)
+                            _post_status("Localise stopped by user")
+                            return
+                        # Per-chunk watchdog: ~1 s expected, 5 s caps it.
+                        if time.monotonic() - chunk_started > 5.0:
+                            logger.warning(
+                                "localise sweep chunk %d watchdog tripped, halting",
+                                chunk_idx + 1,
+                            )
+                            raw_client.halt()
+                            done_event.wait(2.0)
+                            stop_outer = True
+                            break
+                        now = time.monotonic()
+                        if now - last_capture >= _LOCALISE_CAPTURE_PERIOD_S:
+                            last_capture = now
+                            attempted += 1
+                            if _capture_and_record(
+                                f"sweep ({seed_xy[0]:.2f}, {seed_xy[1]:.2f}) "
+                                f"chunk {chunk_idx + 1}"
+                            ):
+                                _post_status(
+                                    f"Localise: {len(detected_centres)} "
+                                    f"detection"
+                                    f"{'s' if len(detected_centres) != 1 else ''} "
+                                    f"so far ({attempted} captures attempted)"
+                                )
+                                # Early stop within this chunk — halt
+                                # clears any queued work AND we break out
+                                # of the chunk-and-seed loops below.
+                                if (
+                                    len(detected_centres)
+                                    >= _LOCALISE_EARLY_STOP_DETECTIONS
+                                ):
+                                    logger.info(
+                                        "localise: %d detections gathered "
+                                        "(threshold %d), halting sweep early",
+                                        len(detected_centres),
+                                        _LOCALISE_EARLY_STOP_DETECTIONS,
+                                    )
+                                    raw_client.halt()
+                                    done_event.wait(2.0)
+                                    stop_outer = True
+                                    break
+                        time.sleep(0.02)
+                    waiter_thread.join(timeout=1.0)
+                    if wait_error:
+                        logger.warning(
+                            "localise wait_command for chunk %d raised %s: %s",
+                            chunk_idx + 1, type(wait_error[0]).__name__,
+                            wait_error[0],
+                        )
+                        stop_outer = True
+                        break
+                    if stop_outer:
+                        break
+
+                if stop_outer:
+                    # We've already broken out of the chunk loop; let the
+                    # outer per-seed loop terminate too via the same
+                    # early-stop-detection check at its top.
+                    pass
 
                 # Settle briefly after the sweep finishes, then capture once
                 # more at the end pose — same rationale as the start
