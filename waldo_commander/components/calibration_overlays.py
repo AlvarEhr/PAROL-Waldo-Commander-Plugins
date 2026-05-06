@@ -277,6 +277,15 @@ _MAX_CAM_BOARD_ANGLE_DEG: float = 78.0
 # python-fcl breaks against thin box geometry.
 _FLOOR_PRIMITIVE_ENABLED: bool = True
 
+# SSG-48 gripper jaw variant for collision checking. The user has two
+# interchangeable jaw STLs in parol6's mesh dir — "finger" (the standard
+# Spectral SSG-48 finger) and "pinch" (narrower pinch tips). Only ONE
+# variant is physically mounted at a time; loading both into the
+# collision manager would over-reject (the union of finger+pinch
+# extents). Picks the variant that matches the physically-mounted jaws;
+# default "finger" matches Jepson's default SSG-48 config.
+_SSG48_JAW_VARIANT: str = "finger"  # "finger" or "pinch"
+
 # Tablet collision primitive — the physical ChArUco display (Galaxy Tab S9
 # Ultra: 208.6 × 326.4 × 5.5 mm bare; ~11 mm with the case) is added as a
 # static collision box at the current _T_BOARD2BASE pose. Anything (gripper,
@@ -778,6 +787,32 @@ def _build_collision_manager(
             mgr.add_object("gripper", trimesh.load(grip_path, force="mesh"), transform=np.eye(4))
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for gripper: %s", e)
+    # Gripper FINGERS — loaded as separate collision objects because they
+    # extend ~50 mm beyond the body in flange -Z and are the part that
+    # actually clips into the workspace tablet/floor at low-elevation
+    # poses. Without them the collision check passes the body cleanly
+    # but the fingertips drag through the tablet surface — exactly the
+    # symptom the user reported. SSG-48 has two interchangeable jaw
+    # variants ("finger" or "pinch"); only one is physically mounted at
+    # a time, so we load only the configured _SSG48_JAW_VARIANT.
+    jaw_loaded: list[str] = []
+    for side in ("left", "right"):
+        jaw_name = f"ssg48_{_SSG48_JAW_VARIANT}_{side}"
+        jaw_path = mesh_dir / f"{jaw_name}_simplified.stl"
+        if not jaw_path.exists():
+            jaw_path = mesh_dir / f"{jaw_name}.stl"
+        if not jaw_path.exists():
+            logger.warning(
+                "collision mesh: %s STL not found in %s — fingertips will "
+                "NOT be collision-checked, low-elevation poses may clip "
+                "the workspace.", jaw_name, mesh_dir,
+            )
+            continue
+        try:
+            mgr.add_object(jaw_name, trimesh.load(jaw_path, force="mesh"), transform=np.eye(4))
+            jaw_loaded.append(jaw_name)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("collision mesh load failed for %s: %s", jaw_name, e)
 
     # FLOOR collision primitive — wide flat box at z ∈ [-0.05, 0]. Anything
     # dipping below z=0 collides with FLOOR. Catches gripper-finger and
@@ -830,6 +865,16 @@ def _build_collision_manager(
         ("L3", "L4"), ("L4", "L5"), ("L5", "L6"),
         ("L6", "gripper"),
     }
+    # The fingers are rigidly attached to the gripper body (we move them
+    # with the same transform as the body). Whitelist body↔jaw and
+    # jaw↔jaw contacts so the (always-overlapping at the base) finger
+    # roots don't fire false self-collision rejections.
+    for jaw in jaw_loaded:
+        adjacent |= {
+            ("L6", jaw), ("gripper", jaw),
+        }
+    if len(jaw_loaded) == 2:
+        adjacent |= {(jaw_loaded[0], jaw_loaded[1])}
     # The robot base sits at z=0 by definition, so base_link / FLOOR "collide"
     # at the contact patch. The tablet sits ON the floor too (back of tablet
     # box clips the floor box).
@@ -847,13 +892,25 @@ def _build_collision_manager(
     if tablet_added:
         for _link in ("base_link", "L1", "L2", "L3", "L4", "L5", "L6"):
             adjacent |= {(_link, "TABLET")}
+        # The user-noted bug: gripper FINGERS were the actual things
+        # clipping the tablet in low-elevation poses. We DO want
+        # finger-vs-tablet collisions to fire as REAL rejections, so
+        # do NOT whitelist them here. (The body-vs-tablet pair is also
+        # NOT whitelisted, by the same reasoning.)
     # Add reverse pairs for symmetric lookup.
     adjacent |= {(b, a) for a, b in adjacent}
+    jaws_str = (
+        f" + {len(jaw_loaded)} jaws ({_SSG48_JAW_VARIANT})" if jaw_loaded else ""
+    )
     logger.info(
-        "self-collision manager loaded: 7 links + gripper%s%s",
+        "self-collision manager loaded: 7 links + gripper%s%s%s",
+        jaws_str,
         " + FLOOR" if floor_added else "",
         " + TABLET" if tablet_added else "",
     )
+    # Stash the loaded jaw names on the manager so _self_collides can
+    # apply the gripper transform to them too.
+    mgr._loaded_jaw_names = list(jaw_loaded)  # type: ignore[attr-defined]
     return mgr, adjacent
 
 
@@ -873,8 +930,15 @@ def _self_collides(
     manager.set_transform("L4", poses.l4)
     manager.set_transform("L5", poses.l5)
     manager.set_transform("L6", poses.l6_visual)
-    # Gripper rides on the flange (its mesh is in flange-frame coordinates).
+    # Gripper body rides on the flange (its mesh is in flange-frame
+    # coordinates). The jaws (ssg48_finger_left/right) are also in
+    # flange-frame and rigidly attached to the body — they ride on
+    # exactly the same transform. Without this update the jaws would
+    # stay at the world origin and never collide with anything except
+    # base_link, missing the actual fingertip-clip-tablet case.
     manager.set_transform("gripper", poses.l6_visual)
+    for jaw_name in getattr(manager, "_loaded_jaw_names", ()):
+        manager.set_transform(jaw_name, poses.l6_visual)
     in_coll, names = manager.in_collision_internal(return_names=True)
     if not in_coll:
         return False
