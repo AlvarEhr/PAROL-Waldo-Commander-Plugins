@@ -3014,8 +3014,27 @@ def _localise_board_thread() -> None:
         raw_client = RobotClient(host="127.0.0.1", port=5001)
         _state["client"] = raw_client
 
-        def flange_pose_provider():
-            return _flange_pose_from_client(raw_client)
+        # client.pose("WRF") returns the TCP pose, which has the tool offset
+        # subtracted from the flange — verified empirically: a 105 mm Z
+        # offset between WRF and FK-from-joints. The mount transform
+        # `cold_start.T_cam2flange` is defined relative to the FLANGE, so
+        # feeding TCP poses through it puts the camera 105 mm too close to
+        # the workspace and ArUco rejects most markers as the FOV crops the
+        # board. Compute the FLANGE pose directly via FK on the joint
+        # angles to bypass any tool offset configured on the server.
+        from scipy.spatial.transform import Rotation as _R_fk  # noqa: PLC0415
+
+        def flange_pose_provider() -> NDArray[np.float64] | None:
+            angles_deg = raw_client.angles()
+            if angles_deg is None or len(angles_deg) < 6:
+                return None
+            angles_rad = np.radians(np.asarray(angles_deg, dtype=np.float64))
+            fk_pose = np.zeros(6, dtype=np.float64)
+            scan_robot.fk(angles_rad, fk_pose)
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = _R_fk.from_euler("XYZ", fk_pose[3:]).as_matrix()
+            T[:3, 3] = fk_pose[:3]
+            return T
 
         if is_sim_mode:
             intrinsics = Intrinsics(
@@ -3220,7 +3239,7 @@ def _localise_board_thread() -> None:
             if detection is None:
                 return False
             try:
-                T_flange2base = _flange_pose_from_client(raw_client)
+                T_flange2base = flange_pose_provider()
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "localise %s: flange-pose query failed (%s: %s)",
