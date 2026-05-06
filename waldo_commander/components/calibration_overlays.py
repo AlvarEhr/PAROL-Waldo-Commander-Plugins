@@ -2949,17 +2949,28 @@ def _localise_board_thread() -> None:
                     tx, ty, n_total, dict(rej),
                 )
 
-        if not candidates:
-            _post_status(
-                f"Localise: 0 reachable scan poses out of "
-                f"{len(_LOCALISE_SCAN_TARGETS_M)} targets. Check that "
-                f"_LOCALISE_SCAN_TARGETS_M lies within PAROL6's workspace."
+        # `candidates` is intentionally empty in J0-sweep mode (we drive the
+        # robot from `seed_q_list` instead, building waypoints on-the-fly).
+        # The empty-candidates check only applies to the legacy multi-target
+        # path; J0-sweep mode reports its own failures earlier (no reachable
+        # seed at any target) or later (no detections during the sweep).
+        if not _LOCALISE_USE_J0_SWEEP:
+            if not candidates:
+                _post_status(
+                    f"Localise: 0 reachable scan poses out of "
+                    f"{len(_LOCALISE_SCAN_TARGETS_M)} targets. Check that "
+                    f"_LOCALISE_SCAN_TARGETS_M lies within PAROL6's workspace."
+                )
+                return
+            logger.info(
+                "localise (multi-target): %d/%d scan poses generated",
+                len(candidates), len(_LOCALISE_SCAN_TARGETS_M),
             )
-            return
-        logger.info(
-            "localise: %d/%d scan poses generated",
-            len(candidates), len(_LOCALISE_SCAN_TARGETS_M),
-        )
+        else:
+            logger.info(
+                "localise (J0-sweep): %d/%d seed targets reachable",
+                len(seed_q_list), len(_LOCALISE_SEED_TARGETS_XY),
+            )
 
         # Mode dispatch: same as _calibration_thread — pick VirtualCamera vs
         # RealSenseCamera based on Waldo-Commander's robot-mode toggle.
