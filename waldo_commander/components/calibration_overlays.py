@@ -277,6 +277,17 @@ _MAX_CAM_BOARD_ANGLE_DEG: float = 78.0
 # python-fcl breaks against thin box geometry.
 _FLOOR_PRIMITIVE_ENABLED: bool = True
 
+# Safety margin (metres) inflating the FLOOR and TABLET collision
+# primitives. Calibration / localise have residual mount error of
+# ~1-5 mm even after convergence; on real hardware sensor noise +
+# joint-encoder error adds another mm or two on top. Inflating the
+# floor/tablet collision boxes by this margin makes the planner
+# REJECT a pose if the gripper would come within margin_m of contact,
+# rather than waiting until the visualisation shows actual penetration.
+# 8 mm is comfortable cushion without rejecting too many useful poses
+# (the calibration's diversity benefits are above ~2 cm clearance).
+_COLLISION_SAFETY_MARGIN_M: float = 0.008
+
 # SSG-48 gripper jaw variant for collision checking. The user has two
 # interchangeable jaw STLs in parol6's mesh dir — "finger" (the standard
 # Spectral SSG-48 finger) and "pinch" (narrower pinch tips). Only ONE
@@ -814,15 +825,21 @@ def _build_collision_manager(
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for %s: %s", jaw_name, e)
 
-    # FLOOR collision primitive — wide flat box at z ∈ [-0.05, 0]. Anything
-    # dipping below z=0 collides with FLOOR. Catches gripper-finger and
-    # camera-bracket clipping that the per-pose TCP-point check misses.
+    # FLOOR collision primitive — wide flat box at z ∈ [-0.05,
+    # +safety_margin]. Top is RAISED above z=0 by the safety margin so
+    # any gripper/jaw approach below that altitude triggers a collision
+    # before actual contact. base_link is on the ("base_link", "FLOOR")
+    # adjacent whitelist so the robot's own base sitting on the floor
+    # doesn't fire a false positive — only links that AREN'T expected
+    # to touch the floor (everything except base_link) get rejected.
     floor_added = False
     if _FLOOR_PRIMITIVE_ENABLED:
         try:
-            floor_box = trimesh.creation.box(extents=(10.0, 10.0, 0.05))
+            box_thickness = 0.05 + _COLLISION_SAFETY_MARGIN_M
+            floor_box = trimesh.creation.box(extents=(10.0, 10.0, box_thickness))
             floor_pose = np.eye(4, dtype=np.float64)
-            floor_pose[2, 3] = -0.025  # box top at z=0
+            # Position so box top is at +safety_margin: centre = top - h/2.
+            floor_pose[2, 3] = _COLLISION_SAFETY_MARGIN_M - box_thickness / 2.0
             mgr.add_object("FLOOR", floor_box, transform=floor_pose)
             floor_added = True
         except Exception as e:  # noqa: BLE001
@@ -840,7 +857,13 @@ def _build_collision_manager(
             from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
             t_w, t_l, t_h = _TABLET_DIMENSIONS_M
             t_off_x, t_off_y = _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M
-            tablet_box = trimesh.creation.box(extents=(t_w, t_l, t_h))
+            # Inflate by 2 × safety margin in each axis (margin on each side).
+            # Centre of the inflated box stays at the same point as the original
+            # tablet centre, so the inflation is symmetric.
+            margin = _COLLISION_SAFETY_MARGIN_M
+            tablet_box = trimesh.creation.box(
+                extents=(t_w + 2 * margin, t_l + 2 * margin, t_h + 2 * margin),
+            )
             tablet_centre_local = np.array(
                 [
                     _cfg.squares_x * _cfg.square_length / 2.0 + t_off_x,
@@ -2846,6 +2869,111 @@ def _calibration_thread() -> None:
                 f"Best={output.best_method}, error={pos_err:.2f}mm"
             )
             _state["calibrated_mount"] = output.mount
+
+            # Post-calibration: drive to a "view board" pose using the
+            # freshly-calibrated mount (much more accurate than cold-start).
+            # Camera ends up looking straight down at the board centre from
+            # ~32 cm — the entire board fits comfortably in the FOV (which
+            # is ~33 cm wide at that distance), giving the user a clean
+            # visual confirmation of the calibration result. If no overhead
+            # pose is reachable for whatever reason, fall back to home.
+            try:
+                from parol6_vision.calibration.board import (  # noqa: PLC0415
+                    BOARD_TABLET_30MM as _view_cfg,
+                )
+                view_centre_local = np.array(
+                    [
+                        _view_cfg.squares_x * _view_cfg.square_length / 2.0,
+                        _view_cfg.squares_y * _view_cfg.square_length / 2.0,
+                        0.0,
+                        1.0,
+                    ],
+                    dtype=np.float64,
+                )
+                view_target = (_T_BOARD2BASE @ view_centre_local)[:3]
+                # Range tuned for "board fits in FOV with margin" while
+                # keeping enough IK feasibility for typical workspace
+                # placements. (0.30, 0.36) m × (75°, 88°) was too tight
+                # — Sobol(128) returned 0 reachable on the user's
+                # board placement. Widening to (0.25, 0.34) m × (60°,
+                # 85°) yields ~15-25 reachable; the most-vertical pick
+                # is still close to overhead, board still fits FOV
+                # (FOV at 0.25 m ≈ 26 cm vs 21 cm board → 24 % margin).
+                view_params = HemisphereParams(
+                    n_candidates=128,
+                    distance_range_m=(0.25, 0.34),
+                    elevation_range_deg=(60.0, 85.0),
+                    azimuth_range_deg=(-180.0, 180.0),
+                    workspace_xy_max_m=0.55,
+                    max_joint_change_deg=180.0,
+                )
+                view_gen = PoseGenerator(
+                    robot=robot, mount=output.mount,
+                    target_world=view_target, params=view_params,
+                )
+                view_cands, _ = view_gen.generate(max_count=None)
+
+                def _view_vertical_score(
+                    c: Any,
+                    target: NDArray[np.float64] = view_target,
+                    mount: CameraMount = output.mount,
+                ) -> float:
+                    cp = mount.cam_pose_for_flange_pose(
+                        np.asarray(c.flange_pose),
+                    )[:3, 3]
+                    f = target - cp
+                    fn = float(np.linalg.norm(f))
+                    return float(-(f / fn)[2]) if fn > 1e-6 else 0.0
+
+                if view_cands:
+                    view_cands.sort(key=_view_vertical_score, reverse=True)
+                    best_view = view_cands[0]
+                    score = _view_vertical_score(best_view)
+                    logger.info(
+                        "post-calibration: driving to view-board pose "
+                        "(vertical-score=%.3f)", score,
+                    )
+                    _post_status("Calibrated — moving to view-board pose")
+                    try:
+                        raw_client.move_j(
+                            angles=list(
+                                np.degrees(best_view.joint_angles_rad).tolist()
+                            ),
+                            speed=0.3, accel=0.5, wait=True, timeout=20.0,
+                        )
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "post-calibration: view-pose move_j raised "
+                            "%s: %s — going home instead",
+                            type(e).__name__, e,
+                        )
+                        try:
+                            raw_client.home(wait=True, timeout=30.0)
+                        except Exception as e2:  # noqa: BLE001
+                            logger.warning(
+                                "post-calibration: home() also raised %s: %s",
+                                type(e2).__name__, e2,
+                            )
+                else:
+                    logger.info(
+                        "post-calibration: no reachable view-board pose "
+                        "(0/%d candidates), going home",
+                        128,
+                    )
+                    _post_status("Calibrated — view pose unreachable, homing")
+                    try:
+                        raw_client.home(wait=True, timeout=30.0)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(
+                            "post-calibration: home() raised %s: %s",
+                            type(e).__name__, e,
+                        )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "post-calibration view pose failed (%s: %s) — "
+                    "robot left at last calibration pose",
+                    type(e).__name__, e,
+                )
 
     except Exception as e:  # noqa: BLE001
         # The orchestrator's own `finally` calls set_tcp_offset to restore the
