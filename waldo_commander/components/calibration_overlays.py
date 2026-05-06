@@ -404,7 +404,7 @@ _LOCALISE_SWEEP_SPEED: float = 0.10
 # avoiding the full 3-seed × 18-second motion when the board is found
 # quickly. Set to a large number (e.g. 999) to disable early stop and
 # always run all seeds for the densest possible consensus sample set.
-_LOCALISE_EARLY_STOP_DETECTIONS: int = 3
+_LOCALISE_EARLY_STOP_DETECTIONS: int = 6
 # Chunk size for the J0 sweep in degrees. The full sweep is broken into
 # back-to-back move_j commands of this size so that halt() (used both by
 # early-stop AND the user's Stop / E-Stop button) interrupts within at
@@ -458,14 +458,24 @@ _LOCALISE_J0_STEPS: int = 13
 # board succeed; lowering this to 1 lets us accept a single confident
 # detection. Increase for more robustness against false positives.
 _LOCALISE_MIN_DETECTIONS: int = 1
-# Early-stop requires both (a) total detections >=
-# _LOCALISE_EARLY_STOP_DETECTIONS, AND (b) at least
-# _LOCALISE_EARLY_STOP_INLIERS of those agreeing within
-# _LOCALISE_INLIER_THRESHOLD_M of the running median. Stopping on raw
-# count alone (the previous behaviour) was triggering after 3-4 noisy
-# low-corner detections that disagreed with each other by >10 mm —
-# downstream consensus then failed with "0 inliers within 10 mm".
-_LOCALISE_EARLY_STOP_INLIERS: int = 2
+# Two-tier stop logic:
+#
+#   IN-SWEEP TARGET (_LOCALISE_EARLY_STOP_DETECTIONS / _INLIERS):
+#     Halt the sweep mid-motion when we hit this. Higher = more captures
+#     before stopping, more samples for the consensus → tighter median.
+#
+#   POST-SWEEP MIN (_LOCALISE_MIN_INLIERS_TO_PROCEED):
+#     After a sweep finishes naturally without hitting the in-sweep
+#     target, skip remaining seeds anyway IF we have at least this many
+#     inliers. Avoids the user-noted case where stage 1 found enough
+#     detections to localise the board but we kept driving through more
+#     seeds chasing a stricter target.
+#
+# Combined: best case the first sweep hits the TARGET quickly and we
+# halt early. Medium case the sweep ends with ≥ MIN inliers and we move
+# on to stage 2. Worst case (<MIN inliers) we try the next seed.
+_LOCALISE_EARLY_STOP_INLIERS: int = 4
+_LOCALISE_MIN_INLIERS_TO_PROCEED: int = 2
 # RANSAC inlier threshold (metres) — detections within this distance of the
 # inlier-set median count as agreeing on the board location. 5 cm is generous
 # enough that the cold-start mount's ~2 mm / 2° error doesn't reject good
@@ -2303,8 +2313,28 @@ def _calibration_thread() -> None:
         # Stash the raw client so the STOP button can call halt() directly.
         _state["client"] = raw_client
 
-        def flange_pose():
-            return _flange_pose_from_client(client)
+        # Same FK-based flange pose query as the localise thread —
+        # client.pose("WRF") returns TCP (with the gripper's 105 mm tool
+        # offset baked in), NOT the flange. The mount transform
+        # T_cam2flange is defined relative to the FLANGE, so feeding TCP
+        # poses into it puts the VirtualCamera 105 mm out of position
+        # (verified live: detection succeeded at only 4 / 16 bootstrap
+        # poses because the camera was rendering far too close to the
+        # board). Run forward kinematics on the live joint angles to
+        # bypass the tool offset.
+        from scipy.spatial.transform import Rotation as _R_calib_fk  # noqa: PLC0415
+
+        def flange_pose() -> NDArray[np.float64] | None:
+            angles_deg = client.angles()
+            if angles_deg is None or len(angles_deg) < 6:
+                return None
+            angles_rad = np.radians(np.asarray(angles_deg, dtype=np.float64))
+            fk_pose = np.zeros(6, dtype=np.float64)
+            robot.fk(angles_rad, fk_pose)
+            T = np.eye(4, dtype=np.float64)
+            T[:3, :3] = _R_calib_fk.from_euler("XYZ", fk_pose[3:]).as_matrix()
+            T[:3, 3] = fk_pose[:3]
+            return T
 
         if is_sim_mode:
             camera: Any = VirtualCamera(
@@ -3274,22 +3304,28 @@ def _localise_board_thread() -> None:
                     raw_client.halt()
                     _post_status("Localise stopped by user")
                     return
-                # Skip remaining seeds only when we've gathered enough
-                # detections AND those detections agree on a board
-                # location (same gate as the in-sweep early stop above).
-                if len(detected_centres) >= _LOCALISE_EARLY_STOP_DETECTIONS:
+                # Post-sweep: skip remaining seeds with the SOFTER threshold
+                # (_LOCALISE_MIN_INLIERS_TO_PROCEED). The in-sweep early-stop
+                # uses the harder _LOCALISE_EARLY_STOP_INLIERS to keep
+                # capturing more frames mid-motion; once the sweep ENDS, we
+                # accept whatever inliers we got rather than restart on a
+                # new seed. Avoids re-sweeping when stage 1 already found
+                # the board reliably enough — stage 2 will refine further.
+                if len(detected_centres) >= 1:
                     _det_arr = np.asarray(detected_centres, dtype=np.float64)
                     _med = np.median(_det_arr, axis=0)
                     _resid = np.linalg.norm(_det_arr - _med, axis=1)
                     _n_inliers = int(
                         (_resid < _LOCALISE_INLIER_THRESHOLD_M).sum()
                     )
-                    if _n_inliers >= _LOCALISE_EARLY_STOP_INLIERS:
+                    if _n_inliers >= _LOCALISE_MIN_INLIERS_TO_PROCEED:
                         logger.info(
                             "localise: skipping remaining seeds — %d "
-                            "detections with %d inliers within %.0f mm",
+                            "detections with %d inliers within %.0f mm "
+                            "(min-to-proceed: %d)",
                             len(detected_centres), _n_inliers,
                             _LOCALISE_INLIER_THRESHOLD_M * 1000,
+                            _LOCALISE_MIN_INLIERS_TO_PROCEED,
                         )
                         break
 
