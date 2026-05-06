@@ -2764,6 +2764,8 @@ def _localise_board_thread() -> None:
     `RealSenseCamera`.
     """
     try:
+        import cv2  # noqa: PLC0415
+
         from parol6 import Robot, RobotClient  # noqa: PLC0415
 
         from parol6_vision.calibration.board import (  # noqa: PLC0415
@@ -3052,13 +3054,37 @@ def _localise_board_thread() -> None:
         detected_poses: list[NDArray[np.float64]] = []
         detected_qualities: list[int] = []  # corner count, for picking best rotation
 
+        # Diagnostic state: counts of frame-level outcomes per sweep so the
+        # post-sweep summary can tell us WHERE detection is breaking down
+        # (blank frames vs no markers vs charuco interpolation vs pose fail).
+        _diag = {"blank": 0, "markers0": 0, "markers_some": 0, "detected": 0}
+        _diag_dump_dir: Path | None = None
+        _diag_dumped = 0
+        _DIAG_DUMP_LIMIT = 6  # save up to 6 sample frames total per localise run
+
+        # Independent ArUco detector for the diagnostic probe — runs the
+        # marker layer alone (skips ChArUco interpolation + solvePnP) so we
+        # can tell whether the markers were even visible to OpenCV.
+        _aruco_dict_for_probe = cv2.aruco.getPredefinedDictionary(
+            BOARD_TABLET_30MM.aruco_dict_id,
+        )
+        _aruco_probe = cv2.aruco.ArucoDetector(
+            _aruco_dict_for_probe, cv2.aruco.DetectorParameters(),
+        )
+
         def _capture_and_record(label: str) -> bool:
             """Capture one frame, run ChArUco detection, and on success
             append (board centre, full SE(3) pose, corner-count) to the
             detection accumulators. Queries the live flange pose AFTER
             capture so the joint angles match the captured frame within
             ~10 ms — negligible drift at the configured sweep speeds.
-            Returns True on a successful detection."""
+            Returns True on a successful detection.
+
+            Also runs a low-level diagnostic probe on each frame (frame
+            stats + raw marker count) and saves up to _DIAG_DUMP_LIMIT
+            sample frames to a temp directory for visual inspection.
+            """
+            nonlocal _diag_dumped, _diag_dump_dir
             try:
                 frame = camera.capture_color()
             except Exception as e:  # noqa: BLE001
@@ -3067,6 +3093,48 @@ def _localise_board_thread() -> None:
                     label, type(e).__name__, e,
                 )
                 return False
+
+            # Frame stats — distinguishes blank (mean ≈ background) from
+            # filled frames where detection still fails.
+            frame_mean = float(frame.mean())
+            frame_std = float(frame.std())
+            if frame_std < 2.0:
+                # Solid-grey blank — VirtualCamera bail path returns these
+                # when flange pose is None or board is out of view.
+                _diag["blank"] += 1
+            else:
+                # Probe raw marker count without going through full board
+                # detection — tells us if ArUco itself can find markers.
+                gray = (
+                    cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    if frame.ndim == 3 else frame
+                )
+                _, marker_ids, _ = _aruco_probe.detectMarkers(gray)
+                n_markers = 0 if marker_ids is None else len(marker_ids)
+                if n_markers == 0:
+                    _diag["markers0"] += 1
+                else:
+                    _diag["markers_some"] += 1
+
+            # Save up to _DIAG_DUMP_LIMIT sample frames for visual inspection.
+            if _diag_dumped < _DIAG_DUMP_LIMIT:
+                if _diag_dump_dir is None:
+                    import tempfile  # noqa: PLC0415
+                    _diag_dump_dir = Path(tempfile.gettempdir()) / "localise_frames"
+                    _diag_dump_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info(
+                        "localise: saving diagnostic frames to %s",
+                        _diag_dump_dir,
+                    )
+                fname = _diag_dump_dir / (
+                    f"frame_{_diag_dumped:02d}_{label.replace(' ', '_').replace('(', '').replace(')', '').replace(',', '')}.png"
+                )
+                try:
+                    cv2.imwrite(str(fname), frame)
+                    _diag_dumped += 1
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("frame dump failed: %s", e)
+
             detection = detector.detect(frame, K, D)
             if detection is None:
                 return False
@@ -3086,6 +3154,7 @@ def _localise_board_thread() -> None:
             detected_centres.append(board_centre_obs)
             detected_poses.append(T_board2base_obs)
             detected_qualities.append(int(detection.num_corners_detected))
+            _diag["detected"] += 1
             return True
 
         attempted = 0
@@ -3101,10 +3170,33 @@ def _localise_board_thread() -> None:
                 if len(detected_centres) >= _LOCALISE_MIN_DETECTIONS:
                     break  # already enough
 
+                # Pick start of sweep based on current J0: whichever end of
+                # the [seed_J0 - half, seed_J0 + half] range is CLOSER to the
+                # robot's current J0. Eliminates the time-wasting "drive all
+                # the way to the far side first" behaviour when the robot
+                # starts near home or at the previous sweep's end.
+                seed_j0_rad = float(seed_q_rad[0])
+                low_j0 = seed_j0_rad - np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
+                high_j0 = seed_j0_rad + np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
+                try:
+                    cur_angles = raw_client.angles()
+                    cur_j0_rad = (
+                        float(np.radians(cur_angles[0]))
+                        if cur_angles is not None and len(cur_angles) > 0
+                        else seed_j0_rad
+                    )
+                except Exception:  # noqa: BLE001
+                    cur_j0_rad = seed_j0_rad
+                if abs(cur_j0_rad - low_j0) <= abs(cur_j0_rad - high_j0):
+                    start_j0 = low_j0
+                    end_j0 = high_j0
+                else:
+                    start_j0 = high_j0
+                    end_j0 = low_j0
                 start_q = seed_q_rad.copy()
-                start_q[0] -= np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
+                start_q[0] = start_j0
                 end_q = seed_q_rad.copy()
-                end_q[0] += np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
+                end_q[0] = end_j0
                 if not (
                     scan_robot.check_limits(start_q)
                     and scan_robot.check_limits(end_q)
@@ -3113,10 +3205,18 @@ def _localise_board_thread() -> None:
                         "localise sweep (%.2f, %.2f): start or end out of joint "
                         "limits (J0 range %.1f° → %.1f°), skipping",
                         seed_xy[0], seed_xy[1],
-                        float(np.degrees(start_q[0])),
-                        float(np.degrees(end_q[0])),
+                        float(np.degrees(start_j0)),
+                        float(np.degrees(end_j0)),
                     )
                     continue
+                logger.info(
+                    "localise sweep (%.2f, %.2f): J0 %.1f° → %.1f° "
+                    "(starting end is %.1f° away from current %.1f°)",
+                    seed_xy[0], seed_xy[1],
+                    float(np.degrees(start_j0)), float(np.degrees(end_j0)),
+                    float(np.degrees(abs(start_j0 - cur_j0_rad))),
+                    float(np.degrees(cur_j0_rad)),
+                )
 
                 _post_status(
                     f"Localise: continuous sweep at seed ({seed_xy[0]:.2f}, "
@@ -3210,6 +3310,29 @@ def _localise_board_thread() -> None:
                 _capture_and_record(
                     f"sweep ({seed_xy[0]:.2f}, {seed_xy[1]:.2f}) end"
                 )
+
+                # Per-sweep diagnostic summary. Goal: distinguish
+                # "camera never saw anything" from "camera saw things but
+                # detector kept failing", so the user can fix the right
+                # thing instead of guessing.
+                logger.info(
+                    "localise sweep (%.2f, %.2f) diagnostics: "
+                    "blank=%d (frame too uniform → camera likely returned "
+                    "_blank_frame, board out of view or flange-pose query "
+                    "failed); markers=0 in %d frames (frame had content but "
+                    "ArUco found no markers); markers≥1 in %d frames (markers "
+                    "visible, may need more for ChArUco interpolation); "
+                    "%d full detections succeeded",
+                    seed_xy[0], seed_xy[1],
+                    _diag["blank"], _diag["markers0"],
+                    _diag["markers_some"], _diag["detected"],
+                )
+                # Reset counters so the next sweep starts clean — we keep
+                # _diag_dumped global to enforce the per-run dump limit.
+                _diag["blank"] = 0
+                _diag["markers0"] = 0
+                _diag["markers_some"] = 0
+                _diag["detected"] = 0
         elif _LOCALISE_USE_J0_SWEEP:
             # Discrete J0-sweep mode (continuous disabled). Per seed,
             # iterate _LOCALISE_J0_STEPS angles with stop+capture at each.
