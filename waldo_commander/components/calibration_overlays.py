@@ -113,7 +113,7 @@ _BOARD_RPY_RAD: tuple[float, float, float] = (0.0, 0.0, np.deg2rad(90))
 #            hemisphere covers ±60° around that base→board ray.
 # Set _SHOW_HEMISPHERE_WIREFRAME=False to hide the visualisation.
 _SHOW_HEMISPHERE_WIREFRAME: bool = True
-_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.18, 0.28)  # (min, max) radial distance
+_HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.14, 0.28)  # (min, max) radial distance
 # 15° → 70°. Lower bound is genuinely useful — low-elevation oblique
 # views see the board's edges in heavy foreshortening, but ChArUco
 # tolerates that down to ~75° off-normal (= ev=15° if board lies flat).
@@ -121,10 +121,16 @@ _HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.18, 0.28)  # (min, max) radial 
 # IK-solve on the wrist-flip mount, and 75°-80° is a thin sliver that
 # isn't worth the wireframe shell extending into.
 _HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (15.0, 70.0)
-# Distance lower bound 0.22 m: at fx=fy=615 the camera covers ~230 mm of
-# horizontal scene at this distance, just enough for the 210 mm-wide board
-# to fit with safety margin. Closer than this and the board falls outside
-# the FOV → no detection.
+# Distance lower bound 0.14 m: at fx=fy=615 the camera covers ~146 mm
+# horizontally at this distance — narrower than the 210 mm board, so a
+# straight-on overhead pose at d=d_min would crop the board. That's fine
+# in practice because (a) low-elevation oblique views see the board
+# foreshortened to a much smaller projected width, and (b) ChArUco only
+# needs 4-6 corners detected, not the whole board, so partial-board
+# views still calibrate. If you want the inner shell smaller still, you
+# can drop to ~0.12 m before the high-elevation candidates start losing
+# enough corners to fail detection. Going below 0.10 m starts depth-of-
+# field issues on the D435i (min focus ~0.10 m) and is not recommended.
 # 150° spread = 300° azimuth coverage. Pushes the hemisphere toward
 # wrapping the board entirely (full 360° = spread 180°), giving the
 # orchestrator more "from-behind-the-board" pose options. The
