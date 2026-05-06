@@ -3032,7 +3032,16 @@ def _localise_board_thread() -> None:
                 "intrinsics fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
                 intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
             )
-        detector = BoardDetector(BOARD_TABLET_30MM)
+        # Lower min_corners_for_pose for the localise scan — we only need a
+        # rough board location estimate (translation, mostly), not a high-
+        # accuracy calibration sample. With min_corners=6 (the default) the
+        # diagnostic showed many frames where ≥1 ArUco markers were visible
+        # but ChArUco interpolation produced fewer than 6 corners and the
+        # detector returned None, even though there were enough constraints
+        # for a coarse pose. min_corners=4 is the absolute minimum for
+        # solvePnP on a planar target; the calibration's main detector
+        # keeps the default 6 for accuracy.
+        detector = BoardDetector(BOARD_TABLET_30MM, min_corners_for_pose=4)
 
         cfg = BOARD_TABLET_30MM
         center_local = np.array(
@@ -3255,7 +3264,32 @@ def _localise_board_thread() -> None:
                         rc,
                     )
                     continue
-                # Capture loop while motion executes. is_robot_stopped
+                # RACE FIX: there's a brief window between move_j(wait=False)
+                # returning and parol6-server actually starting the motion,
+                # during which all joint speeds are zero and is_robot_stopped()
+                # returns True. If we entered the polling loop directly the
+                # FIRST is_robot_stopped() check would fire and we'd exit
+                # before any motion happened (observed live: sweep completed
+                # in 5 s with only 2 captures, while a sweep that DID run took
+                # 22 s with 42 captures). Wait until the joints actually
+                # start moving (or 1 s timeout) before trusting "stopped".
+                start_wait_began = time.monotonic()
+                while time.monotonic() - start_wait_began < 1.0:
+                    try:
+                        if not raw_client.is_robot_stopped(threshold_speed=2.0):
+                            break  # motion has begun
+                    except Exception:  # noqa: BLE001
+                        break  # don't hang on a transient query failure
+                    time.sleep(0.05)
+                else:
+                    logger.warning(
+                        "localise sweep (%.2f, %.2f): motion didn't start "
+                        "within 1 s — robot may already be at the end-pose "
+                        "or move_j was rejected. Capturing what we can.",
+                        seed_xy[0], seed_xy[1],
+                    )
+
+                # Capture loop while motion executes. is_robot_stopped()
                 # uses joint speed below 2.0 °/s as the threshold —
                 # during the sweep at 10% max speed, joints move several
                 # °/s, so this stays False until the end-pose is reached.
@@ -3278,7 +3312,7 @@ def _localise_board_thread() -> None:
                         raw_client.halt()
                         break
                     try:
-                        if raw_client.is_robot_stopped():
+                        if raw_client.is_robot_stopped(threshold_speed=2.0):
                             break
                     except Exception as e:  # noqa: BLE001
                         logger.warning(
