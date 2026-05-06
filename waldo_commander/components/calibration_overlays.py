@@ -3252,101 +3252,73 @@ def _localise_board_thread() -> None:
                     f"Localise: continuous sweep at seed ({seed_xy[0]:.2f}, "
                     f"{seed_xy[1]:.2f}) — scanning"
                 )
-                # Issue non-blocking move to end of sweep.
-                rc = raw_client.move_j(
+                # Issue non-blocking move to end of sweep. move_j returns
+                # the command_index — we'll pass that to wait_command()
+                # in a background thread to get an authoritative
+                # completion signal from the server.
+                cmd_idx = raw_client.move_j(
                     angles=list(np.degrees(end_q)),
                     speed=_LOCALISE_SWEEP_SPEED, accel=0.5, wait=False,
                     timeout=30.0,
                 )
-                if rc < 0:
+                if cmd_idx < 0:
                     logger.info(
                         "localise sweep continuous move returned rc=%d; skipping",
-                        rc,
+                        cmd_idx,
                     )
                     continue
-                # Capture loop while motion executes.
-                #
-                # COMPLETION DETECTION: previously used is_robot_stopped()
-                # (joint speed below 2 °/s threshold). Live diagnostic
-                # showed that lied — parol6's status broadcaster reports
-                # speeds at ~50 Hz and stale-status windows make
-                # is_robot_stopped() flip True while joints are still
-                # moving. Loop exited mid-motion, captured ~2 frames, and
-                # the user saw the "completed" log line appear well
-                # before the robot actually reached the target.
-                #
-                # New approach: check joint ANGLES against the target.
-                # That's deterministic — current angles update from the
-                # same status stream but their VALUE is what we care
-                # about, not their derivative. When max-per-joint
-                # angle error drops below 1°, motion is genuinely done.
-                # A stuck-progress watchdog (no movement >3 s while not
-                # at target) catches the rare case of move_j being
-                # rejected silently.
-                target_q_deg = np.degrees(end_q)
+
+                # COMPLETION DETECTION: use parol6's wait_command(), which
+                # waits on the server's `completed_command_index` from the
+                # status broadcast — a hard "command N has finished"
+                # guarantee from the controller, not derivative-based.
+                # Run it in a background thread so the foreground capture
+                # loop can keep capturing during motion. The sync client's
+                # persistent background event loop handles concurrent
+                # coroutines fine: wait_command() awaits a status
+                # condition, while angles()/pose() called from the capture
+                # loop run as separate UDP request/response coroutines.
+                done_event = threading.Event()
+                wait_error: list[Exception] = []
+
+                def _wait_for_completion(idx: int = cmd_idx) -> None:
+                    try:
+                        raw_client.wait_command(idx, timeout=35.0)
+                    except Exception as e:  # noqa: BLE001
+                        wait_error.append(e)
+                    finally:
+                        done_event.set()
+
+                waiter_thread = threading.Thread(
+                    target=_wait_for_completion, daemon=True,
+                    name=f"localise-waiter-cmd{cmd_idx}",
+                )
+                waiter_thread.start()
+
                 last_capture = 0.0
                 sweep_started = time.monotonic()
-                sweep_max_duration_s = 30.0
-                last_progress_t = sweep_started
-                last_q_deg: NDArray[np.float64] | None = None
-                while True:
+                # Watchdog slightly longer than wait_command's 35 s timeout
+                # so the watchdog only fires if the waiter itself is hung
+                # (which would also mean status broadcasts are dropping).
+                sweep_max_duration_s = 40.0
+                while not done_event.is_set():
                     if _state.get("stop_requested"):
                         raw_client.halt()
+                        # Give the waiter a moment to observe the halt
+                        # and update completed_index, then exit.
+                        done_event.wait(2.0)
                         _post_status("Localise stopped by user")
                         return
-                    now = time.monotonic()
-                    if now - sweep_started > sweep_max_duration_s:
+                    if time.monotonic() - sweep_started > sweep_max_duration_s:
                         logger.warning(
-                            "localise sweep timed out after %.1f s, halting",
+                            "localise sweep watchdog tripped after %.1f s "
+                            "(wait_command not finishing); halting",
                             sweep_max_duration_s,
                         )
                         raw_client.halt()
+                        done_event.wait(2.0)
                         break
-
-                    try:
-                        cur_angles = raw_client.angles()
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "localise: angles() raised %s: %s; halting",
-                            type(e).__name__, e,
-                        )
-                        raw_client.halt()
-                        break
-                    if cur_angles is None or len(cur_angles) < 6:
-                        time.sleep(0.05)
-                        continue
-                    cur_q_deg = np.asarray(cur_angles, dtype=np.float64)
-
-                    # Track progress: any joint moved by >0.3° since
-                    # last sample → robot is actively traversing the
-                    # trajectory, reset the stuck-progress timer.
-                    if (
-                        last_q_deg is not None
-                        and float(np.max(np.abs(cur_q_deg - last_q_deg))) > 0.3
-                    ):
-                        last_progress_t = now
-                    last_q_deg = cur_q_deg
-
-                    # Motion done — at the target within 1° per joint.
-                    angle_err_deg = float(
-                        np.max(np.abs(cur_q_deg - target_q_deg)),
-                    )
-                    if angle_err_deg < 1.0:
-                        break
-
-                    # Stuck-progress watchdog: no joint movement for
-                    # >3 s WHILE we're not at target. Means move_j was
-                    # rejected or parol6-server is genuinely hung;
-                    # halt + bail rather than waiting for the 30 s timeout.
-                    if now - last_progress_t > 3.0:
-                        logger.warning(
-                            "localise sweep stuck at angle err=%.1f° with "
-                            "no progress for >3 s; halting",
-                            angle_err_deg,
-                        )
-                        raw_client.halt()
-                        break
-
+                    now = time.monotonic()
                     if now - last_capture >= _LOCALISE_CAPTURE_PERIOD_S:
                         last_capture = now
                         attempted += 1
@@ -3360,6 +3332,17 @@ def _localise_board_thread() -> None:
                             )
                     # Short sleep so we don't pin the CPU between captures.
                     time.sleep(0.02)
+
+                # Drain the waiter thread (should already be done).
+                waiter_thread.join(timeout=1.0)
+                if wait_error:
+                    logger.warning(
+                        "localise wait_command for sweep (%.2f, %.2f) raised "
+                        "%s: %s — sweep may have been halted or the server "
+                        "rejected the trajectory.",
+                        seed_xy[0], seed_xy[1],
+                        type(wait_error[0]).__name__, wait_error[0],
+                    )
 
                 # Settle briefly after the sweep finishes, then capture once
                 # more at the end pose — same rationale as the start
