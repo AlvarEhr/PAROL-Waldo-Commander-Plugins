@@ -111,16 +111,25 @@ _BOARD_RPY_RAD: tuple[float, float, float] = (0.0, 0.0, np.deg2rad(90))
 #            (auto-computed: from the robot base origin toward the board
 #            center, projected onto the floor). e.g. spread=60 means the
 #            hemisphere covers ±60° around that base→board ray.
-# Set _SHOW_HEMISPHERE_WIREFRAME=False to hide the visualisation.
-_SHOW_HEMISPHERE_WIREFRAME: bool = True
+# Visibility of the various 3D overlays (board+tablet, hemisphere, dots,
+# fixed frustum near-cone, projected footprint, centerline) is now driven
+# at runtime by the calibration panel's checkboxes; per-user state is
+# persisted via NiceGUI's ``app.storage.user`` and surfaces through
+# ``_state['show_*']``. See ``_set_overlay_visible``.
 _HEMI_DISTANCE_RANGE_M: tuple[float, float] = (0.14, 0.28)  # (min, max) radial distance
-# 15° → 70°. Lower bound is genuinely useful — low-elevation oblique
+# 15° → 89°. Lower bound is genuinely useful — low-elevation oblique
 # views see the board's edges in heavy foreshortening, but ChArUco
 # tolerates that down to ~75° off-normal (= ev=15° if board lies flat).
-# Upper bound trimmed to 70° because elevations >80° essentially never
-# IK-solve on the wrist-flip mount, and 75°-80° is a thin sliver that
-# isn't worth the wireframe shell extending into.
-_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (15.0, 70.0)
+# Upper bound is now near-overhead (89° — practical limit; exactly 90°
+# is degenerate for look_at). The pose-generator's continuous-Sobol path
+# now appends an explicit cap ring at ev=ev_hi (8 azimuths × 3 distances
+# = 24 extra candidates, see ``parol6_vision.calibration.pose_generator``)
+# so the boundary IS sampled even though Sobol's unit cube never lands
+# on u=1. Most cap candidates fail IK on PAROL6's wrist-flip mount, but
+# the few that succeed are exactly the perfectly-overhead poses the
+# view-pose selector wants — and the wireframe now visually closes the
+# dome instead of cutting off at 70°.
+_HEMI_ELEVATION_RANGE_DEG: tuple[float, float] = (15.0, 89.0)
 # Distance lower bound 0.14 m: at fx=fy=615 the camera covers ~146 mm
 # horizontally at this distance — narrower than the 210 mm board, so a
 # straight-on overhead pose at d=d_min would crop the board. That's fine
@@ -168,7 +177,6 @@ _HEMI_CENTRE_OVERRIDE_M: tuple[float, float, float] | None = None
 # Set False to disable (e.g. if python-fcl misbehaves).
 _ENABLE_SELF_COLLISION_CHECK: bool = True
 
-_SHOW_REACHABILITY_POINTS: bool = True
 # (n_distances, n_elevations, n_azimuths). With tilt_x=180 the wrist must
 # flip to satisfy the look-at constraint, so only ~4% of grid samples are
 # reachable. We compensate with a denser grid (~840 samples → ~33 reachable)
@@ -690,6 +698,13 @@ _state: dict[str, Any] = {
     "detection_overlay_group": None,  # NiceGUI group handle
     "detection_last_mtime": 0.0,       # for change detection
     "detection_overlay_timer": None,
+    # Visibility toggles for the 3D scene elements.
+    "show_board": True,
+    "show_hemisphere": True,
+    "show_reachability": True,
+    "show_near_cone": True,
+    "show_centerline": True,
+    "show_footprint": True,
 }
 
 
@@ -1502,13 +1517,25 @@ def _frustum_corners_local(
 def _raycast_frustum_footprint(
     T_flange2base: NDArray[np.float64],
     T_cam2flange: NDArray[np.float64],
-    T_gripper_visual2base: NDArray[np.float64],
-    mgr: Any,
     meshes: dict[str, Any],
     default_depth_m: float,
 ) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], tuple[float, float, float]]:
-    """Cast rays from camera apex through the far plane edges against the static environment + gripper.
-    Returns (footprint_hits, camera_world_pos, center_hit) in WORLD coordinates."""
+    """Cast rays from the camera apex against the static scene primitives
+    (``VISUAL_FLOOR`` and ``VISUAL_TABLET`` if present in ``meshes``) and
+    return where each ray hits.
+
+    The arm links and gripper meshes are intentionally NOT raycast against:
+    the camera is mounted on the gripper looking outward, so it can't see
+    its own arm in any normal configuration. If a future mount geometry
+    points the camera back at itself, extend ``meshes`` with the relevant
+    link entries — they're already populated by ``_build_collision_manager``.
+
+    Returns ``(footprint_hits, camera_world_pos, center_hit)`` — all in
+    world frame, all metres. ``footprint_hits`` is the four (or more)
+    perimeter samples interpolated along the far-plane edges; ``center_hit``
+    is the optical-axis intersection used by the centerline rendering.
+    Rays that don't hit anything within ``default_depth_m`` terminate at
+    that depth so the visualisation stays bounded."""
     T_cam2base = T_flange2base @ T_cam2flange
     cam_pos_world = T_cam2base[:3, 3]
 
@@ -1631,16 +1658,27 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
     objects: list[Any] = []
     with scene_group:
-        # --- Near cone: bright apex-to-corner + far-plane rectangle. ---
-        for i in range(1, 5):
-            objects.append(
-                ui.scene.line(list(near[0]), list(near[i])).material("#ff8080")
-            )
-        for i in range(1, 5):
-            j = 1 + (i % 4)
-            objects.append(
-                ui.scene.line(list(near[i]), list(near[j])).material("#ff5050")
-            )
+        # Wrap the near-cone lines in their own sub-group so the panel's
+        # "Fixed frustum" toggle can hide/show the whole bundle at runtime
+        # via a single `.visible(False)` call instead of iterating eight lines.
+        near_cone_group = (
+            ui.scene.group()
+            .with_name("calib:near_cone")
+            .visible(_state.get("show_near_cone", True))
+        )
+        _state["near_cone_group"] = near_cone_group
+        with near_cone_group:
+            # Apex-to-corner rays (bright pink) + far-plane rectangle
+            # (slightly darker pink).
+            for i in range(1, 5):
+                objects.append(
+                    ui.scene.line(list(near[0]), list(near[i])).material("#ff8080")
+                )
+            for i in range(1, 5):
+                j = 1 + (i % 4)
+                objects.append(
+                    ui.scene.line(list(near[i]), list(near[j])).material("#ff5050")
+                )
     return objects
 
 
@@ -1734,25 +1772,34 @@ def add_overlays(urdf_scene: Any) -> None:
     scene_root = urdf_scene.scene
     _state["scene_root"] = scene_root
 
-    _state["board_group"] = _build_board_overlay_group(scene_root, png_url)
-    _state["tablet_group"] = _build_tablet_overlay_group(scene_root)
-
-    # ------------------------------------------------------------------
-    # Hemisphere wireframe — shows the (distance × elevation × azimuth)
-    # region around the board where the pose generator places camera
-    # candidates. Drawn in WORLD frame because hemisphere_camera_position()
-    # uses world Z-up regardless of board rotation. Anchor is the hemisphere
-    # centre (override-aware via _HEMI_CENTRE_OVERRIDE_M; falls back to the
-    # board centre when no override is set).
-    # ------------------------------------------------------------------
-    if _SHOW_HEMISPHERE_WIREFRAME:
-        _add_hemisphere_wireframe(scene_root, _hemi_centre_world())
+    # All board-dependent overlays (board, tablet, hemisphere wireframe,
+    # reachability dots) are built through a single helper so initial build
+    # and post-localise refresh share one code path. Each child group's
+    # visibility honours the current ``_state['show_*']`` flag, which is
+    # initialised from persisted user preferences in ``add_control_panel``
+    # before this function is called (see ``add_control_panel``).
+    _build_board_dependent_overlays(scene_root, png_url)
 
     # Detection-overlay polling — repaints AABB boxes from the perception
     # pipeline's last_detection.json snapshot when its mtime changes.
     _state["detection_overlay_timer"] = ui.timer(
         _DETECTION_POLL_INTERVAL_S, _poll_detection_json,
     )
+
+    # Calibration-driven scene timers. Installed here (during overlay setup,
+    # which happens once per page) instead of in the calibration panel
+    # builder so they keep running regardless of which side-tab is active.
+    # Both are no-ops while their preconditions don't hold:
+    #   - _post_calibration_tick (4 Hz): waits until calibration finishes
+    #     and ``_state['calibrated_mount']`` is set.
+    #   - _raycast_footprint_tick (5 Hz): waits until a mount is available
+    #     and the scene root + collision manager pair are populated; also
+    #     short-circuits when both ``show_footprint`` and ``show_centerline``
+    #     are off, or when the joint/mount inputs haven't changed since the
+    #     last frame (keeps the asyncio loop responsive during heavy CPU
+    #     spikes from the calibration thread + 50 Hz status broadcasts).
+    ui.timer(0.25, _post_calibration_tick, active=True)
+    ui.timer(1.0 / _FOOTPRINT_TICK_HZ, _raycast_footprint_tick, active=True)
 
 
 def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
@@ -1891,18 +1938,7 @@ def refresh_board_dependent_overlays() -> None:
         return
 
     def _do_refresh() -> None:
-        for key in ("board_group", "hemisphere_group", "tablet_group"):
-            old = _state.get(key)
-            if old is not None:
-                try:
-                    old.delete()
-                except Exception:  # noqa: BLE001
-                    pass
-                _state[key] = None
-        _state["board_group"] = _build_board_overlay_group(scene_root, png_url)
-        _state["tablet_group"] = _build_tablet_overlay_group(scene_root)
-        if _SHOW_HEMISPHERE_WIREFRAME:
-            _add_hemisphere_wireframe(scene_root, _hemi_centre_world())
+        _build_board_dependent_overlays(scene_root, png_url)
 
     if loop is None:
         # No event loop captured — caller is on the main thread.
@@ -2056,8 +2092,8 @@ def _poll_detection_json() -> None:
         logger.debug("_poll_detection_json: render failed: %s", e)
 
 
-def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]) -> None:
-    """Draw a 3D wireframe volume for the hemisphere search region.
+def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[np.float64]) -> None:
+    """Draw a 3D wireframe volume for the hemisphere search region inside ``scene_group``.
 
     Volume bounds are an annular spherical sector defined by:
         d ∈ [d_min, d_max]                      (radial)
@@ -2084,9 +2120,6 @@ def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]
     azimuths = np.linspace(az_min, az_max, n_az_segments + 1)
     elevations = np.linspace(ev_min, ev_max, n_ev_segments + 1)
 
-    grp = scene_root.group().move(*target_world.tolist()).with_name("calib:hemisphere")
-    _state["hemisphere_group"] = grp
-
     def offset(d: float, elev_deg: float, az_deg: float) -> tuple[float, float, float]:
         elev = np.radians(elev_deg)
         az = np.radians(az_deg)
@@ -2096,35 +2129,46 @@ def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]
             float(d * np.sin(elev)),
         )
 
-    with grp:
-        # Two spherical shells (inner d_min, outer d_max). For each shell:
-        #   - latitude arcs: constant elev, varying az
-        #   - longitude arcs: constant az, varying elev
-        for d, opacity in [(d_min, 0.55), (d_max, 0.30)]:
-            color = "#5599ff" if d == d_min else "#3366cc"
-            # Latitude arcs (one per elevation step).
-            for ev in elevations:
-                pts = [offset(d, ev, az) for az in azimuths]
-                for i in range(len(pts) - 1):
-                    ui.scene.line(list(pts[i]), list(pts[i + 1])).material(
-                        color, opacity=opacity
-                    )
-            # Longitude arcs (one per azimuth step).
-            for az in azimuths:
-                pts = [offset(d, ev, az) for ev in elevations]
-                for i in range(len(pts) - 1):
-                    ui.scene.line(list(pts[i]), list(pts[i + 1])).material(
-                        color, opacity=opacity
-                    )
+    with scene_group:
+        # Wireframe lines live in their own sub-group so the panel's
+        # "Hemisphere wireframe" toggle hides them independently of the
+        # reachability dots (which live in a separate sub-group added by
+        # ``_add_reachability_points``).
+        wf_group = (
+            ui.scene.group()
+            .with_name("calib:hemisphere_wireframe")
+            .visible(_state.get("show_hemisphere", True))
+        )
+        _state["hemisphere_wireframe_group"] = wf_group
+        with wf_group:
+            # Two spherical shells (inner d_min, outer d_max). For each shell:
+            #   - latitude arcs: constant elev, varying az
+            #   - longitude arcs: constant az, varying elev
+            for d, opacity in [(d_min, 0.55), (d_max, 0.30)]:
+                color = "#5599ff" if d == d_min else "#3366cc"
+                # Latitude arcs (one per elevation step).
+                for ev in elevations:
+                    pts = [offset(d, ev, az) for az in azimuths]
+                    for i in range(len(pts) - 1):
+                        ui.scene.line(list(pts[i]), list(pts[i + 1])).material(
+                            color, opacity=opacity
+                        )
+                # Longitude arcs (one per azimuth step).
+                for az in azimuths:
+                    pts = [offset(d, ev, az) for ev in elevations]
+                    for i in range(len(pts) - 1):
+                        ui.scene.line(list(pts[i]), list(pts[i + 1])).material(
+                            color, opacity=opacity
+                        )
 
-        # Four corner edges connecting inner shell to outer shell.
-        for ev, az in [
-            (ev_min, az_min), (ev_min, az_max),
-            (ev_max, az_min), (ev_max, az_max),
-        ]:
-            inner = offset(d_min, ev, az)
-            outer = offset(d_max, ev, az)
-            ui.scene.line(list(inner), list(outer)).material("#88bbff", opacity=0.8)
+            # Four corner edges connecting inner shell to outer shell.
+            for ev, az in [
+                (ev_min, az_min), (ev_min, az_max),
+                (ev_max, az_min), (ev_max, az_max),
+            ]:
+                inner = offset(d_min, ev, az)
+                outer = offset(d_max, ev, az)
+                ui.scene.line(list(inner), list(outer)).material("#88bbff", opacity=0.8)
 
     logger.info(
         "hemisphere volume wireframe at %s: d=[%.2f, %.2f] m, "
@@ -2134,26 +2178,117 @@ def _add_hemisphere_wireframe(scene_root: Any, target_world: NDArray[np.float64]
         _hemi_azimuth_center_deg(), _HEMI_AZIMUTH_SPREAD_DEG,
     )
 
-    # Reachability sampling — overlay green dots at hemisphere positions where
-    # the pose generator's IK + workspace check actually succeeds. Gives a
-    # PRE-CALIBRATION view of which parts of the volume are usable.
-    if _SHOW_REACHABILITY_POINTS:
-        _add_reachability_points(grp, target_world)
+
+def _build_board_dependent_overlays(scene_root: Any, png_url: str) -> None:
+    """Build (or rebuild) every overlay whose geometry depends on the current
+    ``_T_BOARD2BASE`` / hemisphere centre, and cache each group handle in
+    ``_state`` so the panel toggles can flip visibility at runtime.
+
+    Always creates every group — visibility is governed by ``_state['show_*']``
+    flags applied at creation time and updated thereafter via
+    :func:`_set_overlay_visible`. Always-creating keeps initial build and
+    post-localise refresh on a single code path; the runtime cost of hidden
+    Three.js objects is negligible compared to the multi-second IK sweep
+    that populates the reachability dots.
+
+    Call from the asyncio loop thread (NiceGUI scene API is not thread-safe).
+    """
+    # Tear down anything that already exists (post-localise rebuild path).
+    for key in ("board_group", "tablet_group", "hemisphere_group"):
+        old = _state.get(key)
+        if old is not None:
+            try:
+                old.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            _state[key] = None
+    # Sub-group handles inside hemisphere_group die with their parent.
+    for key in ("hemisphere_wireframe_group", "reachability_group"):
+        _state[key] = None
+
+    # Board + tablet — controlled by a single "Board + tablet" toggle.
+    show_board = bool(_state.get("show_board", True))
+    board_group = _build_board_overlay_group(scene_root, png_url)
+    board_group.visible(show_board)
+    _state["board_group"] = board_group
+
+    tablet_group = _build_tablet_overlay_group(scene_root)
+    tablet_group.visible(show_board)
+    _state["tablet_group"] = tablet_group
+
+    # Hemisphere wireframe + reachability dots, parented to a common group
+    # whose origin sits at the hemisphere centre. The two children
+    # (wireframe / dots) get their own sub-groups inside their builders so
+    # they can be toggled independently. The OUTER ``hemisphere_group``
+    # stays visible whenever EITHER child should show — the per-child
+    # sub-groups carry the actual show/hide state.
+    #
+    # The reachability IK sweep is dispatched OFF the asyncio loop — see
+    # ``_start_reachability_compute_async``. The wireframe appears
+    # immediately; the green dots populate a moment later when the
+    # sweep finishes (typically <2 s). This keeps the loop responsive
+    # for websocket traffic during the sweep.
+    target_world = _hemi_centre_world()
+    grp = scene_root.group().move(*target_world.tolist()).with_name("calib:hemisphere")
+    _state["hemisphere_group"] = grp
+    _add_hemisphere_wireframe_to_group(grp, target_world)
+    _start_reachability_compute_async(grp, target_world)
 
 
-def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]) -> None:
-    """Sample the hemisphere volume via the orchestrator's PoseGenerator,
-    render reachable camera positions as green spheres inside ``scene_group``.
+def _set_overlay_visible(name: str, visible: bool) -> None:
+    """Toggle one of the 3D overlay groups at runtime.
 
-    Why the PoseGenerator and not naive IK: the PoseGenerator uses continuity
-    seeds (each successful candidate's joint angles seed the next IK call),
-    which dramatically improves IK convergence. With a flat zero-seed we get
-    near-zero reachable poses; with continuity seeds we get the same set the
-    orchestrator will actually use during calibration. The viz here is then
-    a true preview of "where will calibration go" before you click Run.
+    ``name`` is one of: ``board`` (board + tablet), ``hemisphere``
+    (wireframe), ``reachability`` (green dots), ``near_cone`` (fixed
+    frustum lines), ``centerline`` (camera→hit yellow line),
+    ``footprint`` (projected magenta polygon).
 
-    ``scene_group`` is already translated to ``target_world``, so we offset
-    each camera-world position by -target_world before drawing.
+    Persists the new state in ``_state['show_<name>']`` so the per-tick
+    raycast loop and any future rebuild use the right flag. Best-effort
+    ``.visible()`` on the cached group handle for the static overlays
+    that have one — the dynamic centerline and footprint are recreated
+    every 100 ms in ``_raycast_footprint_tick`` and read the flag there.
+    """
+    state_key = f"show_{name}"
+    _state[state_key] = bool(visible)
+
+    group_key_map = {
+        "board": ("board_group", "tablet_group"),
+        "hemisphere": ("hemisphere_wireframe_group",),
+        "reachability": ("reachability_group",),
+        "near_cone": ("near_cone_group",),
+    }
+    for grp_key in group_key_map.get(name, ()):
+        grp = _state.get(grp_key)
+        if grp is None:
+            continue
+        try:
+            grp.visible(bool(visible))
+        except Exception as e:  # noqa: BLE001
+            # Page-teardown / parent-slot races. Not fatal — the next
+            # rebuild will pick up the new state from ``_state``.
+            logger.debug(
+                "_set_overlay_visible(%s): %s: %s",
+                name, type(e).__name__, e,
+            )
+
+
+def _compute_reachability_candidates(
+    target_world: NDArray[np.float64],
+) -> tuple[list[NDArray[np.float64]], list[Any]] | None:
+    """Run the hemisphere IK sweep + farthest-first thinning. Pure compute
+    — no scene mutation, safe to run off the asyncio loop.
+
+    Returns ``(cam_positions_world, candidates)`` lined up index-for-index,
+    or ``None`` on import / Robot-instantiation failure (caller should
+    skip rendering and log).
+
+    Why this is a hot path: the IK sweep runs ~1024 candidates through
+    pinokin's IKSolver, which takes 1-3 seconds. Doing this on the asyncio
+    event loop blocks the websocket pump long enough for Socket.IO to
+    drop the browser connection. Run it from a thread instead via
+    ``run_in_executor`` and call ``_render_reachability_dots`` on the loop
+    once it returns.
     """
     try:
         from parol6 import Robot  # noqa: PLC0415
@@ -2164,7 +2299,7 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         )
     except ImportError:
         logger.debug("parol6/parol6_vision not importable; skipping reachability viz")
-        return
+        return None
 
     _ensure_workspace_envelope()
 
@@ -2185,7 +2320,7 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         robot = Robot()
     except Exception as e:  # noqa: BLE001
         logger.warning("could not instantiate Robot for reachability viz: %s", e)
-        return
+        return None
 
     if _REACHABILITY_USE_CONTINUOUS:
         # Sobol low-discrepancy sampling — provably uniform 3D coverage of
@@ -2222,17 +2357,13 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
     )
     cands, stats = gen.generate(max_count=max_count)
 
-    # Extract the camera position implied by each accepted candidate's flange
-    # pose (T_cam2base = T_flange2base @ T_cam2flange). Track the candidate
-    # alongside its camera position so the board-localise sweep can reuse the
-    # joint angles directly (skips a redundant pose-generation pass).
+    # Extract camera positions; final flange-hull check (PoseGenerator's
+    # workspace_xy/z bounds are rectangular; the hull is more accurate).
     reachable_cam_world: list[NDArray[np.float64]] = []
-    reachable_candidates: list = []
+    reachable_candidates: list[Any] = []
     for c in cands:
         T_cam2base = cold_start.cam_pose_for_flange_pose(np.asarray(c.flange_pose))
         cam_pos = T_cam2base[:3, 3]
-        # Optional final hull check on flange position (the PoseGenerator's
-        # workspace_xy/z bounds are rectangular; the hull is more accurate).
         if not bool(envelope_contains(np.asarray(c.flange_pose)[:3, 3])[0]):
             continue
         reachable_cam_world.append(cam_pos)
@@ -2250,16 +2381,13 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         stats.rejection_log.get("singular", 0),
     )
 
-    # Sanity check: every surviving dot's distance from target_world should
-    # lie inside [d_min, d_max], the same range the wireframe is drawn at.
-    # If any survivors are outside the shell, the dots will visually appear
-    # "above" or "below" the dome — surface that mismatch loudly so we can
-    # debug rather than silently rendering inconsistent geometry.
     if reachable_cam_world:
         cam_arr = np.asarray(reachable_cam_world, dtype=np.float64)
         rel = cam_arr - target_world
         dists = np.linalg.norm(rel, axis=1)
-        elevs_deg = np.degrees(np.arcsin(np.clip(rel[:, 2] / np.maximum(dists, 1e-9), -1.0, 1.0)))
+        elevs_deg = np.degrees(
+            np.arcsin(np.clip(rel[:, 2] / np.maximum(dists, 1e-9), -1.0, 1.0))
+        )
         out_of_shell = ((dists < d_min - 1e-3) | (dists > d_max + 1e-3)).sum()
         logger.info(
             "reachability dots distance range %.3f - %.3f m (shell %.3f - %.3f), "
@@ -2271,28 +2399,17 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
         if out_of_shell > 0:
             logger.warning(
                 "%d reachability dot(s) lie OUTSIDE the wireframe shell — "
-                "this means the dots and wireframe disagree about the "
-                "hemisphere. Likely cause: target_world drifted between "
-                "wireframe and dot rendering, or the cold-start mount's "
-                "T_cam2flange differs from the one used by the pose "
-                "generator. Tight numerical mismatches (sub-mm) are "
-                "expected from FK-verify tolerance.",
+                "dots/wireframe disagreeing about the hemisphere centre.",
                 int(out_of_shell),
             )
 
-    # Greedy farthest-first thinning so the rendered points form a uniform
-    # spread across the reachable region instead of clustered along grid
-    # lines. Approximates Poisson-disc sampling without an explicit minimum-
-    # distance threshold — instead we pick a target count and let the
-    # algorithm maximise minimum pairwise distance for that count. Run on the
-    # candidate list (key=cam_pos) so the surviving CANDIDATES stay in lockstep
-    # with the surviving points.
+    # Greedy farthest-first thinning for uniform spread.
     selected_candidates = reachable_candidates
+    points_to_render = reachable_cam_world
     if (
         _REACHABILITY_KEEP_COUNT is not None
         and len(reachable_candidates) > _REACHABILITY_KEEP_COUNT
     ):
-        # Build (point, candidate) tuples for thinning, then unzip.
         paired = list(zip(reachable_cam_world, reachable_candidates))
         paired = _greedy_farthest_first(
             paired, _REACHABILITY_KEEP_COUNT, key=lambda p: p[0],
@@ -2303,21 +2420,84 @@ def _add_reachability_points(scene_group: Any, target_world: NDArray[np.float64]
             "farthest-first thinning: %d -> %d points",
             len(reachable_cam_world), len(points_to_render),
         )
-    else:
-        points_to_render = reachable_cam_world
 
-    # Cache the selected candidates so the board-localise thread can reuse
-    # their joint angles as scan poses.
-    _state["reachable_candidates"] = selected_candidates
+    return points_to_render, selected_candidates
 
-    # Render points as small green spheres, in scene_group's local frame
-    # (which is already translated to target_world). Smaller radius
-    # (3 mm instead of 6 mm) so dense reachable regions don't fuse into
-    # a single blob; semi-transparent so overlapping dots visibly stack.
-    with scene_group:
-        for cam_pos in points_to_render:
-            local = (cam_pos - target_world).tolist()
-            ui.scene.sphere(0.003).move(*local).material("#33dd66", opacity=0.7)
+
+def _render_reachability_dots(
+    scene_group: Any,
+    target_world: NDArray[np.float64],
+    points_to_render: list[NDArray[np.float64]],
+) -> None:
+    """Create the green-sphere sub-group inside ``scene_group``. Scene
+    mutation only — must run on the asyncio loop (NiceGUI scene is not
+    thread-safe).
+
+    ``scene_group`` is already translated to ``target_world``, so each
+    sphere's local position is ``cam_pos - target_world``. 3 mm radius +
+    70 % opacity so dense regions visibly stack instead of fusing.
+    """
+    if scene_group is None:
+        return
+    try:
+        with scene_group:
+            reach_group = (
+                ui.scene.group()
+                .with_name("calib:reachability")
+                .visible(_state.get("show_reachability", True))
+            )
+            _state["reachability_group"] = reach_group
+            with reach_group:
+                for cam_pos in points_to_render:
+                    local = (cam_pos - target_world).tolist()
+                    (
+                        ui.scene.sphere(0.003)
+                        .move(*local)
+                        .material("#33dd66", opacity=0.7)
+                    )
+    except Exception as e:  # noqa: BLE001
+        # Page-teardown / parent-slot races. Fine to swallow — next
+        # rebuild will populate the group.
+        if "parent slot" not in str(e):
+            logger.warning("reachability render failed: %s", e)
+
+
+def _start_reachability_compute_async(
+    scene_group: Any,
+    target_world: NDArray[np.float64],
+) -> None:
+    """Dispatch the (slow) IK sweep to a thread; render results on the loop
+    when it finishes.
+
+    Without this, the sweep blocks the asyncio event loop for 1-3 s — long
+    enough that Socket.IO's outgoing buffer fills under load (50 Hz URDF
+    status broadcasts + 5 Hz frustum tick) and the browser disconnects.
+    Doing the IK in a thread keeps the loop responsive; only the cheap
+    scene-rendering step lands back on the loop.
+    """
+    loop = _state.get("main_loop")
+
+    def _worker() -> None:
+        result = _compute_reachability_candidates(target_world)
+        if result is None:
+            return
+        points, selected = result
+        # Cache candidates so the board-localise sweep can reuse them.
+        _state["reachable_candidates"] = selected
+        if loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(
+                _render_reachability_dots, scene_group, target_world, points,
+            )
+        except RuntimeError as e:
+            logger.info(
+                "reachability render skipped (loop unavailable): %s", e,
+            )
+
+    threading.Thread(
+        target=_worker, name="calib-reachability-sweep", daemon=True,
+    ).start()
 
 
 def _greedy_farthest_first(
@@ -4322,95 +4502,155 @@ def _post_calibration_tick() -> None:
         raise
 
 
+# ``_raycast_footprint_tick`` runs on the asyncio event loop. To keep the
+# UI responsive during heavy CPU spikes (calibration thread spawning IK
+# sweeps, parol6's 50 Hz status broadcasts updating the URDF scene), it
+# uses three early-exit optimisations:
+#   1. Skip when both ``show_footprint`` and ``show_centerline`` are off
+#      — no point raycasting if neither result is rendered.
+#   2. Skip when ``(joint_angles, mount)`` are unchanged from the last
+#      successful tick — the projection result is identical, so the
+#      delete/recreate websocket churn would be wasted.
+#   3. Lower fire rate (5 Hz) — visually fluid for a sanity overlay,
+#      halves the websocket pressure compared to the previous 10 Hz.
+_FOOTPRINT_TICK_HZ: float = 5.0
+_FOOTPRINT_JOINT_DELTA_RAD: float = 1e-4    # ~0.006° per-joint epsilon
+_FOOTPRINT_MOUNT_DELTA_M: float = 1e-5      # 10 µm translation epsilon
+
+
+def _footprint_inputs_changed(
+    q: NDArray[np.float64],
+    T_cam2flange: NDArray[np.float64],
+) -> bool:
+    """Return True iff the joint angles or mount differ enough from the
+    previous tick to warrant rebuilding the footprint geometry."""
+    last_q = _state.get("footprint_last_q")
+    last_mount = _state.get("footprint_last_mount")
+    if last_q is None or last_mount is None:
+        return True
+    if np.max(np.abs(q - last_q)) > _FOOTPRINT_JOINT_DELTA_RAD:
+        return True
+    if np.max(np.abs(T_cam2flange - last_mount)) > _FOOTPRINT_MOUNT_DELTA_M:
+        return True
+    return False
+
+
 def _raycast_footprint_tick() -> None:
-    """Update the dynamic ray-projected footprint.
-    
-    Runs at 10 Hz. Projects rays from the camera through the far frustum corners
-    and draws the resulting polygon footprint in the world scene.
+    """Update the dynamic ray-projected footprint at ``_FOOTPRINT_TICK_HZ``.
+
+    Projects rays from the camera apex through the far frustum corners and
+    draws the resulting polygon (and centerline) in the world scene. Three
+    early-exit paths keep the asyncio loop unburdened — see the module
+    comment above this function.
     """
     try:
+        # Early exit (1): if neither overlay is visible, skip everything —
+        # no raycast, no scene churn, no collision-manager rebuild.
+        show_footprint = bool(_state.get("show_footprint", True))
+        show_centerline = bool(_state.get("show_centerline", True))
+        if not show_footprint and not show_centerline:
+            # Tear down any stale objects from a previous-frame state
+            # change so they don't linger when both flags are off.
+            stale = _state.pop("footprint_objects", None)
+            if stale:
+                for obj in stale:
+                    try:
+                        obj.delete()
+                    except Exception:  # noqa: BLE001
+                        pass
+                _state["footprint_last_q"] = None
+                _state["footprint_last_mount"] = None
+            return
+
         scene_root = _state.get("scene_root")
         if scene_root is None:
             return
-        
-        # Check if scene is still "alive" to avoid parent slot errors
+        # Scene-liveness guard — avoids "parent slot deleted" exceptions
+        # during page-teardown / hot-reload races.
         try:
             if hasattr(scene_root, "id") and scene_root.id is None:
                 return
-        except Exception: # noqa: BLE001
+        except Exception:  # noqa: BLE001
             return
 
         mount = _state.get("current_mount")
         if mount is None:
             return
-            
+
         pair = _state.get("trajectory_collision_mgr_pair")
         if pair is None:
             pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
             if pair is None:
                 return
             _state["trajectory_collision_mgr_pair"] = pair
-        mgr, adjacent, meshes = pair
+        # Only the ``meshes`` dict is needed here — the collision manager
+        # itself drives self-collision / trajectory checks elsewhere.
+        _, _, meshes = pair
 
         try:
             from waldo_commander.state import robot_state, ui_state  # noqa: PLC0415
             from parol6_vision.sim.robot_kinematics import link_poses  # noqa: PLC0415
-            
+
             n_joints = 6
             if ui_state.active_robot is not None:
                 n_joints = ui_state.active_robot.joints.count
-                
             if len(robot_state.angles.rad) < n_joints:
                 return
-                
             q = np.asarray(robot_state.angles.rad[:n_joints], dtype=np.float64)
             poses = link_poses(q)
             T_flange2base = poses.l6
-            T_gripper_visual2base = poses.l6_visual
         except Exception as e:  # noqa: BLE001
             logger.warning("footprint tick skipped (kinematics error): %s", e)
             return
 
+        # Early exit (2): if neither joint angles nor mount have changed
+        # meaningfully since the last successful tick, the footprint we
+        # already drew is still correct — skip the work.
+        if not _footprint_inputs_changed(q, mount.T_cam2flange):
+            return
+
         try:
             hits_world, cam_world, center_hit_world = _raycast_frustum_footprint(
-                T_flange2base, 
+                T_flange2base,
                 mount.T_cam2flange,
-                T_gripper_visual2base,
-                mgr,
                 meshes,
-                _FRUSTUM_FAR_DEPTH_M or 1.5
+                _FRUSTUM_FAR_DEPTH_M or 1.5,
             )
 
             objects = []
-            # Parent the footprint to scene_root (world frame) so it stays fixed to the hit surface
-            # rather than sticking to the camera locally.
+            # Parent everything to scene_root (world frame) so the footprint
+            # stays fixed to the hit surface instead of sticking to the
+            # camera locally. Delete-and-recreate inside one ``with``
+            # context so the websocket diff is one batched message.
             with scene_root:
-                # Clean up previous footprint inside the context manager to batch the websocket message
-                # and completely eliminate flickering.
                 for obj in _state.get("footprint_objects", []):
                     try:
                         obj.delete()
                     except Exception:  # noqa: BLE001
                         pass
-                
-                # Footprint perimeter - use a single Polyline for the entire perimeter
-                # to reduce the number of websocket messages and eliminate flickering.
-                perimeter_points = [list(p) for p in hits_world]
-                perimeter_points.append(list(hits_world[0])) # Close the loop
-                objects.append(
-                    ui.scene.polyline(perimeter_points).material("#ff00ff")
-                )
-                    
-                # Draw the centerline from the camera apex to the hit point
-                objects.append(
-                    ui.scene.line(list(cam_world), list(center_hit_world)).material("#ffff00")
-                )
-                    
+                if show_footprint:
+                    perimeter_points = [list(p) for p in hits_world]
+                    perimeter_points.append(list(hits_world[0]))  # close loop
+                    objects.append(
+                        ui.scene.polyline(perimeter_points).material("#ff00ff")
+                    )
+                if show_centerline:
+                    objects.append(
+                        ui.scene.line(list(cam_world), list(center_hit_world))
+                        .material("#ffff00")
+                    )
             _state["footprint_objects"] = objects
-        except Exception as e:
+            # Cache the inputs we just rendered so the next tick can
+            # short-circuit if nothing's changed.
+            _state["footprint_last_q"] = q.copy()
+            _state["footprint_last_mount"] = mount.T_cam2flange.copy()
+        except Exception as e:  # noqa: BLE001
             if "parent slot" not in str(e):
-                logger.error("footprint tick failed in raycast or render: %s", e, exc_info=True)
-                
+                logger.error(
+                    "footprint tick failed in raycast or render: %s",
+                    e, exc_info=True,
+                )
+
     except RuntimeError as e:
         if "parent slot" in str(e):
             return
@@ -4418,20 +4658,250 @@ def _raycast_footprint_tick() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Floating control panel
+# Hover-above-board verification mode
 # ---------------------------------------------------------------------------
 
 
-def add_control_panel() -> None:
-    """Add a small floating panel with a 'Run Calibration' button + status.
+def _build_R_with_z_axis(z_axis_world: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Build a 3x3 rotation matrix whose Z column equals ``z_axis_world``.
 
-    Call this from inside the page context after the scene is built.
+    The X axis is world +X projected perpendicular to ``z_axis_world`` (or
+    world +Y when world +X is nearly parallel). Y is then ``Z × X``. The
+    rotation about Z is therefore arbitrary-but-deterministic — fine for
+    hover-above-board where the gripper roll doesn't matter for the
+    physical measurement, only the position + downward orientation do.
+    """
+    z = np.asarray(z_axis_world, dtype=np.float64).reshape(3)
+    z = z / float(np.linalg.norm(z))
+    candidate = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    if abs(float(np.dot(candidate, z))) > 0.99:
+        candidate = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+    x = candidate - float(np.dot(candidate, z)) * z
+    x /= float(np.linalg.norm(x))
+    y = np.cross(z, x)
+    return np.column_stack([x, y, z])
+
+
+def _drive_hover_pose_thread(
+    board_local_x_m: float,
+    board_local_y_m: float,
+    standoff_m: float,
+    mode: str = "camera",
+) -> None:
+    """Drive a chosen reference frame to ``(board_local_x, board_local_y,
+    standoff_m)`` above the board surface, looking / pointing straight down.
+    Run in a daemon thread spawned by the panel's hover buttons.
+
+    Use case: post-calibration physical verification on real hardware. The
+    user picks a known XY on the board (corners or centre), commands a
+    standoff, and physically measures the reference-to-board distance with
+    a ruler/caliper. If the chain is correct, the reference lands at the
+    commanded standoff above the commanded XY (within a few mm); if it's
+    off, the discrepancy reveals the error magnitude and direction.
+
+    Modes:
+
+    * ``"camera"`` — drive the camera optical centre to ``target +
+      standoff × up``, with optical axis pointing AT the target (camera
+      looks straight down at the marked point). Validates ``T_cam2flange``
+      i.e. the calibration result directly.
+
+    * ``"tcp"`` — drive the gripper TCP (fingertips for the SSG-48
+      "finger" variant) to ``target + standoff × up``, with the gripper
+      pointing perpendicular to the board surface (flange ``+Z`` aligned
+      with the board's local ``+Z``). Validates ``T_tcp2flange`` i.e. the
+      kinematic chain from joints to fingertip — independent of
+      calibration. Useful as a baseline check that the rest of the chain
+      is right before blaming calibration for a calibration error.
+
+    The standoff is measured in BOARD-LOCAL +Z (perpendicular to the board
+    surface) — not world +Z — so a tilted board still gets a perpendicular
+    standoff.
+    """
+    try:
+        from parol6 import Robot, RobotClient  # noqa: PLC0415
+        from parol6 import tools as parol6_tools  # noqa: PLC0415
+        from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
+            look_at_pose,
+        )
+        from scipy.spatial.transform import Rotation as SciRot  # noqa: PLC0415
+
+        # Common world-frame quantities used by both modes.
+        target_local = np.array(
+            [board_local_x_m, board_local_y_m, 0.0, 1.0], dtype=np.float64,
+        )
+        target_world = (_T_BOARD2BASE @ target_local)[:3]
+        # Board-local +Z in world frame — direction perpendicular to the
+        # board surface, pointing AWAY from the ChArUco face.
+        direction_up_world = _T_BOARD2BASE[:3, :3] @ np.array(
+            [0.0, 0.0, 1.0], dtype=np.float64,
+        )
+        direction_up_world /= float(np.linalg.norm(direction_up_world))
+
+        if mode == "camera":
+            mount = _state.get("current_mount")
+            if mount is None:
+                _post_status(
+                    "Hover (camera): no camera mount available — "
+                    "cannot compute pose.",
+                )
+                return
+            cam_world = target_world + standoff_m * direction_up_world
+            T_cam2base = look_at_pose(cam_world, target_world)
+            T_flange2base = mount.flange_pose_for_cam_pose(T_cam2base)
+            ref_label = "camera"
+        elif mode == "tcp":
+            # SSG-48's TCP transform: ``T_flange2tcp`` has translation
+            # ``(0, 0, -tcp_offset_z)`` for the active jaw variant. Compose
+            # the desired TCP-in-base pose, then back out T_flange2base.
+            try:
+                T_flange2tcp = parol6_tools.get_tool_transform(
+                    "SSG-48", _SSG48_JAW_VARIANT,
+                )
+            except ValueError as e:
+                _post_status(f"Hover (TCP): {e}")
+                return
+            tcp_origin_world = target_world + standoff_m * direction_up_world
+            R_tcp = _build_R_with_z_axis(direction_up_world)
+            T_tcp2base = np.eye(4, dtype=np.float64)
+            T_tcp2base[:3, :3] = R_tcp
+            T_tcp2base[:3, 3] = tcp_origin_world
+            T_flange2base = T_tcp2base @ np.linalg.inv(T_flange2tcp)
+            ref_label = "TCP"
+        else:
+            _post_status(f"Hover: unknown mode '{mode}'")
+            return
+
+        pos = T_flange2base[:3, 3]
+        rpy = SciRot.from_matrix(T_flange2base[:3, :3]).as_euler(
+            "XYZ", degrees=False,
+        )
+        flange_xyz_rpy = np.concatenate([pos, rpy])
+
+        robot = Robot()
+        seed = np.radians(np.array([0.0, -90.0, 180.0, 0.0, 0.0, 180.0]))
+        try:
+            ik_result = robot.ik(flange_xyz_rpy, seed)
+        except Exception as e:  # noqa: BLE001
+            _post_status(f"Hover ({ref_label}): IK raised {type(e).__name__}: {e}")
+            return
+        q_rad = np.asarray(ik_result.q, dtype=np.float64)
+
+        # FK-verify (parol6's IK reports success=False even when q is
+        # numerically fine; trust FK + tight tolerance instead).
+        fk_pose = np.zeros(6, dtype=np.float64)
+        robot.fk(q_rad, fk_pose)
+        pos_err_mm = float(np.linalg.norm(fk_pose[:3] - flange_xyz_rpy[:3])) * 1000.0
+        if pos_err_mm > 1.0:
+            _post_status(
+                f"Hover ({ref_label}): pose unreachable "
+                f"(IK pos_err={pos_err_mm:.2f} mm). "
+                f"Try a different XY or smaller standoff.",
+            )
+            return
+        if not robot.check_limits(q_rad):
+            _post_status(f"Hover ({ref_label}): pose violates joint limits.")
+            return
+
+        if _state.get("stop_requested"):
+            _post_status(f"Hover ({ref_label}): stopped before starting motion.")
+            return
+
+        client = RobotClient(host="127.0.0.1", port=5001)
+        _state["client"] = client  # so STOP can halt the hover move
+        angles_deg = np.degrees(q_rad).tolist()
+        _post_status(
+            f"Hover ({ref_label}): moving to "
+            f"({board_local_x_m * 1000:.0f}, {board_local_y_m * 1000:.0f}) mm "
+            f"@ standoff {standoff_m * 1000:.0f} mm",
+        )
+        rc = client.move_j(
+            angles=angles_deg, speed=0.3, accel=0.5, wait=True, timeout=20.0,
+        )
+        if rc < 0:
+            _post_status(f"Hover ({ref_label}): move halted.")
+        else:
+            _post_status(
+                f"Hover OK ({ref_label}): "
+                f"({board_local_x_m * 1000:.0f}, {board_local_y_m * 1000:.0f}) mm "
+                f"@ {standoff_m * 1000:.0f} mm — measure now.",
+            )
+    except Exception as e:  # noqa: BLE001
+        if _state.get("stop_requested"):
+            _post_status("Hover: stopped by user.")
+        else:
+            logger.exception("hover thread crashed")
+            _post_status(f"Hover ERROR: {e}")
+    finally:
+        _state["is_hovering"] = False
+        _state["stop_requested"] = False
+
+
+# ---------------------------------------------------------------------------
+# Calibration tab content
+# ---------------------------------------------------------------------------
+
+
+# Keys are the suffixes used by ``_set_overlay_visible``; values are the
+# (label, default_visible) shown in the panel. Order matches the panel layout.
+_OVERLAY_TOGGLES: tuple[tuple[str, str, bool], ...] = (
+    ("board",        "Board + tablet",          True),
+    ("hemisphere",   "Hemisphere wireframe",    True),
+    ("reachability", "Reachability dots",       True),
+    ("near_cone",    "Fixed frustum (near cone)", True),
+    ("centerline",   "Centerline (camera→hit)", True),
+    ("footprint",    "Projected footprint",     True),
+)
+
+
+def _load_persisted_overlay_prefs() -> None:
+    """Read each ``show_*`` flag from ``app.storage.user`` (NiceGUI's
+    cookie-backed per-user storage) and seed ``_state`` with them.
+
+    Defaults (from ``_OVERLAY_TOGGLES``) win when the storage key is missing,
+    so a brand-new user sees everything on. Failures fall back to the
+    defaults — storage isn't available outside a request context, and we
+    don't want a one-time read error to lose the user's preference forever.
+    """
+    try:
+        from nicegui import app  # noqa: PLC0415
+        store = app.storage.user
+    except Exception as e:  # noqa: BLE001
+        logger.debug("calibration prefs: app.storage.user unavailable (%s)", e)
+        store = None
+    for name, _label, default in _OVERLAY_TOGGLES:
+        key = f"show_{name}"
+        if store is not None:
+            value = bool(store.get(key, default))
+        else:
+            value = default
+        _state[key] = value
+
+
+def _persist_overlay_pref(name: str, visible: bool) -> None:
+    """Write one ``show_*`` flag to ``app.storage.user`` so it survives a reload."""
+    try:
+        from nicegui import app  # noqa: PLC0415
+        app.storage.user[f"show_{name}"] = bool(visible)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("calibration prefs: persist failed for %s (%s)", name, e)
+
+
+def build_calibration_panel_content(close_callback: Callable[[], None] | None = None) -> None:
+    """Build the calibration tab's contents.
+
+    The panel hosts both the action buttons (Run / Localise / STOP) that
+    drive the calibration + localise threads, and the view-overlay
+    checkboxes that toggle visibility of each scene element. Designed to
+    live inside a ``ui.tab_panel`` in ``main.py``'s side-tab system, so the
+    calibration tooling shares a common UI pattern with Program / I/O /
+    Gripper. Pass ``close_callback`` to wire up the panel's close button.
     """
 
     def _busy_warn(msg: str) -> bool:
-        """Reject button press if either the calibration or the localise thread
-        is already running, OR if the localise-before-Run dialog is open.
-        Returns True if a warning was issued."""
+        """Reject button press if calibration / localise / hover is running,
+        or if the localise-before-Run dialog is open. Returns True if a
+        warning was issued."""
         if _state.get("is_running"):
             ui.notify(
                 f"{msg}: calibration already running — wait for it to finish",
@@ -4442,6 +4912,13 @@ def add_control_panel() -> None:
         if _state.get("is_localising"):
             ui.notify(
                 f"{msg}: board localise already running — wait for it to finish",
+                color="warning",
+                position="top",
+            )
+            return True
+        if _state.get("is_hovering"):
+            ui.notify(
+                f"{msg}: hover move in progress — wait for it to finish",
                 color="warning",
                 position="top",
             )
@@ -4463,7 +4940,7 @@ def add_control_panel() -> None:
         _post_status("Running calibration via parol6-server...")
         threading.Thread(target=_calibration_thread, daemon=True).start()
 
-    def _on_click() -> None:
+    def _on_run() -> None:
         if _busy_warn("Run"):
             return
         # Localise-before-Run guard. If the user hasn't successfully run
@@ -4473,9 +4950,6 @@ def add_control_panel() -> None:
         # offers to run anyway (sim mode, or already-trusted setup) or
         # cancel and run Localise first.
         if _state.get("last_localise_ok_at") is None:
-            # Block any other Run / Localise click while the dialog is open.
-            # Without this, the user can click Localise during the open
-            # dialog → both threads end up running in parallel.
             _state["dialog_open"] = True
             with ui.dialog() as dialog, ui.card():
                 ui.label("Board hasn't been localised this session").classes(
@@ -4502,8 +4976,6 @@ def add_control_panel() -> None:
                         "Run anyway", on_click=_proceed, color="warning",
                     ).props("size=sm")
                     ui.button("Cancel", on_click=_cancel).props("size=sm")
-            # Backdrop / Esc dismisses the dialog without invoking either
-            # button — clear the flag in that case too.
             dialog.on("hide", lambda _e=None: _state.update(dialog_open=False))
             dialog.open()
             return
@@ -4521,16 +4993,16 @@ def add_control_panel() -> None:
     def _on_stop() -> None:
         """Abort the running calibration OR localise: halt + flag the thread.
 
-        ``RobotClient.halt()`` is a sync UDP call that refuses to run inside
-        an active asyncio event loop. The NiceGUI callback runs in the main
-        event loop, so calling halt() directly from here raises
-        ``RobotClient was used while an event loop is running``. Workaround:
-        dispatch halt() to a daemon thread which has no event loop attached.
-        The flag (_state["stop_requested"]) is set immediately so subsequent
-        move_j calls in the running thread short-circuit even if the
-        thread-dispatched halt hasn't fired yet.
+        ``RobotClient.halt()`` is sync UDP and refuses to run inside an
+        active asyncio event loop, so dispatch the halt to a daemon thread.
+        The stop flag is set immediately so subsequent ``move_j`` calls
+        short-circuit even before the thread-dispatched halt fires.
         """
-        if not (_state.get("is_running") or _state.get("is_localising")):
+        if not (
+            _state.get("is_running")
+            or _state.get("is_localising")
+            or _state.get("is_hovering")
+        ):
             return
         _state["stop_requested"] = True
         client = _state.get("client")
@@ -4544,25 +5016,175 @@ def add_control_panel() -> None:
             ui.notify("HALTED — robot motion stopped", color="warning")
         _post_status("Stop requested — wait for current move to finish")
 
-    with ui.element("div").style(
-        "position: absolute; top: 78px; left: 80px; z-index: 30; "
-        "background: rgba(20, 22, 28, 0.85); padding: 8px 12px; "
-        "border-radius: 8px; color: #ddd; font-size: 12px; "
-        "max-width: 280px;"
-    ):
-        ui.label("parol6-vision calibration").classes("font-semibold text-sm")
-        _state["status_label"] = ui.label("Idle.").classes("text-xs opacity-80")
-        with ui.row().classes("gap-1"):
-            ui.button("Run", on_click=_on_click, color="primary").props("size=sm")
-            ui.button(
-                "Localise Board", on_click=_on_localise, color="secondary",
-            ).props("size=sm")
-            ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
+    # Load persisted toggle prefs into _state BEFORE the scene builds (this
+    # function runs during page render, after add_overlays). The first-page
+    # ordering guarantee is that main.py builds the URDF scene + overlays
+    # BEFORE building the side tabs, so initial overlay visibility may use
+    # the defaults — but the moment the panel renders, _state is reseeded
+    # from storage and the next per-tick read picks up the persisted value.
+    # For the static groups (board/tablet/hemisphere/dots/near_cone), we
+    # reapply visibility here so any divergence between defaults-at-build
+    # and persisted-at-render is corrected.
+    _load_persisted_overlay_prefs()
+    for name, _label, _default in _OVERLAY_TOGGLES:
+        _set_overlay_visible(name, _state.get(f"show_{name}", True))
 
-    # 4 Hz tick to apply the calibrated mount once calibration finishes.
-    # No joint-update plumbing needed — the parol6-server status broadcast
-    # drives the URDF scene naturally.
-    ui.timer(0.25, _post_calibration_tick, active=True)
-    
-    # 10 Hz tick for dynamic ray-projected frustum footprint
-    ui.timer(0.10, _raycast_footprint_tick, active=True)
+    with ui.row().classes("w-full items-center"):
+        ui.label("Calibration").classes("text-lg font-medium")
+        ui.space()
+        if close_callback is not None:
+            ui.button(icon="close", on_click=close_callback).props(
+                "flat round dense color=white"
+            )
+
+    _state["status_label"] = ui.label("Idle.").classes(
+        "text-xs opacity-80"
+    )
+
+    with ui.row().classes("gap-1 q-mt-sm"):
+        ui.button("Run", on_click=_on_run, color="primary").props("size=sm")
+        ui.button(
+            "Localise Board", on_click=_on_localise, color="secondary",
+        ).props("size=sm")
+        ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
+
+    ui.separator().classes("q-my-sm")
+
+    with ui.expansion("View overlays", icon="visibility").classes("w-full"):
+        def _make_handler(name: str):
+            # Closure-free factory so each checkbox binds to its own name.
+            def _on_change(e) -> None:
+                visible = bool(e.value)
+                _set_overlay_visible(name, visible)
+                _persist_overlay_pref(name, visible)
+            return _on_change
+
+        for name, label, _default in _OVERLAY_TOGGLES:
+            ui.checkbox(
+                label,
+                value=bool(_state.get(f"show_{name}", True)),
+                on_change=_make_handler(name),
+            ).props("dense")
+
+    # Hover-above-board verification — drive the camera to a known XY on
+    # the board surface at a configurable standoff height, look straight
+    # down. Lets the user physically measure with a ruler/caliper and
+    # check whether the calibration's mount transform is right. Standoff
+    # is measured perpendicular to the board surface (board-local +Z).
+    with ui.expansion(
+        "Hover above board (verification)", icon="straighten",
+    ).classes("w-full"):
+        # Persist standoff and mode so they survive a page reload.
+        try:
+            from nicegui import app as _nicegui_app  # noqa: PLC0415
+            _persisted_standoff = float(
+                _nicegui_app.storage.user.get("calib_hover_standoff_mm", 100.0)
+            )
+            _persisted_hover_mode = str(
+                _nicegui_app.storage.user.get("calib_hover_mode", "camera")
+            )
+            if _persisted_hover_mode not in ("camera", "tcp"):
+                _persisted_hover_mode = "camera"
+        except Exception:  # noqa: BLE001
+            _persisted_standoff = 100.0
+            _persisted_hover_mode = "camera"
+
+        with ui.row().classes("items-center gap-2 q-mt-xs"):
+            standoff_input = (
+                ui.number(
+                    label="Standoff (mm)",
+                    value=_persisted_standoff,
+                    min=10.0, max=300.0, step=5.0, format="%.0f",
+                )
+                .props("dense")
+                .classes("w-32")
+            )
+
+            def _persist_standoff(_e) -> None:
+                try:
+                    from nicegui import app as _na  # noqa: PLC0415
+                    _na.storage.user["calib_hover_standoff_mm"] = float(
+                        standoff_input.value
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            standoff_input.on("update:model-value", _persist_standoff)
+
+            # Reference-frame toggle: "Camera" hovers the optical centre
+            # (validates calibration), "TCP" hovers the gripper fingertips
+            # (validates kinematics chain only — independent of calibration).
+            hover_mode_input = (
+                ui.toggle(
+                    {"camera": "Camera", "tcp": "TCP"},
+                    value=_persisted_hover_mode,
+                )
+                .props("dense color=primary unelevated")
+            )
+
+            def _persist_hover_mode(_e) -> None:
+                try:
+                    from nicegui import app as _na  # noqa: PLC0415
+                    _na.storage.user["calib_hover_mode"] = str(
+                        hover_mode_input.value or "camera"
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+            hover_mode_input.on("update:model-value", _persist_hover_mode)
+
+        from parol6_vision.calibration.board import (  # noqa: PLC0415
+            BOARD_TABLET_30MM as _hover_cfg,
+        )
+        bw_mm = _hover_cfg.squares_x * _hover_cfg.square_length * 1000.0
+        bh_mm = _hover_cfg.squares_y * _hover_cfg.square_length * 1000.0
+        # Board-local frame: origin at one corner, +X along squares_x (long
+        # edge, 210 mm), +Y along squares_y (short edge, 150 mm). The
+        # buttons label the corners by their (X-low/high, Y-low/high) name
+        # — "Origin" is (0, 0), "TR" = top-right = (max_x, max_y), etc.
+        hover_presets: list[tuple[str, float, float]] = [
+            ("Centre",  bw_mm / 2.0, bh_mm / 2.0),
+            ("Origin",  0.0,         0.0),
+            ("X+",      bw_mm,       0.0),
+            ("Y+",      0.0,         bh_mm),
+            ("X+Y+",    bw_mm,       bh_mm),
+        ]
+
+        def _make_hover_handler(local_x_mm: float, local_y_mm: float):
+            def _click() -> None:
+                if _busy_warn("Hover"):
+                    return
+                try:
+                    standoff_mm = float(standoff_input.value or 0.0)
+                except (TypeError, ValueError):
+                    ui.notify(
+                        "Hover: standoff must be a number", color="warning",
+                    )
+                    return
+                if standoff_mm < 10.0:
+                    ui.notify(
+                        f"Hover: standoff {standoff_mm:.0f} mm too small "
+                        f"(min 10 mm)",
+                        color="warning",
+                    )
+                    return
+                mode = str(hover_mode_input.value or "camera")
+                _state["is_hovering"] = True
+                _state["stop_requested"] = False
+                threading.Thread(
+                    target=_drive_hover_pose_thread,
+                    args=(
+                        local_x_mm / 1000.0,
+                        local_y_mm / 1000.0,
+                        standoff_mm / 1000.0,
+                        mode,
+                    ),
+                    daemon=True,
+                ).start()
+            return _click
+
+        with ui.row().classes("gap-1 q-mt-sm"):
+            for label, local_x, local_y in hover_presets:
+                ui.button(
+                    label, on_click=_make_hover_handler(local_x, local_y),
+                ).props("size=sm outline")

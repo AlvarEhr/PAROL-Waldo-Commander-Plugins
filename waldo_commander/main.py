@@ -234,16 +234,16 @@ async def initialize_urdf_scene() -> None:
             SceneColors.AXIS_Z_HEX
         )  # Z
 
-    # parol6-vision: hand-eye calibration overlays + control panel (optional).
-    # Safe to call even if parol6-vision isn't installed — function is a no-op.
+    # parol6-vision: hand-eye calibration overlays + scene-driven timers.
+    # The control panel is built later as the "Calibration" side-tab —
+    # see ``_build_left_panels``. Safe to call even if parol6-vision isn't
+    # installed — function is a no-op when imports fail.
     try:
         from waldo_commander.components.calibration_overlays import (
-            add_control_panel as _calib_add_control_panel,
             add_overlays as _calib_add_overlays,
         )
 
         _calib_add_overlays(ui_state.urdf_scene)
-        _calib_add_control_panel()
     except Exception as e:  # noqa: BLE001
         logger.warning("calibration overlays failed: %s", e)
 
@@ -514,6 +514,12 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
         gripper_tab.props("disable")
         gripper_tab.mark("tab-gripper")
         ui_state._gripper_tab = gripper_tab
+        # parol6-vision calibration — Run / Localise / STOP + view-overlay
+        # toggles. Tab is disabled when parol6-vision isn't importable.
+        calibration_tab = ui.tab(
+            name="calibration", label="", icon="precision_manufacturing",
+        )
+        calibration_tab.mark("tab-calibration")
 
     # ---- Top panels container ----
     with (
@@ -607,6 +613,29 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
                     ui_state.gripper_page.build()
 
             ui_state._build_gripper_content = _build_gripper_content
+
+        # parol6-vision calibration tab — Run / Localise / STOP + view
+        # overlays. Imports lazily so a missing parol6-vision install
+        # doesn't break the rest of the page.
+        with ui.tab_panel("calibration").classes(
+            "gap-2 overlay-card overflow-hidden"
+        ):
+            try:
+                from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
+                    build_calibration_panel_content as _calib_build_panel,
+                )
+                _calib_build_panel(close_callback=close_top_panels)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("calibration panel build failed: %s", e)
+                with ui.row().classes("w-full items-center"):
+                    ui.label("Calibration").classes("text-lg font-medium")
+                    ui.space()
+                    ui.button(icon="close", on_click=close_top_panels).props(
+                        "flat round dense color=white"
+                    )
+                ui.label(
+                    "parol6-vision is not installed in this environment.",
+                ).classes("text-xs opacity-80")
 
         def update_top_layout(e=None):
             new_tab = e.args if e and e.args else side_tabs.value or ""
