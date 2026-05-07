@@ -61,6 +61,8 @@ _OVERLAY_TOGGLES: tuple[tuple[str, str, bool], ...] = (
     ("near_cone",    "Fixed frustum (near cone)", True),
     ("centerline",   "Centerline (camera→hit)", True),
     ("footprint",    "Projected footprint",     True),
+    # Off by default — perception JSON often outlives its run.
+    ("detections",   "Perception detections",   False),
 )
 
 

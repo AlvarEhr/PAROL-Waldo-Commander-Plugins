@@ -73,6 +73,10 @@ _state: dict[str, Any] = {
     "show_near_cone": True,
     "show_centerline": True,
     "show_footprint": True,
+    # Off by default — the perception JSON file frequently outlives
+    # the pipeline run that wrote it, and the user wouldn't expect a
+    # stale wireframe of "the white cube" to greet them on startup.
+    "show_detections": False,
 }
 
 

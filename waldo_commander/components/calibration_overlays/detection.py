@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from typing import Any
 
 import numpy as np
@@ -16,6 +17,27 @@ from .constants import (
 from .state import _state
 
 logger = logging.getLogger(__name__)
+
+
+# Stale detections — anything older than this in seconds is ignored. The
+# JSON file gets written once per ``find_object.py`` invocation and stays
+# on disk indefinitely; without a freshness check the overlay would
+# show whatever the last test run wrote, possibly weeks ago, on every
+# waldo-commander startup. Tunable here if a long-running pipeline
+# needs more headroom.
+_DETECTION_FRESHNESS_S: float = 60.0
+
+
+def _clear_detection_group() -> None:
+    """Tear down the rendered detection wireframe group, if any."""
+    grp = _state.get("detection_overlay_group")
+    if grp is None:
+        return
+    try:
+        grp.delete()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("detection overlay delete failed: %s", e)
+    _state["detection_overlay_group"] = None
 
 
 def _render_detection_overlay(detections_payload: dict[str, Any]) -> None:
@@ -45,14 +67,12 @@ def _render_detection_overlay(detections_payload: dict[str, Any]) -> None:
         # Always tear down the previous group before deciding whether to
         # rebuild — that way a frame switch from "base" to "camera" still
         # clears stale boxes.
-        old = _state.get("detection_overlay_group")
-        if old is not None:
-            try:
-                old.delete()
-            except Exception as e:  # noqa: BLE001 - NiceGUI raises various types on torn-down scenes
-                logger.debug("detection overlay delete failed: %s", e)
-            _state["detection_overlay_group"] = None
+        _clear_detection_group()
 
+        # Visibility toggle (panel checkbox). Off by default — the JSON
+        # snapshot frequently outlives the perception run that wrote it.
+        if not bool(_state.get("show_detections", False)):
+            return
         if frame != "base":
             return  # only render base-frame detections in the URDF scene
         if not detections:
@@ -127,14 +147,49 @@ def _poll_detection_json() -> None:
     (perception not running) or unchanged since the last tick. Logs at
     DEBUG level on any error so we don't spam the log when no perception
     pipeline has run yet.
+
+    Files older than ``_DETECTION_FRESHNESS_S`` are ignored — without
+    this, a stale ``last_detection.json`` from a prior ``find_object.py``
+    test would show its wireframe forever after every restart. Any
+    rendered group from a previous tick is cleared when staleness or
+    the visibility toggle says we shouldn't be rendering.
     """
     path = _DETECTION_JSON_PATH
+    show = bool(_state.get("show_detections", False))
+    if not show:
+        # User turned the overlay off — make sure any stale group from
+        # a previous tick is gone, then bail without polling the file.
+        if _state.get("detection_overlay_group") is not None:
+            loop = _state.get("main_loop")
+            if loop is None:
+                _clear_detection_group()
+            else:
+                try:
+                    loop.call_soon_threadsafe(_clear_detection_group)
+                except RuntimeError:
+                    pass
+        return
+
     try:
         if not path.exists():
             return
         mtime = path.stat().st_mtime
     except OSError as e:
         logger.debug("_poll_detection_json: stat failed: %s", e)
+        return
+
+    # Freshness guard — drop stale detections so old pipeline runs don't
+    # ghost across restarts.
+    if (time.time() - mtime) > _DETECTION_FRESHNESS_S:
+        if _state.get("detection_overlay_group") is not None:
+            loop = _state.get("main_loop")
+            if loop is None:
+                _clear_detection_group()
+            else:
+                try:
+                    loop.call_soon_threadsafe(_clear_detection_group)
+                except RuntimeError:
+                    pass
         return
 
     if mtime == _state.get("detection_last_mtime"):

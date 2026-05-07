@@ -546,6 +546,7 @@ def _set_overlay_visible(name: str, visible: bool) -> None:
         "hemisphere": ("hemisphere_wireframe_group",),
         "reachability": ("reachability_group",),
         "near_cone": ("near_cone_group",),
+        "detections": ("detection_overlay_group",),
     }
     for grp_key in group_key_map.get(name, ()):
         grp = _state.get(grp_key)
