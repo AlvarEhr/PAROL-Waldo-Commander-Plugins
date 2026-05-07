@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
@@ -36,6 +37,41 @@ def _build_R_with_z_axis(z_axis_world: NDArray[np.float64]) -> NDArray[np.float6
     x /= float(np.linalg.norm(x))
     y = np.cross(z, x)
     return np.column_stack([x, y, z])
+
+
+def _resolve_active_tool_transform(client: Any) -> tuple[np.ndarray, str]:
+    """Look up the currently-active tool's flange→TCP transform.
+
+    Tries the live client's bound tool first (so the lookup tracks
+    whatever the user has selected — pneumatic gripper, swapped jaw
+    variant, etc.). Falls back to ``parol6.tools.get_tool_transform("SSG-48",
+    _SSG48_JAW_VARIANT)`` if no tool is bound on this client yet (which
+    can happen if the GUI hasn't called ``select_tool`` on this fresh
+    connection).
+
+    Returns ``(T_flange2tcp, tool_label)``. ``tool_label`` is the tool's
+    display name (or "SSG-48" on fallback) for the status line.
+    """
+    from parol6 import tools as parol6_tools  # noqa: PLC0415
+    from scipy.spatial.transform import Rotation as SciRot  # noqa: PLC0415
+
+    try:
+        spec = client.tool
+        tcp_origin = np.asarray(spec.tcp_origin, dtype=np.float64).reshape(3)
+        tcp_rpy = np.asarray(spec.tcp_rpy, dtype=np.float64).reshape(3)
+        # XYZ extrinsic Euler — see Docs/HANDOFF.md "Conventions".
+        R = SciRot.from_euler("XYZ", tcp_rpy, degrees=False).as_matrix()
+        T = np.eye(4, dtype=np.float64)
+        T[:3, :3] = R
+        T[:3, 3] = tcp_origin
+        return T, str(spec.display_name)
+    except RuntimeError:
+        # No tool bound — fall back to the configured default.
+        T = np.asarray(
+            parol6_tools.get_tool_transform("SSG-48", _SSG48_JAW_VARIANT),
+            dtype=np.float64,
+        )
+        return T, "SSG-48 (fallback)"
 
 
 def _drive_hover_pose_thread(
@@ -78,7 +114,6 @@ def _drive_hover_pose_thread(
     from .panel import _post_status  # noqa: PLC0415
     try:
         from parol6 import Robot, RobotClient  # noqa: PLC0415
-        from parol6 import tools as parol6_tools  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
             look_at_pose,
         )
@@ -96,6 +131,13 @@ def _drive_hover_pose_thread(
         )
         direction_up_world /= float(np.linalg.norm(direction_up_world))
 
+        # Open the controller client up front so we can:
+        #   - look up the active tool's TCP transform via ``client.tool``
+        #     (TCP mode only, but cheap regardless),
+        #   - hand the same client to STOP via ``_state["client"]``.
+        client = RobotClient(host="127.0.0.1", port=5001)
+        _state["client"] = client
+
         if mode == "camera":
             mount = _state.get("current_mount")
             if mount is None:
@@ -109,23 +151,20 @@ def _drive_hover_pose_thread(
             T_flange2base = mount.flange_pose_for_cam_pose(T_cam2base)
             ref_label = "camera"
         elif mode == "tcp":
-            # SSG-48's TCP transform: ``T_flange2tcp`` has translation
-            # ``(0, 0, -tcp_offset_z)`` for the active jaw variant. Compose
-            # the desired TCP-in-base pose, then back out T_flange2base.
-            try:
-                T_flange2tcp = parol6_tools.get_tool_transform(
-                    "SSG-48", _SSG48_JAW_VARIANT,
-                )
-            except ValueError as e:
-                _post_status(f"Hover (TCP): {e}")
-                return
+            # Pull the flange→TCP transform from the active tool (queries
+            # ``client.tool``, falls back to SSG-48 default if no tool
+            # has been bound on this client). Compose the desired
+            # TCP-in-base pose with TCP +Z aligned to the board's
+            # local +Z (gripper pointing perpendicular into the board),
+            # then back out T_flange2base.
+            T_flange2tcp, tool_label = _resolve_active_tool_transform(client)
             tcp_origin_world = target_world + standoff_m * direction_up_world
             R_tcp = _build_R_with_z_axis(direction_up_world)
             T_tcp2base = np.eye(4, dtype=np.float64)
             T_tcp2base[:3, :3] = R_tcp
             T_tcp2base[:3, 3] = tcp_origin_world
             T_flange2base = T_tcp2base @ np.linalg.inv(T_flange2tcp)
-            ref_label = "TCP"
+            ref_label = f"TCP[{tool_label}]"
         else:
             _post_status(f"Hover: unknown mode '{mode}'")
             return
@@ -165,8 +204,6 @@ def _drive_hover_pose_thread(
             _post_status(f"Hover ({ref_label}): stopped before starting motion.")
             return
 
-        client = RobotClient(host="127.0.0.1", port=5001)
-        _state["client"] = client  # so STOP can halt the hover move
         angles_deg = np.degrees(q_rad).tolist()
         _post_status(
             f"Hover ({ref_label}): moving to "
