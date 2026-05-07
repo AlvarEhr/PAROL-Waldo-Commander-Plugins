@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import shutil
+import subprocess
+import sys
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -33,6 +36,26 @@ from nicegui import events, ui
 from . import custom_tools
 
 logger = logging.getLogger(__name__)
+
+
+def _open_folder_in_os(path: Path) -> bool:
+    """Open ``path`` in the OS's native file browser. NiceGUI server-side
+    runs on the user's machine (waldo-commander is a local app, not
+    hosted), so this opens the folder on the user's desktop. Returns
+    True on success.
+    """
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        if sys.platform == "win32":
+            os.startfile(str(path))  # noqa: S606 — local app, not server
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(path)])  # noqa: S603, S607
+        else:
+            subprocess.Popen(["xdg-open", str(path)])  # noqa: S603, S607
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not open folder %s: %s", path, e)
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +478,85 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
 # ---------------------------------------------------------------------------
 
 
+def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
+    """Dialog to fork an existing registered tool into a new custom tool.
+
+    The picker lists every entry in ``parol6.tools._TOOL_REGISTRY`` —
+    that includes built-ins (SSG-48, MSG, PNEUMATIC, VACUUM) AND any
+    other custom tools already registered. Picking SSG-48 after the
+    SSG-48 mesh hijack has run gives you a custom tool whose body is
+    the merged camera-bracket STL — exactly the test target for this
+    workflow.
+    """
+    available = custom_tools.list_registered_tools()
+    if not available:
+        ui.notify(
+            "No source tools available — parol6 registry is empty.",
+            color="warning",
+        )
+        return
+    options = {key: f"{display}  ({key})" for key, display in available}
+
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
+        ui.label("Import existing tool as custom").classes(
+            "text-base font-semibold",
+        )
+        ui.label(
+            "Forks any tool from parol6's registry — including the "
+            "SSG-48 entry mutated by the mesh hijack — into a custom "
+            "tool you can iterate on. Mesh files are copied; the new "
+            "custom tool starts with an identity placement transform "
+            "since the source meshes are already in flange coordinates.",
+        ).classes("text-xs opacity-70")
+        first_key = next(iter(options))
+        source_select = ui.select(
+            options=options, value=first_key, label="Source tool",
+        ).props("dense").classes("w-full")
+        target_input = ui.input(
+            label="New custom-tool name",
+            placeholder="ssg48_my_setup",
+        ).props("dense autofocus")
+
+        def _on_import() -> None:
+            source_key = str(source_select.value or "")
+            target = str(target_input.value or "").strip()
+            if not source_key:
+                ui.notify("Pick a source tool", color="warning")
+                return
+            if not target or not all(c.isalnum() or c == "_" for c in target):
+                ui.notify(
+                    "Target name must be non-empty letters/digits/underscore",
+                    color="warning",
+                )
+                return
+            cfg = custom_tools.import_from_registered(source_key, target)
+            if cfg is None:
+                ui.notify(
+                    f"Import failed — check logs (target may already "
+                    f"exist or source has no body mesh).",
+                    color="warning",
+                )
+                return
+            # Bake + register so it's picked up by the gripper dropdown
+            # without a restart.
+            custom_tools.register_one(cfg)
+            ui.notify(
+                f"Imported {source_key} → custom:{target}. "
+                f"Use it from the gripper panel or the card's "
+                f"'Use this tool' button.",
+                color="positive", position="top",
+            )
+            dialog.close()
+            refresh()
+
+        with ui.row():
+            ui.button("Import", on_click=_on_import, color="primary").props(
+                "size=sm",
+            )
+            ui.button("Cancel", on_click=dialog.close).props("size=sm")
+    dialog.open()
+
+
 def _add_tool_dialog(refresh: Callable[[], None]) -> None:
     """Open a dialog to create a new custom tool: name + description +
     optional immediate body STL upload.
@@ -548,12 +650,18 @@ def build_custom_tools_expansion() -> None:
                 "Add custom tool", icon="add",
                 on_click=lambda: _add_tool_dialog(_list_view.refresh),
             ).props("size=sm outline")
+            def _open_root() -> None:
+                if not _open_folder_in_os(custom_tools.CUSTOM_TOOLS_ROOT):
+                    ui.notify(
+                        f"Could not open. Path: {custom_tools.CUSTOM_TOOLS_ROOT}",
+                        color="warning",
+                    )
+
             ui.button(
-                "Open folder",
-                on_click=lambda: ui.notify(
-                    f"Path: {custom_tools.CUSTOM_TOOLS_ROOT}",
-                    color="info",
-                ),
-                icon="folder_open",
+                "Open folder", on_click=_open_root, icon="folder_open",
+            ).props("size=sm outline")
+            ui.button(
+                "Import existing tool", icon="content_copy",
+                on_click=lambda: _import_existing_tool_dialog(_list_view.refresh),
             ).props("size=sm outline")
         _list_view()

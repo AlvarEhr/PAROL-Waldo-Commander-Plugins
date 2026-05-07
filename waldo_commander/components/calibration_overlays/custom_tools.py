@@ -693,6 +693,160 @@ def live_refresh_active_tool(name: str) -> bool:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Import-from-existing-tool — fork any registered tool into a custom one
+# ---------------------------------------------------------------------------
+
+
+def list_registered_tools() -> list[tuple[str, str]]:
+    """Return ``[(registry_key, display_name), ...]`` for every tool
+    currently in ``parol6.tools._TOOL_REGISTRY``. Used by the import
+    dialog so the user picks a source by name. Excludes ``"NONE"`` (it
+    has no meshes worth copying).
+    """
+    try:
+        from parol6 import tools as parol6_tools  # noqa: PLC0415
+    except ImportError:
+        return []
+    out: list[tuple[str, str]] = []
+    for key, cfg in parol6_tools._TOOL_REGISTRY.items():
+        if key == "NONE":
+            continue
+        out.append((key, getattr(cfg, "name", key)))
+    return sorted(out, key=lambda p: p[1])
+
+
+def import_from_registered(source_key: str, target_name: str) -> CustomToolConfig | None:
+    """Fork the tool at ``parol6.tools._TOOL_REGISTRY[source_key]`` into a
+    new custom tool under ``~/.waldo-commander/custom_tools/<target_name>/``.
+
+    Reads the source's meshes (BODY + JAWs), copies the underlying STL
+    files from parol6's mesh dir to the new custom-tool folder, extracts
+    the TCP transform + jaw motion, and writes a ``config.json`` with a
+    placement transform of identity (the source meshes are already in
+    flange coordinates so no extra placement is needed).
+
+    Returns the new ``CustomToolConfig`` on success, or None when:
+    * the source key isn't in the registry,
+    * the source has no body mesh,
+    * the target name already exists,
+    * file copies fail.
+
+    Use case: migrate a built-in tool (or one that was modified by a
+    startup hijack like the SSG-48 merged-bracket bake) into the custom
+    system so the user can iterate transforms / TCP / motion via the UI
+    instead of editing module constants.
+    """
+    if target_name in list_tool_names():
+        logger.warning("import: target %r already exists", target_name)
+        return None
+    try:
+        from parol6 import tools as parol6_tools  # noqa: PLC0415
+    except ImportError:
+        return None
+    src = parol6_tools._TOOL_REGISTRY.get(source_key)
+    if src is None:
+        logger.warning("import: no tool with key %r", source_key)
+        return None
+    try:
+        from importlib.resources import files as pkg_files  # noqa: PLC0415
+        parol6_root = Path(str(pkg_files("parol6")))
+        mesh_dir = parol6_root / "urdf_model" / "meshes"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("import: could not locate parol6 mesh dir: %s", e)
+        return None
+
+    # Locate the meshes — pick the first BODY + first 2 JAWS by role.
+    MeshRole = parol6_tools.MeshRole  # noqa: N806
+    body_spec = None
+    jaw_specs: list = []
+    for spec in src.meshes:
+        if spec.role == MeshRole.BODY and body_spec is None:
+            body_spec = spec
+        elif spec.role == MeshRole.JAW:
+            jaw_specs.append(spec)
+    if body_spec is None:
+        logger.warning("import: source %r has no body mesh", source_key)
+        return None
+
+    def _resolve(filename: str) -> Path:
+        """Strip any browser cache-bust ``?v=<mtime>`` suffix the SSG-48
+        hijack adds for Three.js URL invalidation — it's URL syntax,
+        invalid as a filesystem path."""
+        plain = filename.split("?", 1)[0]
+        return mesh_dir / plain
+
+    # Copy STLs into the new custom-tool folder under canonical names.
+    target_folder = CUSTOM_TOOLS_ROOT / target_name
+    target_folder.mkdir(parents=True, exist_ok=True)
+    body_src = _resolve(body_spec.file)
+    if not body_src.exists():
+        logger.warning("import: body STL missing: %s", body_src)
+        return None
+    shutil.copyfile(str(body_src), str(target_folder / BODY_STL_NAME))
+    # Up to two jaws: jaw_specs[0] -> jaw_left, jaw_specs[1] -> jaw_right.
+    # parol6's tools list "right" before "left" by convention; both
+    # orderings work since the only thing that matters is one-per-side.
+    if len(jaw_specs) >= 2:
+        for jaw_spec, dst_name in (
+            (jaw_specs[0], JAW_RIGHT_STL_NAME),
+            (jaw_specs[1], JAW_LEFT_STL_NAME),
+        ):
+            jaw_src = _resolve(jaw_spec.file)
+            if jaw_src.exists():
+                shutil.copyfile(str(jaw_src), str(target_folder / dst_name))
+
+    # Extract TCP transform: source.transform is the 4×4 flange→TCP.
+    transform = np.asarray(src.transform, dtype=np.float64)
+    tcp_origin = tuple(float(v) for v in transform[:3, 3])
+    tcp_rpy = tuple(
+        float(v) for v in SciRot.from_matrix(transform[:3, :3]).as_euler("XYZ")
+    )
+
+    # Jaw motion: pick the first LinearMotion (custom_tools only models
+    # one). parol6 ships LinearMotion with axis + travel_m + symmetric.
+    jaw_travel_m = 0.0
+    jaw_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
+    jaw_symmetric = True
+    LinearMotion = getattr(parol6_tools, "LinearMotion", None)
+    for motion in getattr(src, "motions", ()) or ():
+        if LinearMotion is not None and isinstance(motion, LinearMotion):
+            jaw_travel_m = float(getattr(motion, "travel_m", 0.0))
+            axis_raw = getattr(motion, "axis", (0.0, 1.0, 0.0))
+            jaw_axis = (
+                float(axis_raw[0]), float(axis_raw[1]), float(axis_raw[2]),
+            )
+            jaw_symmetric = bool(getattr(motion, "symmetric", True))
+            break
+
+    cfg = CustomToolConfig(
+        name=target_name,
+        display_name=getattr(src, "name", target_name),
+        description=(
+            f"Imported from {source_key}. "
+            f"{getattr(src, 'description', '') or ''}".strip()
+        ),
+        # Identity placement — source STLs are already in flange coords.
+        mesh_translate_m=(0.0, 0.0, 0.0),
+        mesh_rpy_rad=(0.0, 0.0, 0.0),
+        mesh_scale=1.0,
+        tcp_origin_m=(tcp_origin[0], tcp_origin[1], tcp_origin[2]),
+        tcp_rpy_rad=(tcp_rpy[0], tcp_rpy[1], tcp_rpy[2]),
+        jaw_travel_m=jaw_travel_m,
+        jaw_axis=jaw_axis,
+        jaw_symmetric=jaw_symmetric,
+    )
+    save_config(cfg)
+    # Refresh the derived flags now that body / jaws exist on disk.
+    cfg.has_body = cfg.body_path.exists()
+    cfg.has_jaws = cfg.jaw_left_path.exists() and cfg.jaw_right_path.exists()
+    logger.info(
+        "import: %r forked from %s (body=%s, jaws=%s, tcp=%s)",
+        target_name, source_key, cfg.has_body, cfg.has_jaws, tcp_origin,
+    )
+    return cfg
+
+
 async def select_as_active(name: str) -> bool:
     """Send a ``select_tool`` to the controller so ``custom:<name>``
     becomes the live active tool. Returns True on success.
