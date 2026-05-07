@@ -137,33 +137,37 @@ async def initialize_urdf_scene() -> None:
 
     # parol6-vision: hijack the SSG-48 BODY mesh to embed the user's merged
     # camera-bracket STL. Pass the active_robot so its tools collection
-    # (snapshotted at Robot.__init__ time) gets rebuilt from the mutated
-    # registry. Must run BEFORE UrdfScene.show() reads tool meshes.
-    try:
-        from waldo_commander.components.calibration_overlays import (
-            hijack_ssg48_body_mesh as _calib_hijack_ssg48,
-        )
+    # The legacy SSG-48 hijack is intentionally NOT called here anymore.
+    # It mutated the built-in SSG-48 entry to point at one user's merged
+    # camera-bracket STL, which is correct for that user but wrong for
+    # everyone else. The first-run migration below converts the same
+    # historical setup into a regular custom tool (custom:ssg48_realsense)
+    # while leaving the SSG-48 entry as Jepson's stock body.
 
-        _calib_hijack_ssg48(active_robot=robot)
-    except Exception as _e:  # noqa: BLE001
-        logger.warning("SSG-48 mesh hijack failed: %s", _e)
-
-    # Phase 1B: register every user-defined tool from
+    # Phase 1B + 1C: register every user-defined tool from
     # ~/.waldo-commander/custom_tools/. Each one bakes its STL with the
     # configured placement transform into parol6's mesh dir, then adds a
-    # ``custom:<name>`` entry to ``parol6.tools._TOOL_REGISTRY``. Same
-    # registry-mutation timing constraint as the SSG-48 hijack — must
-    # land before UrdfScene reads tool meshes.
+    # ``custom:<name>`` entry to ``parol6.tools._TOOL_REGISTRY``. Must
+    # run before UrdfScene reads tool meshes.
     try:
         from waldo_commander.components.calibration_overlays import (
             custom_tools as _calib_custom_tools,
         )
 
+        # One-shot migration of the legacy SSG-48 + camera-bracket setup
+        # into a regular custom tool. No-op when the user doesn't have
+        # the merged STL (most users) or when the migration has already
+        # run once. Goes BEFORE register_all so the new tool gets
+        # registered along with everything else in the same pass.
+        try:
+            _calib_custom_tools.auto_migrate_ssg48_with_bracket()
+        except Exception as _ie:  # noqa: BLE001
+            logger.warning("ssg48 auto-migration failed: %s", _ie)
+
         _registered = _calib_custom_tools.register_all()
         if _registered:
             # Rebuild the active_robot's _tools so the freshly-registered
-            # entries are visible to the gripper dropdown — same pattern
-            # the SSG-48 hijack uses to refresh after registry mutation.
+            # entries are visible to the gripper dropdown.
             try:
                 from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
 

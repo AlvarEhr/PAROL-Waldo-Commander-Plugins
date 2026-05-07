@@ -646,6 +646,198 @@ def register_all() -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# One-shot SSG-48 + camera-bracket migration
+# ---------------------------------------------------------------------------
+
+
+_SSG48_MIGRATION_NAME: str = "ssg48_realsense"
+_SSG48_SENTINEL_FILENAME: str = ".ssg48_realsense_migrated"
+
+
+def _ssg48_merged_stl_path() -> Path | None:
+    """Locate parol6-vision's merged SSG-48 + camera bracket STL relative
+    to the package install. Returns None when the sibling clone isn't
+    where we expect (e.g. fresh checkout without parol6-vision next door).
+    """
+    pv_root = (
+        Path(__file__).resolve().parent.parent.parent.parent.parent / "parol6-vision"
+    )
+    candidate = pv_root / "parol6_vision" / "sim" / "meshes" / "ssg48_body_realsense.stl"
+    return candidate if candidate.exists() else None
+
+
+def auto_migrate_ssg48_with_bracket() -> bool:
+    """One-shot migration: convert the historical SSG-48 hijack into a
+    user-defined ``custom:ssg48_realsense`` tool, pre-baked from the merged
+    SSG-48 + camera-bracket STL with the same fit constants the hijack
+    used. Idempotent via a sentinel file at
+    ``~/.waldo-commander/custom_tools/.ssg48_realsense_migrated``.
+
+    Why a migration instead of a permanent hijack: the hijack hardcodes
+    one user's CAD setup (Alvar's merged STL) into the SSG-48 entry,
+    which is wrong for upstream code. After this migration the regular
+    "SSG-48" entry stays as Jepson's stock body, and the camera-bracket
+    setup lives as a normal custom tool the user can iterate via the UI.
+
+    Pre-conditions for the migration to fire:
+
+    * Sentinel file does NOT exist (first run after this code lands).
+    * ``parol6-vision/parol6_vision/sim/meshes/ssg48_body_realsense.stl``
+      exists at the sibling-clone location (the merged STL is Alvar's
+      personal CAD export — for users without the file, this no-ops
+      silently).
+    * The custom tool name ``ssg48_realsense`` is not already in use.
+
+    Side effects on success:
+
+    * ``~/.waldo-commander/custom_tools/ssg48_realsense/{body.stl,
+      jaw_left.stl, jaw_right.stl, config.json}`` written. The body
+      STL has the SSG-48 fit transform pre-applied so the placement
+      transform stays at identity — user iteration still works via
+      ``mesh_translate_m`` etc.
+    * ``custom:ssg48_realsense`` registered in ``parol6.tools._TOOL_REGISTRY``.
+    * Sentinel file written so this migration never runs again.
+    * The legacy ``ssg48_body_realsense.stl`` is also written into
+      parol6's mesh dir so the collision check (which still hardcodes
+      that filename) keeps working without further changes.
+
+    Returns True when the migration created a new custom tool, False
+    when skipped (sentinel present, source missing, name conflict, etc.).
+    """
+    ensure_root()
+    sentinel = CUSTOM_TOOLS_ROOT / _SSG48_SENTINEL_FILENAME
+    if sentinel.exists():
+        return False
+    if _SSG48_MIGRATION_NAME in list_tool_names():
+        # Custom tool already exists — write the sentinel so we don't
+        # try again, and keep what's there. User-customised state wins.
+        sentinel.touch(exist_ok=True)
+        return False
+
+    src_body = _ssg48_merged_stl_path()
+    if src_body is None:
+        # No merged STL on disk — common case for users without Alvar's
+        # personal CAD. Skip without fanfare; don't write the sentinel
+        # so a later checkout that brings the file in does run the
+        # migration.
+        logger.info(
+            "ssg48 migration: merged STL not found; skipping",
+        )
+        return False
+
+    try:
+        import trimesh  # noqa: PLC0415
+        from importlib.resources import files as pkg_files  # noqa: PLC0415
+        from scipy.spatial.transform import Rotation as SciRot  # noqa: PLC0415
+    except ImportError as e:
+        logger.info("ssg48 migration: deps unavailable (%s); skipping", e)
+        return False
+
+    # Same fit constants the SSG-48 hijack used historically — kept as
+    # module-level defaults in ``constants.py`` so this migration
+    # produces an identical body to the legacy hijack output.
+    from . import constants as _c  # noqa: PLC0415
+
+    fit_scale = float(_c._MERGED_STL_FIT_SCALE)
+    fit_translate = np.asarray(_c._MERGED_STL_FIT_TRANSLATE_M, dtype=np.float64)
+    user_translate = np.asarray(_c._MERGED_STL_TRANSLATE_M, dtype=np.float64)
+    user_rpy = np.asarray(_c._MERGED_STL_RPY_RAD, dtype=np.float64)
+
+    try:
+        mesh = trimesh.load(str(src_body), force="mesh")
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ssg48 migration: trimesh load failed: %s", e)
+        return False
+
+    # Step 1: fit transform (scale + translate).
+    T_fit = np.eye(4, dtype=np.float64)
+    T_fit[:3, :3] = np.eye(3) * fit_scale
+    T_fit[:3, 3] = fit_translate
+    mesh.apply_transform(T_fit)
+
+    # Step 2: user RPY + translate (Alvar's tuning on top of the fit).
+    if any(abs(a) > 1e-9 for a in user_rpy):
+        T_extra = np.eye(4, dtype=np.float64)
+        T_extra[:3, :3] = SciRot.from_euler("XYZ", user_rpy).as_matrix()
+        T_extra[:3, 3] = user_translate
+        mesh.apply_transform(T_extra)
+    elif np.linalg.norm(user_translate) > 1e-9:
+        T_extra = np.eye(4, dtype=np.float64)
+        T_extra[:3, 3] = user_translate
+        mesh.apply_transform(T_extra)
+
+    # Write the body into the new custom-tool folder.
+    target_folder = CUSTOM_TOOLS_ROOT / _SSG48_MIGRATION_NAME
+    target_folder.mkdir(parents=True, exist_ok=True)
+    mesh.export(str(target_folder / BODY_STL_NAME), file_type="stl")
+
+    # Find parol6's mesh dir for the stock SSG-48 finger STLs.
+    try:
+        parol6_root = Path(str(pkg_files("parol6")))
+        mesh_dir = parol6_root / "urdf_model" / "meshes"
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ssg48 migration: parol6 mesh dir unreachable: %s", e)
+        return False
+
+    # Copy stock jaw STLs (already in flange-metres coords).
+    for stock_name, dst_name in (
+        ("ssg48_finger_left.stl", JAW_LEFT_STL_NAME),
+        ("ssg48_finger_right.stl", JAW_RIGHT_STL_NAME),
+    ):
+        src = mesh_dir / stock_name
+        if src.exists():
+            shutil.copyfile(str(src), str(target_folder / dst_name))
+
+    # Also write the baked body to the legacy ``ssg48_body_realsense.stl``
+    # filename in parol6's mesh dir — collision.py and other consumers
+    # still resolve the gripper body via that filename. Keeps existing
+    # collision checks working without a parallel refactor in this turn.
+    try:
+        legacy_path = mesh_dir / "ssg48_body_realsense.stl"
+        mesh.export(str(legacy_path), file_type="stl")
+        logger.info("ssg48 migration: wrote legacy %s", legacy_path)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ssg48 migration: legacy bake failed: %s", e)
+
+    cfg = CustomToolConfig(
+        name=_SSG48_MIGRATION_NAME,
+        display_name="SSG-48 + RealSense bracket",
+        description=(
+            "Migrated from the legacy SSG-48 hijack. Body has the merged "
+            "camera bracket fused in; jaws are parol6's stock finger STLs. "
+            "Fit transform pre-baked into body.stl so placement starts at "
+            "identity — iterate via the placement inputs."
+        ),
+        mesh_translate_m=(0.0, 0.0, 0.0),
+        mesh_rpy_rad=(0.0, 0.0, 0.0),
+        mesh_scale=1.0,
+        # SSG-48 TCP — same flange→TCP transform as the built-in entry.
+        tcp_origin_m=(0.0, 0.0, -0.105),
+        tcp_rpy_rad=(0.0, 0.0, 0.0),
+        # Jaw motion from parol6's _SSG48_JAW_MOTION (24 mm symmetric, +Y).
+        jaw_travel_m=0.024,
+        jaw_axis=(0.0, 1.0, 0.0),
+        jaw_symmetric=True,
+    )
+    save_config(cfg)
+    cfg.has_body = cfg.body_path.exists()
+    cfg.has_jaws = (
+        cfg.jaw_left_path.exists() and cfg.jaw_right_path.exists()
+    )
+
+    # Register the new custom tool so it shows up in the dropdown
+    # without a restart.
+    register_one(cfg)
+
+    sentinel.touch()
+    logger.info(
+        "ssg48 migration complete — custom:%s created, sentinel %s written",
+        _SSG48_MIGRATION_NAME, sentinel,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Live-refresh hooks — re-load tool meshes in the URDF scene without a
 # round-trip through the gripper-panel dropdown.
 # ---------------------------------------------------------------------------
