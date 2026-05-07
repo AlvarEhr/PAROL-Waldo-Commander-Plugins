@@ -148,6 +148,34 @@ async def initialize_urdf_scene() -> None:
     except Exception as _e:  # noqa: BLE001
         logger.warning("SSG-48 mesh hijack failed: %s", _e)
 
+    # Phase 1B: register every user-defined tool from
+    # ~/.waldo-commander/custom_tools/. Each one bakes its STL with the
+    # configured placement transform into parol6's mesh dir, then adds a
+    # ``custom:<name>`` entry to ``parol6.tools._TOOL_REGISTRY``. Same
+    # registry-mutation timing constraint as the SSG-48 hijack — must
+    # land before UrdfScene reads tool meshes.
+    try:
+        from waldo_commander.components.calibration_overlays import (
+            custom_tools as _calib_custom_tools,
+        )
+
+        _registered = _calib_custom_tools.register_all()
+        if _registered:
+            # Rebuild the active_robot's _tools so the freshly-registered
+            # entries are visible to the gripper dropdown — same pattern
+            # the SSG-48 hijack uses to refresh after registry mutation.
+            try:
+                from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
+
+                robot._tools = _parol6_build_tools()  # type: ignore[attr-defined]
+            except Exception as _ie:  # noqa: BLE001
+                logger.debug(
+                    "custom_tools: active_robot._tools refresh failed: %s",
+                    _ie,
+                )
+    except Exception as _e:  # noqa: BLE001
+        logger.warning("custom_tools registration failed: %s", _e)
+
     # Detect theme and set appropriate colors
     is_dark = is_dark_theme()
     bg_color = (

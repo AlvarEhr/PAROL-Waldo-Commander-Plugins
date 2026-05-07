@@ -46,6 +46,7 @@ Layout of the package:
   the threads use to push status updates back to the GUI.
 """
 
+from . import custom_tools
 from .collision import validate_joint_trajectory
 from .overlays import add_overlays, refresh_board_dependent_overlays
 from .panel import build_calibration_panel_content
@@ -54,6 +55,7 @@ from .ssg48_hijack import hijack_ssg48_body_mesh
 __all__ = [
     "add_overlays",
     "build_calibration_panel_content",
+    "custom_tools",
     "hijack_ssg48_body_mesh",
     "refresh_board_dependent_overlays",
     "validate_joint_trajectory",

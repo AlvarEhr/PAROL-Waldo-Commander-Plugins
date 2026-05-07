@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 from nicegui import ui
 
-from . import settings, settings_ui
+from . import custom_tools_ui, settings, settings_ui
 from .calibration_thread import _calibration_thread
 from .hover import _drive_hover_pose_thread
 from .localise import _localise_board_thread
@@ -424,5 +424,6 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
             settings_ui.build_preset_bar(refresh_panel=_settings_panel.refresh)
             ui.separator().classes("q-my-sm")
             settings_ui.build_calibration_settings_expansion()
+            custom_tools_ui.build_custom_tools_expansion()
 
         _settings_panel()
