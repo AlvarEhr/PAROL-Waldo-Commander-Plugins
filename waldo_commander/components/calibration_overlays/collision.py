@@ -9,15 +9,8 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from .constants import (
-    _COLLISION_SAFETY_MARGIN_M,
-    _FLOOR_PRIMITIVE_ENABLED,
-    _SSG48_JAW_VARIANT,
-    _TABLET_DIMENSIONS_M,
-    _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M,
-    _TABLET_PRIMITIVE_ENABLED,
-)
-from .state import _T_BOARD2BASE, _state
+from . import settings
+from .state import _T_BOARD2BASE, _state, current_board_config
 
 logger = logging.getLogger(__name__)
 
@@ -31,10 +24,11 @@ def _build_collision_manager(
 
     Args:
         tablet_T_board2base: Optional 4×4 board→base transform. When
-            provided AND ``_TABLET_PRIMITIVE_ENABLED`` is True, a box of
-            ``_TABLET_DIMENSIONS_M`` is placed at the ChArUco centre, with
-            its top face on the board's z=0 surface and the body extending
-            in board-local -Z. When None, no tablet primitive is added.
+            provided AND the mounting surface is enabled, a box of
+            ``settings.surface_dimensions_m`` is placed at the ChArUco
+            centre, with its top face on the board's z=0 surface and the
+            body extending in board-local -Z. When None, no surface
+            primitive is added.
 
     Returns:
         (manager, adjacent_pairs, meshes) on success, None if python-fcl or any
@@ -88,10 +82,11 @@ def _build_collision_manager(
     # but the fingertips drag through the tablet surface — exactly the
     # symptom the user reported. SSG-48 has two interchangeable jaw
     # variants ("finger" or "pinch"); only one is physically mounted at
-    # a time, so we load only the configured _SSG48_JAW_VARIANT.
+    # a time, so we load only the configured tool_jaw_variant.
+    jaw_variant = str(settings.tool_jaw_variant)
     jaw_loaded: list[str] = []
     for side in ("left", "right"):
-        jaw_name = f"ssg48_{_SSG48_JAW_VARIANT}_{side}"
+        jaw_name = f"ssg48_{jaw_variant}_{side}"
         jaw_path = mesh_dir / f"{jaw_name}_simplified.stl"
         if not jaw_path.exists():
             jaw_path = mesh_dir / f"{jaw_name}.stl"
@@ -118,13 +113,14 @@ def _build_collision_manager(
     # doesn't fire a false positive — only links that AREN'T expected
     # to touch the floor (everything except base_link) get rejected.
     floor_added = False
-    if _FLOOR_PRIMITIVE_ENABLED:
+    safety_margin = float(settings.collision_safety_margin_m)
+    if bool(settings.floor_primitive_enabled):
         try:
-            box_thickness = 0.05 + _COLLISION_SAFETY_MARGIN_M
+            box_thickness = 0.05 + safety_margin
             floor_box = trimesh.creation.box(extents=(10.0, 10.0, box_thickness))
             floor_pose = np.eye(4, dtype=np.float64)
             # Position so box top is at +safety_margin: centre = top - h/2.
-            floor_pose[2, 3] = _COLLISION_SAFETY_MARGIN_M - box_thickness / 2.0
+            floor_pose[2, 3] = safety_margin - box_thickness / 2.0
             mgr.add_object("FLOOR", floor_box, transform=floor_pose)
             meshes["FLOOR"] = floor_box
 
@@ -145,15 +141,15 @@ def _build_collision_manager(
     # The board pose is auto-lifted by tablet thickness in _build_T_board2base,
     # so in WORLD frame the box ends up between z=0 (bench) and z=+t_h (screen).
     tablet_added = False
-    if _TABLET_PRIMITIVE_ENABLED and tablet_T_board2base is not None:
+    if bool(settings.surface_enabled) and tablet_T_board2base is not None:
         try:
-            from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
-            t_w, t_l, t_h = _TABLET_DIMENSIONS_M
-            t_off_x, t_off_y = _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M
+            _cfg = current_board_config()
+            t_w, t_l, t_h = settings.surface_dimensions_m
+            t_off_x, t_off_y = settings.surface_offset_local_m
             # Inflate by 2 × safety margin in each axis (margin on each side).
             # Centre of the inflated box stays at the same point as the original
             # tablet centre, so the inflation is symmetric.
-            margin = _COLLISION_SAFETY_MARGIN_M
+            margin = safety_margin
             tablet_box = trimesh.creation.box(
                 extents=(t_w + 2 * margin, t_l + 2 * margin, t_h + 2 * margin),
             )
@@ -222,7 +218,7 @@ def _build_collision_manager(
     # Add reverse pairs for symmetric lookup.
     adjacent |= {(b, a) for a, b in adjacent}
     jaws_str = (
-        f" + {len(jaw_loaded)} jaws ({_SSG48_JAW_VARIANT})" if jaw_loaded else ""
+        f" + {len(jaw_loaded)} jaws ({jaw_variant})" if jaw_loaded else ""
     )
     logger.info(
         "self-collision manager loaded: 7 links + gripper%s%s%s",

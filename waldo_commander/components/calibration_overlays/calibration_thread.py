@@ -9,22 +9,12 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from . import settings
 from .collision import _build_collision_manager, _self_collides, _trajectory_collides
 from .constants import (
     _BOARD_TARGET_OFFSETS_LOCAL,
     _BOOTSTRAP_N_CANDIDATES,
     _CALIBRATION_USE_CONTINUOUS,
-    _CAM_MOUNT_TILT_DEG,
-    _CAM_MOUNT_TRANSLATE_MM,
-    _ENABLE_SELF_COLLISION_CHECK,
-    _HEMI_DISTANCE_RANGE_M,
-    _HEMI_ELEVATION_RANGE_DEG,
-    _INTR_CX,
-    _INTR_CY,
-    _INTR_FX,
-    _INTR_FY,
-    _INTR_H,
-    _INTR_W,
     _MAIN_N_CANDIDATES,
     _MAX_CAM_BOARD_ANGLE_DEG,
     _OCCLUSION_BOARD_SAMPLES_LOCAL,
@@ -40,6 +30,7 @@ from .state import (
     _hemi_azimuth_world_range_deg,
     _hemi_centre_world,
     _state,
+    current_board_config,
 )
 from .workspace import _ensure_workspace_envelope, envelope_contains
 
@@ -66,10 +57,7 @@ def _calibration_thread() -> None:
         # Lazy imports.
         from parol6 import Robot, RobotClient  # noqa: PLC0415
 
-        from parol6_vision.calibration.board import (  # noqa: PLC0415
-            BOARD_TABLET_30MM,
-            BoardDetector,
-        )
+        from parol6_vision.calibration.board import BoardDetector  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
             CameraMount,
         )
@@ -106,17 +94,20 @@ def _calibration_thread() -> None:
             # Sim ground truth: cold-start tunable + small fixed perturbation
             # (±2 mm / ±2°) so the simulated calibration always has something
             # realistic to converge to.
+            cam_translate = settings.cam_mount_translate_mm
+            cam_tilt = settings.cam_mount_tilt_deg
             ground_truth_mount = CameraMount.from_eyeball_estimate(
-                x_mm=_CAM_MOUNT_TRANSLATE_MM[0] + 2.0,
-                y_mm=_CAM_MOUNT_TRANSLATE_MM[1] + 2.0,
-                z_mm=_CAM_MOUNT_TRANSLATE_MM[2] - 2.0,
-                tilt_x_deg=_CAM_MOUNT_TILT_DEG[0] + 2.0,
-                tilt_y_deg=_CAM_MOUNT_TILT_DEG[1] - 1.0,
-                tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+                x_mm=cam_translate[0] + 2.0,
+                y_mm=cam_translate[1] + 2.0,
+                z_mm=cam_translate[2] - 2.0,
+                tilt_x_deg=cam_tilt[0] + 2.0,
+                tilt_y_deg=cam_tilt[1] - 1.0,
+                tilt_z_deg=cam_tilt[2],
             )
             intrinsics = Intrinsics(
-                fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
-                width=_INTR_W, height=_INTR_H,
+                fx=float(settings.intr_fx), fy=float(settings.intr_fy),
+                cx=float(settings.intr_cx), cy=float(settings.intr_cy),
+                width=int(settings.intr_width), height=int(settings.intr_height),
                 dist_coeffs=np.zeros(5, dtype=np.float64),
             )
         else:
@@ -176,22 +167,25 @@ def _calibration_thread() -> None:
             T[:3, 3] = fk_pose[:3]
             return T
 
+        intr_w = int(settings.intr_width)
+        intr_h = int(settings.intr_height)
+        cfg = current_board_config()
         if is_sim_mode:
             camera: Any = VirtualCamera(
                 intrinsics=intrinsics,
-                image_width=_INTR_W,
-                image_height=_INTR_H,
+                image_width=intr_w,
+                image_height=intr_h,
                 ground_truth_mount=ground_truth_mount,
                 flange_pose_provider=flange_pose,
-                board=VirtualBoard(config=BOARD_TABLET_30MM, T_board2base=T_BOARD2BASE),
+                board=VirtualBoard(config=cfg, T_board2base=T_BOARD2BASE),
                 noise_std=0.0,
             )
             logger.info("calibration camera: VirtualCamera (simulator mode)")
         else:
             from parol6_vision.camera.realsense import RealSenseCamera  # noqa: PLC0415
             camera = RealSenseCamera(
-                width=_INTR_W,
-                height=_INTR_H,
+                width=intr_w,
+                height=intr_h,
                 fps=30,
                 enable_depth=False,  # calibration only needs color frames
                 enable_color=True,
@@ -208,14 +202,16 @@ def _calibration_thread() -> None:
                 intrinsics.fx, intrinsics.fy, intrinsics.cx, intrinsics.cy,
                 intrinsics.dist_coeffs.tolist(),
             )
-        detector = BoardDetector(BOARD_TABLET_30MM)
+        detector = BoardDetector(cfg)
+        cs_translate = settings.cam_mount_translate_mm
+        cs_tilt = settings.cam_mount_tilt_deg
         cold_start = CameraMount.from_eyeball_estimate(
-            x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
-            y_mm=_CAM_MOUNT_TRANSLATE_MM[1],
-            z_mm=_CAM_MOUNT_TRANSLATE_MM[2],
-            tilt_x_deg=_CAM_MOUNT_TILT_DEG[0],
-            tilt_y_deg=_CAM_MOUNT_TILT_DEG[1],
-            tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+            x_mm=cs_translate[0],
+            y_mm=cs_translate[1],
+            z_mm=cs_translate[2],
+            tilt_x_deg=cs_tilt[0],
+            tilt_y_deg=cs_tilt[1],
+            tilt_z_deg=cs_tilt[2],
         )
 
         # Hemisphere CENTRE — also the calibration's look-at target. Uses the
@@ -263,10 +259,10 @@ def _calibration_thread() -> None:
         # drive into the physical ChArUco display.
         collision_mgr_pair = (
             _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
-            if _ENABLE_SELF_COLLISION_CHECK else None
+            if bool(settings.enable_self_collision_check) else None
         )
         occlusion_meshes = (
-            _build_occlusion_mesh() if _ENABLE_SELF_COLLISION_CHECK else None
+            _build_occlusion_mesh() if bool(settings.enable_self_collision_check) else None
         )
 
         class HullFilteredPoseGenerator(PoseGenerator):
@@ -283,13 +279,13 @@ def _calibration_thread() -> None:
                 # construction time — possibly the override); only the
                 # look-at aim varies per pass.
                 #
-                # When _HEMI_CENTRE_OVERRIDE_M is set, self.target_world is
+                # When settings.hemi_centre_override_m is set, self.target_world is
                 # the override (a fixed workable-space anchor). The aim
                 # points STILL come from _T_BOARD2BASE — i.e. cameras aim
                 # at the actual board, not the override. Single-target mode
                 # uses the centre offset (0.5, 0.5) explicitly so the same
                 # invariant holds with or without multi-target.
-                cfg = BOARD_TABLET_30MM
+                cfg = current_board_config()
                 w_m_b = cfg.squares_x * cfg.square_length
                 h_m_b = cfg.squares_y * cfg.square_length
                 offsets = (
@@ -369,7 +365,7 @@ def _calibration_thread() -> None:
                 # (e.g. arm body blocks the side of the FOV but not the centre).
                 if occlusion_meshes is not None:
                     cold_T = self.mount.T_cam2flange
-                    cfg = BOARD_TABLET_30MM
+                    cfg = current_board_config()
                     w_m_b = cfg.squares_x * cfg.square_length
                     h_m_b = cfg.squares_y * cfg.square_length
                     sample_world = [
@@ -506,8 +502,8 @@ def _calibration_thread() -> None:
         #
         # Both grids are DENSE because tilt_x=180 forces wrist-flip
         # configurations and only ~5% of grid points pass IK.
-        d_min, d_max = _HEMI_DISTANCE_RANGE_M
-        ev_min, ev_max = _HEMI_ELEVATION_RANGE_DEG
+        d_min, d_max = settings.hemi_distance_range_m
+        ev_min, ev_max = settings.hemi_elevation_range_deg
         az_world_range = _hemi_azimuth_world_range_deg()
         if _CALIBRATION_USE_CONTINUOUS:
             # Sobol low-discrepancy sampling — same volume as the discrete
@@ -631,9 +627,6 @@ def _calibration_thread() -> None:
             # visual confirmation of the calibration result. If no overhead
             # pose is reachable for whatever reason, fall back to home.
             try:
-                from parol6_vision.calibration.board import (  # noqa: PLC0415
-                    BOARD_TABLET_30MM as _view_cfg,
-                )
                 from parol6_vision.calibration.view_pose import (  # noqa: PLC0415
                     DEFAULT_MARGIN_PX as _VIEW_MARGIN_PX,
                     DEFAULT_TARGET_FILL as _VIEW_TARGET_FILL,
@@ -643,6 +636,7 @@ def _calibration_thread() -> None:
                 )
                 from parol6_vision.camera.intrinsics import Intrinsics  # noqa: PLC0415
 
+                _view_cfg = current_board_config()
                 view_centre_local = np.array(
                     [
                         _view_cfg.squares_x * _view_cfg.square_length / 2.0,
@@ -655,8 +649,9 @@ def _calibration_thread() -> None:
                 view_target = (_T_BOARD2BASE @ view_centre_local)[:3]
                 view_corners_world = board_corners_world(_T_BOARD2BASE, _view_cfg)
                 view_intrinsics = Intrinsics(
-                    fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
-                    width=_INTR_W, height=_INTR_H,
+                    fx=float(settings.intr_fx), fy=float(settings.intr_fy),
+                    cx=float(settings.intr_cx), cy=float(settings.intr_cy),
+                    width=int(settings.intr_width), height=int(settings.intr_height),
                     dist_coeffs=np.zeros(5, dtype=np.float64),
                 )
                 # Hemisphere range derived from intrinsics + board geometry —

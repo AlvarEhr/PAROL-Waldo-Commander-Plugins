@@ -12,18 +12,8 @@ from nicegui import app as ng_app, ui
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as SciRotation
 
-from .constants import (
-    _CAM_MOUNT_TILT_DEG,
-    _CAM_MOUNT_TRANSLATE_MM,
-    _DETECTION_POLL_INTERVAL_S,
-    _HEMI_AZIMUTH_SPREAD_DEG,
-    _HEMI_DISTANCE_RANGE_M,
-    _HEMI_ELEVATION_RANGE_DEG,
-    _SHOW_TABLET_OVERLAY,
-    _TABLET_DIMENSIONS_M,
-    _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M,
-    _TABLET_PRIMITIVE_ENABLED,
-)
+from . import settings
+from .constants import _DETECTION_POLL_INTERVAL_S
 from .detection import _poll_detection_json
 from .frustum import (
     _FOOTPRINT_TICK_HZ,
@@ -38,6 +28,7 @@ from .state import (
     _hemi_azimuth_world_range_deg,
     _hemi_centre_world,
     _state,
+    current_board_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -76,13 +67,21 @@ def add_overlays(urdf_scene: Any) -> None:
     if urdf_scene.tcp_anchor is None:
         logger.warning("add_overlays: UrdfScene has no tcp_anchor; gripper bracket won't follow flange")
 
+    # Pull persisted user settings into the runtime cache BEFORE the scene
+    # builds so the initial board / hemisphere / cam-mount geometry uses
+    # whatever the user last saved (rather than the module-default values).
+    # Any exceptions here are caught inside load_from_storage; safe to call.
+    settings.load_from_storage()
+    # Settings load may have shifted board placement / surface thickness
+    # vs. the initial _T_BOARD2BASE built at module import time. Rebuild
+    # before any consumer reads it.
+    from .state import rebuild_T_board2base  # noqa: PLC0415
+    rebuild_T_board2base()
+
     # Lazy import — keep parol6-vision out of the main load path so
     # Waldo-Commander still imports cleanly without it.
     try:
-        from parol6_vision.calibration.board import (  # noqa: PLC0415
-            BOARD_TABLET_30MM,
-            render_board_png,
-        )
+        from parol6_vision.calibration.board import render_board_png  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import CameraMount  # noqa: PLC0415
     except ImportError as e:
         logger.error("parol6-vision not importable; skipping calibration overlays: %s", e)
@@ -103,7 +102,7 @@ def add_overlays(urdf_scene: Any) -> None:
     cache_dir = Path(__file__).resolve().parent.parent.parent / "_calib_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     board_png = cache_dir / "board.png"
-    canonical = render_board_png(BOARD_TABLET_30MM, pixels_per_metre=4000.0, margin_squares=0.0)
+    canonical = render_board_png(current_board_config(), pixels_per_metre=4000.0, margin_squares=0.0)
     # No vertical flip: NiceGUI's Three.js Texture material uses flipY=false
     # AND our texture-coord array maps world (0,0,0) -> UV (0,0) -> the PNG's
     # top-left pixel. cv2.flip(...,0) was double-flipping that and producing
@@ -123,13 +122,15 @@ def add_overlays(urdf_scene: Any) -> None:
     # Cache mount + paths for the worker thread.
     _state["merged_stl_path"] = merged_stl
     _state["board_png_path"] = board_png
+    cam_translate = settings.cam_mount_translate_mm
+    cam_tilt = settings.cam_mount_tilt_deg
     _state["current_mount"] = CameraMount.from_eyeball_estimate(
-        x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
-        y_mm=_CAM_MOUNT_TRANSLATE_MM[1],
-        z_mm=_CAM_MOUNT_TRANSLATE_MM[2],
-        tilt_x_deg=_CAM_MOUNT_TILT_DEG[0],
-        tilt_y_deg=_CAM_MOUNT_TILT_DEG[1],
-        tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+        x_mm=cam_translate[0],
+        y_mm=cam_translate[1],
+        z_mm=cam_translate[2],
+        tilt_x_deg=cam_tilt[0],
+        tilt_y_deg=cam_tilt[1],
+        tilt_z_deg=cam_tilt[2],
     )
 
     # ------------------------------------------------------------------
@@ -191,9 +192,7 @@ def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
     can rebuild the group after auto-localise mutates ``_T_BOARD2BASE``.
     Returns the group handle (call ``.delete()`` to remove).
     """
-    from parol6_vision.calibration.board import BOARD_TABLET_30MM  # noqa: PLC0415
-
-    cfg = BOARD_TABLET_30MM
+    cfg = current_board_config()
     w_m = cfg.squares_x * cfg.square_length
     h_m = cfg.squares_y * cfg.square_length
 
@@ -254,15 +253,16 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
     Position, orientation, and dimensions match _build_collision_manager's
     tablet exactly, so what you see in the GUI is what's being collision-
     checked. Returns the group handle (``.delete()`` to remove), or None if
-    rendering is disabled. Driven by _TABLET_PRIMITIVE_ENABLED + _SHOW_TABLET_OVERLAY.
+    rendering is disabled. Driven by ``settings.surface_enabled`` +
+    ``settings.surface_show_overlay``.
     """
-    if not (_TABLET_PRIMITIVE_ENABLED and _SHOW_TABLET_OVERLAY):
+    if not (bool(settings.surface_enabled) and bool(settings.surface_show_overlay)):
         return None
 
-    from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
+    _cfg = current_board_config()
 
-    t_w, t_l, t_h = _TABLET_DIMENSIONS_M
-    t_off_x, t_off_y = _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M
+    t_w, t_l, t_h = settings.surface_dimensions_m
+    t_off_x, t_off_y = settings.surface_offset_local_m
 
     # Tablet centre in board-local frame, then push to world via _T_BOARD2BASE.
     # Board pose is auto-lifted by t_h in _build_T_board2base, so placing the
@@ -294,10 +294,47 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
     logger.info(
         "tablet overlay: centre=%s, dims=%s, offset=%s",
         np.round(centre_world, 3).tolist(),
-        _TABLET_DIMENSIONS_M,
-        _TABLET_OFFSET_FROM_CHARUCO_LOCAL_M,
+        tuple(settings.surface_dimensions_m),
+        tuple(settings.surface_offset_local_m),
     )
     return grp
+
+
+def regenerate_board_png() -> None:
+    """Re-render the cached ChArUco PNG from the current board settings,
+    then refresh the URL with a cache-busting suffix so the browser loads
+    the new image. Called by ``live_apply`` whenever a board-geometry
+    setting changes (squares_x/y, square_length, marker_length, dictionary,
+    legacy_pattern). Caller is responsible for ``refresh_board_dependent_overlays``
+    afterwards.
+    """
+    board_png = _state.get("board_png_path")
+    if board_png is None:
+        return
+    try:
+        import time  # noqa: PLC0415
+
+        import cv2  # noqa: PLC0415
+        from parol6_vision.calibration.board import render_board_png  # noqa: PLC0415
+
+        cfg = current_board_config()
+        canonical = render_board_png(
+            cfg, pixels_per_metre=4000.0, margin_squares=0.0,
+        )
+        canonical_rgb = cv2.cvtColor(canonical, cv2.COLOR_GRAY2RGB)
+        cv2.imwrite(str(board_png), canonical_rgb)
+        # Bust the browser cache by appending the file mtime — the static
+        # mount path doesn't change, so the same file on disk now served
+        # at a new URL forces a re-fetch.
+        cache_buster = int(time.time())
+        _state["png_url"] = f"/calib_cache/{board_png.name}?v={cache_buster}"
+        logger.info(
+            "regenerated board PNG: %dx%d squares, %.1f mm each, dict=%s",
+            cfg.squares_x, cfg.squares_y,
+            cfg.square_length * 1000, cfg.aruco_dict_id,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("regenerate_board_png failed: %s", e)
 
 
 def refresh_board_dependent_overlays() -> None:
@@ -356,8 +393,8 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
     within this volume that's also reachable + IK-valid, not just along a
     few discrete arcs.
     """
-    d_min, d_max = _HEMI_DISTANCE_RANGE_M
-    ev_min, ev_max = _HEMI_ELEVATION_RANGE_DEG
+    d_min, d_max = settings.hemi_distance_range_m
+    ev_min, ev_max = settings.hemi_elevation_range_deg
     az_min, az_max = _hemi_azimuth_world_range_deg()
 
     # Grid resolution for the surface meshing.
@@ -421,7 +458,7 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
         "elev=[%.0f, %.0f] deg, az_center=%.0f deg ±%.0f deg",
         np.round(target_world, 3).tolist(),
         d_min, d_max, ev_min, ev_max,
-        _hemi_azimuth_center_deg(), _HEMI_AZIMUTH_SPREAD_DEG,
+        _hemi_azimuth_center_deg(), float(settings.hemi_azimuth_spread_deg),
     )
 
 
@@ -458,8 +495,14 @@ def _build_board_dependent_overlays(scene_root: Any, png_url: str) -> None:
     board_group.visible(show_board)
     _state["board_group"] = board_group
 
+    # Tablet (mounting-surface) overlay is OPTIONAL — disabled when the
+    # surface is turned off OR when the user has hidden the visual. Guard
+    # the .visible() call so a None return value (legitimate) doesn't
+    # raise and abort the rest of the board-dependent rebuild
+    # (hemisphere, reachability dots).
     tablet_group = _build_tablet_overlay_group(scene_root)
-    tablet_group.visible(show_board)
+    if tablet_group is not None:
+        tablet_group.visible(show_board)
     _state["tablet_group"] = tablet_group
 
     # Hemisphere wireframe + reachability dots, parented to a common group

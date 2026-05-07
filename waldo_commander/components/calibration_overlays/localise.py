@@ -11,29 +11,9 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
+from . import settings
 from .constants import (
-    _BOARD_TRANSLATE_M,
-    _CAM_MOUNT_TILT_DEG,
-    _CAM_MOUNT_TRANSLATE_MM,
-    _INTR_CX,
-    _INTR_CY,
-    _INTR_FX,
-    _INTR_FY,
-    _INTR_H,
-    _INTR_W,
-    _LOCALISE_CAPTURE_PERIOD_S,
-    _LOCALISE_CONTINUOUS_SWEEP,
-    _LOCALISE_EARLY_STOP_DETECTIONS,
-    _LOCALISE_EARLY_STOP_INLIERS,
-    _LOCALISE_INLIER_THRESHOLD_M,
-    _LOCALISE_J0_CHUNK_DEG,
     _LOCALISE_J0_STEPS,
-    _LOCALISE_J0_SWEEP_HALF_DEG,
-    _LOCALISE_MIN_DETECTIONS,
-    _LOCALISE_MIN_INLIERS_TO_PROCEED,
-    _LOCALISE_REFINE_DISTANCE_M,
-    _LOCALISE_REFINE_ELEVATION_DEG,
-    _LOCALISE_REFINE_N_POSES,
     _LOCALISE_SCAN_AZIMUTH_COUNT,
     _LOCALISE_SCAN_AZIMUTH_RANGE_DEG,
     _LOCALISE_SCAN_DISTANCES_M,
@@ -41,17 +21,12 @@ from .constants import (
     _LOCALISE_SCAN_TARGETS_M,
     _LOCALISE_SEED_DISTANCE_RANGE_M,
     _LOCALISE_SEED_ELEVATION_RANGE_DEG,
-    _LOCALISE_SEED_N_CANDIDATES,
     _LOCALISE_SEED_TARGETS_XY,
-    _LOCALISE_SWEEP_SPEED,
-    _LOCALISE_USE_J0_SWEEP,
     _SETTLE_TIME_REAL_S,
     _SETTLE_TIME_SIM_S,
-    _TABLET_DIMENSIONS_M,
-    _TABLET_PRIMITIVE_ENABLED,
 )
 from .overlays import refresh_board_dependent_overlays
-from .state import _T_BOARD2BASE, _state
+from .state import _T_BOARD2BASE, _state, current_board_config
 
 logger = logging.getLogger(__name__)
 
@@ -72,7 +47,7 @@ def _localise_board_thread() -> None:
     The board can be ANYWHERE in the robot's reachable workspace — the
     scan grid is defined relative to the robot base, NOT to the configured
     board location, so it works whether or not the user's existing
-    `_BOARD_TRANSLATE_M` matches reality.
+    `settings.board_translate_m` matches reality.
 
     This is a sim-mode runner — uses `VirtualCamera` with the same
     perturbation scheme as `_calibration_thread`. On hardware, swap to
@@ -86,7 +61,6 @@ def _localise_board_thread() -> None:
         from parol6 import Robot, RobotClient  # noqa: PLC0415
 
         from parol6_vision.calibration.board import (  # noqa: PLC0415
-            BOARD_TABLET_30MM,
             BoardDetector,
             board_pose_to_matrix,
         )
@@ -109,18 +83,20 @@ def _localise_board_thread() -> None:
         # by the standard PoseGenerator (one distance, one elevation, one
         # azimuth — the azimuth is irrelevant at near-overhead elevations).
         # The board can be ANYWHERE in the workspace; we don't depend on
-        # the user's `_BOARD_TRANSLATE_M` being accurate.
-        scan_z = _BOARD_TRANSLATE_M[2]
-        if _TABLET_PRIMITIVE_ENABLED:
-            scan_z += _TABLET_DIMENSIONS_M[2]
+        # the user's `settings.board_translate_m` being accurate.
+        scan_z = settings.board_translate_m[2]
+        if bool(settings.surface_enabled):
+            scan_z += float(settings.surface_dimensions_m[2])
 
+        cam_translate = settings.cam_mount_translate_mm
+        cam_tilt = settings.cam_mount_tilt_deg
         cold_start = CameraMount.from_eyeball_estimate(
-            x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
-            y_mm=_CAM_MOUNT_TRANSLATE_MM[1],
-            z_mm=_CAM_MOUNT_TRANSLATE_MM[2],
-            tilt_x_deg=_CAM_MOUNT_TILT_DEG[0],
-            tilt_y_deg=_CAM_MOUNT_TILT_DEG[1],
-            tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+            x_mm=cam_translate[0],
+            y_mm=cam_translate[1],
+            z_mm=cam_translate[2],
+            tilt_x_deg=cam_tilt[0],
+            tilt_y_deg=cam_tilt[1],
+            tilt_z_deg=cam_tilt[2],
         )
         scan_robot = Robot()
         candidates: list = []
@@ -142,13 +118,13 @@ def _localise_board_thread() -> None:
         # both continuous-sweep and discrete-J0-sweep branches below; the
         # multi-target legacy path bypasses this entirely.
         seed_q_list: list[tuple[tuple[float, float], NDArray[np.float64]]] = []
-        if _LOCALISE_USE_J0_SWEEP:
+        if bool(settings.localise_use_j0_sweep):
             for seed_xy in _LOCALISE_SEED_TARGETS_XY:
                 seed_target = np.array(
                     [seed_xy[0], seed_xy[1], scan_z], dtype=np.float64,
                 )
                 seed_params = HemisphereParams(
-                    n_candidates=_LOCALISE_SEED_N_CANDIDATES,
+                    n_candidates=int(settings.localise_seed_n_candidates),
                     distance_range_m=_LOCALISE_SEED_DISTANCE_RANGE_M,
                     elevation_range_deg=_LOCALISE_SEED_ELEVATION_RANGE_DEG,
                     azimuth_range_deg=(-180.0, 180.0),
@@ -171,7 +147,7 @@ def _localise_board_thread() -> None:
                     rej = dict(getattr(seed_stats, "rejection_log", {}) or {})
                     logger.info(
                         "localise seed (%.2f, %.2f): 0/%d reachable, rej=%s",
-                        seed_xy[0], seed_xy[1], _LOCALISE_SEED_N_CANDIDATES, rej,
+                        seed_xy[0], seed_xy[1], int(settings.localise_seed_n_candidates), rej,
                     )
                     continue
                 seed_cands_sorted = sorted(
@@ -187,7 +163,7 @@ def _localise_board_thread() -> None:
                     "localise seed (%.2f, %.2f): %d/%d reachable, vertical-score=%.3f, "
                     "joints (deg)=%s",
                     seed_xy[0], seed_xy[1],
-                    len(seed_cands), _LOCALISE_SEED_N_CANDIDATES,
+                    len(seed_cands), int(settings.localise_seed_n_candidates),
                     _vertical_score_for(seed_cands_sorted[0], seed_target),
                     ["%.1f" % v for v in np.degrees(seed_q_rad)],
                 )
@@ -273,7 +249,7 @@ def _localise_board_thread() -> None:
         # The empty-candidates check only applies to the legacy multi-target
         # path; J0-sweep mode reports its own failures earlier (no reachable
         # seed at any target) or later (no detections during the sweep).
-        if not _LOCALISE_USE_J0_SWEEP:
+        if not bool(settings.localise_use_j0_sweep):
             if not candidates:
                 _post_status(
                     f"Localise: 0 reachable scan poses out of "
@@ -324,37 +300,42 @@ def _localise_board_thread() -> None:
             T[:3, 3] = fk_pose[:3]
             return T
 
+        intr_w = int(settings.intr_width)
+        intr_h = int(settings.intr_height)
         if is_sim_mode:
             intrinsics = Intrinsics(
-                fx=_INTR_FX, fy=_INTR_FY, cx=_INTR_CX, cy=_INTR_CY,
-                width=_INTR_W, height=_INTR_H,
+                fx=float(settings.intr_fx), fy=float(settings.intr_fy),
+                cx=float(settings.intr_cx), cy=float(settings.intr_cy),
+                width=intr_w, height=intr_h,
                 dist_coeffs=np.zeros(5, dtype=np.float64),
             )
             # Sim ground truth: same perturbation scheme as _calibration_thread.
             ground_truth_mount = CameraMount.from_eyeball_estimate(
-                x_mm=_CAM_MOUNT_TRANSLATE_MM[0] + 2.0,
-                y_mm=_CAM_MOUNT_TRANSLATE_MM[1] + 2.0,
-                z_mm=_CAM_MOUNT_TRANSLATE_MM[2] - 2.0,
-                tilt_x_deg=_CAM_MOUNT_TILT_DEG[0] + 2.0,
-                tilt_y_deg=_CAM_MOUNT_TILT_DEG[1] - 1.0,
-                tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+                x_mm=cam_translate[0] + 2.0,
+                y_mm=cam_translate[1] + 2.0,
+                z_mm=cam_translate[2] - 2.0,
+                tilt_x_deg=cam_tilt[0] + 2.0,
+                tilt_y_deg=cam_tilt[1] - 1.0,
+                tilt_z_deg=cam_tilt[2],
             )
             # The VirtualBoard sees the CURRENT _T_BOARD2BASE as ground truth.
             camera: Any = VirtualCamera(
                 intrinsics=intrinsics,
-                image_width=_INTR_W,
-                image_height=_INTR_H,
+                image_width=intr_w,
+                image_height=intr_h,
                 ground_truth_mount=ground_truth_mount,
                 flange_pose_provider=flange_pose_provider,
-                board=VirtualBoard(config=BOARD_TABLET_30MM, T_board2base=_T_BOARD2BASE),
+                board=VirtualBoard(
+                    config=current_board_config(), T_board2base=_T_BOARD2BASE,
+                ),
                 noise_std=0.0,
             )
             logger.info("localise camera: VirtualCamera (simulator mode)")
         else:
             from parol6_vision.camera.realsense import RealSenseCamera  # noqa: PLC0415
             camera = RealSenseCamera(
-                width=_INTR_W,
-                height=_INTR_H,
+                width=intr_w,
+                height=intr_h,
                 fps=30,
                 enable_depth=False,
                 enable_color=True,
@@ -377,9 +358,8 @@ def _localise_board_thread() -> None:
         # for a coarse pose. min_corners=4 is the absolute minimum for
         # solvePnP on a planar target; the calibration's main detector
         # keeps the default 6 for accuracy.
-        detector = BoardDetector(BOARD_TABLET_30MM, min_corners_for_pose=4)
-
-        cfg = BOARD_TABLET_30MM
+        cfg = current_board_config()
+        detector = BoardDetector(cfg, min_corners_for_pose=4)
         center_local = np.array(
             [cfg.squares_x * cfg.square_length / 2.0,
              cfg.squares_y * cfg.square_length / 2.0,
@@ -431,7 +411,7 @@ def _localise_board_thread() -> None:
         # marker layer alone (skips ChArUco interpolation + solvePnP) so we
         # can tell whether the markers were even visible to OpenCV.
         _aruco_dict_for_probe = cv2.aruco.getPredefinedDictionary(
-            BOARD_TABLET_30MM.aruco_dict_id,
+            cfg.aruco_dict_id,
         )
         _aruco_probe = cv2.aruco.ArucoDetector(
             _aruco_dict_for_probe, cv2.aruco.DetectorParameters(),
@@ -546,7 +526,7 @@ def _localise_board_thread() -> None:
             return True
 
         attempted = 0
-        if _LOCALISE_USE_J0_SWEEP and _LOCALISE_CONTINUOUS_SWEEP:
+        if bool(settings.localise_use_j0_sweep) and bool(settings.localise_continuous_sweep):
             # Continuous-sweep mode — one non-blocking move_j per seed,
             # capture during motion, accumulate detections. Skips to the
             # next seed once enough detections are gathered.
@@ -556,8 +536,8 @@ def _localise_board_thread() -> None:
                     _post_status("Localise stopped by user")
                     return
                 # Post-sweep: skip remaining seeds with the SOFTER threshold
-                # (_LOCALISE_MIN_INLIERS_TO_PROCEED). The in-sweep early-stop
-                # uses the harder _LOCALISE_EARLY_STOP_INLIERS to keep
+                # (int(settings.localise_min_inliers_to_proceed)). The in-sweep early-stop
+                # uses the harder int(settings.localise_early_stop_inliers) to keep
                 # capturing more frames mid-motion; once the sweep ENDS, we
                 # accept whatever inliers we got rather than restart on a
                 # new seed. Avoids re-sweeping when stage 1 already found
@@ -567,16 +547,16 @@ def _localise_board_thread() -> None:
                     _med = np.median(_det_arr, axis=0)
                     _resid = np.linalg.norm(_det_arr - _med, axis=1)
                     _n_inliers = int(
-                        (_resid < _LOCALISE_INLIER_THRESHOLD_M).sum()
+                        (_resid < float(settings.localise_inlier_threshold_m)).sum()
                     )
-                    if _n_inliers >= _LOCALISE_MIN_INLIERS_TO_PROCEED:
+                    if _n_inliers >= int(settings.localise_min_inliers_to_proceed):
                         logger.info(
                             "localise: skipping remaining seeds — %d "
                             "detections with %d inliers within %.0f mm "
                             "(min-to-proceed: %d)",
                             len(detected_centres), _n_inliers,
-                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
-                            _LOCALISE_MIN_INLIERS_TO_PROCEED,
+                            float(settings.localise_inlier_threshold_m) * 1000,
+                            int(settings.localise_min_inliers_to_proceed),
                         )
                         break
 
@@ -586,8 +566,8 @@ def _localise_board_thread() -> None:
                 # the way to the far side first" behaviour when the robot
                 # starts near home or at the previous sweep's end.
                 seed_j0_rad = float(seed_q_rad[0])
-                low_j0 = seed_j0_rad - np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
-                high_j0 = seed_j0_rad + np.radians(_LOCALISE_J0_SWEEP_HALF_DEG)
+                low_j0 = seed_j0_rad - np.radians(float(settings.localise_j0_sweep_half_deg))
+                high_j0 = seed_j0_rad + np.radians(float(settings.localise_j0_sweep_half_deg))
                 try:
                     cur_angles = raw_client.angles()
                     cur_j0_rad = (
@@ -654,7 +634,7 @@ def _localise_board_thread() -> None:
                     f"{seed_xy[1]:.2f}) — scanning"
                 )
                 # CHUNKED SWEEP: break the J0 motion into back-to-back
-                # move_j commands of ~_LOCALISE_J0_CHUNK_DEG each. parol6's
+                # move_j commands of ~float(settings.localise_j0_chunk_deg) each. parol6's
                 # halt() clears the command queue but does not interrupt
                 # the trajectory currently being executed; chunking gives
                 # the user's Stop / E-Stop AND the early-stop-on-enough-
@@ -663,7 +643,7 @@ def _localise_board_thread() -> None:
                 start_j0_rad = float(start_q[0])
                 end_j0_rad = float(end_q[0])
                 total_dj0_rad = end_j0_rad - start_j0_rad
-                chunk_step_rad = np.radians(_LOCALISE_J0_CHUNK_DEG) * np.sign(
+                chunk_step_rad = np.radians(float(settings.localise_j0_chunk_deg)) * np.sign(
                     total_dj0_rad
                 )
                 # Build the list of waypoint J0 angles, ending exactly at
@@ -693,7 +673,7 @@ def _localise_board_thread() -> None:
 
                     cmd_idx = raw_client.move_j(
                         angles=list(np.degrees(chunk_q)),
-                        speed=_LOCALISE_SWEEP_SPEED, accel=0.5, wait=False,
+                        speed=float(settings.localise_sweep_speed), accel=0.5, wait=False,
                         timeout=10.0,
                     )
                     if cmd_idx < 0:
@@ -739,7 +719,7 @@ def _localise_board_thread() -> None:
                             stop_outer = True
                             break
                         now = time.monotonic()
-                        if now - last_capture >= _LOCALISE_CAPTURE_PERIOD_S:
+                        if now - last_capture >= float(settings.localise_capture_period_s):
                             last_capture = now
                             attempted += 1
                             if _capture_and_record(
@@ -758,11 +738,11 @@ def _localise_board_thread() -> None:
                                 # downstream consensus to fail when low-
                                 # corner detections disagreed by >5 cm.
                                 # Requirement: ≥N detections, ≥M of which
-                                # are within _LOCALISE_INLIER_THRESHOLD_M
+                                # are within float(settings.localise_inlier_threshold_m)
                                 # of the median.
                                 if (
                                     len(detected_centres)
-                                    >= _LOCALISE_EARLY_STOP_DETECTIONS
+                                    >= int(settings.localise_early_stop_detections)
                                 ):
                                     _det_arr = np.asarray(
                                         detected_centres, dtype=np.float64,
@@ -772,15 +752,15 @@ def _localise_board_thread() -> None:
                                         _det_arr - _med, axis=1,
                                     )
                                     _n_inliers = int(
-                                        (_resid < _LOCALISE_INLIER_THRESHOLD_M).sum()
+                                        (_resid < float(settings.localise_inlier_threshold_m)).sum()
                                     )
-                                    if _n_inliers >= _LOCALISE_EARLY_STOP_INLIERS:
+                                    if _n_inliers >= int(settings.localise_early_stop_inliers):
                                         logger.info(
                                             "localise: %d detections, %d "
                                             "inliers within %.0f mm — "
                                             "halting sweep early",
                                             len(detected_centres), _n_inliers,
-                                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
+                                            float(settings.localise_inlier_threshold_m) * 1000,
                                         )
                                         raw_client.halt()
                                         done_event.wait(2.0)
@@ -793,8 +773,8 @@ def _localise_board_thread() -> None:
                                             "of median (need ≥%d) — "
                                             "continuing sweep",
                                             len(detected_centres), _n_inliers,
-                                            _LOCALISE_INLIER_THRESHOLD_M * 1000,
-                                            _LOCALISE_EARLY_STOP_INLIERS,
+                                            float(settings.localise_inlier_threshold_m) * 1000,
+                                            int(settings.localise_early_stop_inliers),
                                         )
                         time.sleep(0.02)
                     waiter_thread.join(timeout=1.0)
@@ -858,15 +838,15 @@ def _localise_board_thread() -> None:
                 _diag["detected"] = 0
                 _diag["marker_counts"] = []
                 _diag["charuco_counts"] = []
-        elif _LOCALISE_USE_J0_SWEEP:
+        elif bool(settings.localise_use_j0_sweep):
             # Discrete J0-sweep mode (continuous disabled). Per seed,
             # iterate _LOCALISE_J0_STEPS angles with stop+capture at each.
             j0_offsets = np.linspace(
-                -_LOCALISE_J0_SWEEP_HALF_DEG, +_LOCALISE_J0_SWEEP_HALF_DEG,
+                -float(settings.localise_j0_sweep_half_deg), +float(settings.localise_j0_sweep_half_deg),
                 _LOCALISE_J0_STEPS,
             )
             for seed_xy, seed_q_rad in seed_q_list:
-                if len(detected_centres) >= _LOCALISE_MIN_DETECTIONS:
+                if len(detected_centres) >= int(settings.localise_min_detections):
                     break
                 for dj0 in j0_offsets:
                     if _state.get("stop_requested"):
@@ -923,13 +903,13 @@ def _localise_board_thread() -> None:
                 )
                 _capture_and_record(f"scan {i + 1}/{len(candidates)}")
 
-        if len(detected_centres) < _LOCALISE_MIN_DETECTIONS:
+        if len(detected_centres) < int(settings.localise_min_detections):
             _post_status(
                 f"Localise FAILED: only {len(detected_centres)} detections "
                 f"from {attempted} captures across "
-                f"{len(seed_q_list) if _LOCALISE_USE_J0_SWEEP else len(candidates)} "
+                f"{len(seed_q_list) if bool(settings.localise_use_j0_sweep) else len(candidates)} "
                 "scan path(s) (need "
-                f"≥{_LOCALISE_MIN_DETECTIONS}). Board may be outside the "
+                f"≥{int(settings.localise_min_detections)}). Board may be outside the "
                 f"workspace scan region — check _LOCALISE_SEED_TARGETS_XY "
                 "(or _LOCALISE_SCAN_TARGETS_M for legacy mode)."
             )
@@ -942,7 +922,7 @@ def _localise_board_thread() -> None:
         # so the board fully fits the FOV. From these poses ChArUco gets
         # the full board in view → 10-20 corners interpolated → much
         # higher-precision detections than the off-axis sweep frames.
-        if _LOCALISE_REFINE_N_POSES > 0 and len(detected_centres) >= 1:
+        if int(settings.localise_refine_n_poses) > 0 and len(detected_centres) >= 1:
             stage1_count = len(detected_centres)
             rough_centre = np.median(
                 np.asarray(detected_centres, dtype=np.float64), axis=0,
@@ -953,7 +933,7 @@ def _localise_board_thread() -> None:
             )
             logger.info(
                 "localise stage 2: rough centre = %s, generating %d refinement poses",
-                rough_centre.tolist(), _LOCALISE_REFINE_N_POSES,
+                rough_centre.tolist(), int(settings.localise_refine_n_poses),
             )
             refine_target = rough_centre.copy()
 
@@ -969,12 +949,12 @@ def _localise_board_thread() -> None:
             refine_params = HemisphereParams(
                 n_candidates=256,
                 distance_range_m=(
-                    max(0.20, _LOCALISE_REFINE_DISTANCE_M - 0.10),
-                    _LOCALISE_REFINE_DISTANCE_M + 0.06,
+                    max(0.20, float(settings.localise_refine_distance_m) - 0.10),
+                    float(settings.localise_refine_distance_m) + 0.06,
                 ),
                 elevation_range_deg=(
-                    max(40.0, _LOCALISE_REFINE_ELEVATION_DEG - 30.0),
-                    min(85.0, _LOCALISE_REFINE_ELEVATION_DEG + 5.0),
+                    max(40.0, float(settings.localise_refine_elevation_deg) - 30.0),
+                    min(85.0, float(settings.localise_refine_elevation_deg) + 5.0),
                 ),
                 azimuth_range_deg=(-180.0, 180.0),
                 workspace_xy_max_m=0.55,
@@ -1006,9 +986,9 @@ def _localise_board_thread() -> None:
                     return float(-(forward / fn)[2]) if fn > 1e-6 else 0.0
 
                 # Sort all by vertical-score, take top half, then thin by
-                # azimuth diversity to pick _LOCALISE_REFINE_N_POSES.
+                # azimuth diversity to pick int(settings.localise_refine_n_poses).
                 refine_cands.sort(key=_refine_score, reverse=True)
-                top_half = refine_cands[: max(_LOCALISE_REFINE_N_POSES * 4, 8)]
+                top_half = refine_cands[: max(int(settings.localise_refine_n_poses) * 4, 8)]
 
                 def _cam_azimuth_deg(c) -> float:
                     cam_pos = cold_start.cam_pose_for_flange_pose(
@@ -1024,7 +1004,7 @@ def _localise_board_thread() -> None:
                 # fields and raise "truth value of array is ambiguous".
                 picked_indices: list[int] = [0]
                 while (
-                    len(picked_indices) < _LOCALISE_REFINE_N_POSES
+                    len(picked_indices) < int(settings.localise_refine_n_poses)
                     and len(picked_indices) < len(top_half)
                 ):
                     pick_azs = [
@@ -1109,13 +1089,13 @@ def _localise_board_thread() -> None:
         det_arr = np.asarray(detected_centres, dtype=np.float64)
         median = np.median(det_arr, axis=0)
         residuals = np.linalg.norm(det_arr - median, axis=1)
-        inlier_mask = residuals < _LOCALISE_INLIER_THRESHOLD_M
+        inlier_mask = residuals < float(settings.localise_inlier_threshold_m)
         n_inliers = int(inlier_mask.sum())
-        if n_inliers < _LOCALISE_MIN_DETECTIONS:
+        if n_inliers < int(settings.localise_min_detections):
             _post_status(
                 f"Localise FAILED: {n_inliers} inliers within "
-                f"{_LOCALISE_INLIER_THRESHOLD_M * 1000:.0f} mm of median "
-                f"(need ≥{_LOCALISE_MIN_DETECTIONS}). "
+                f"{float(settings.localise_inlier_threshold_m) * 1000:.0f} mm of median "
+                f"(need ≥{int(settings.localise_min_detections)}). "
                 "Detections too inconsistent — try repositioning the board."
             )
             return

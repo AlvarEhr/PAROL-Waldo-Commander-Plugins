@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 
-from .constants import _SSG48_JAW_VARIANT
+from . import settings
 from .state import _T_BOARD2BASE, _state
 
 logger = logging.getLogger(__name__)
@@ -45,9 +45,9 @@ def _resolve_active_tool_transform(client: Any) -> tuple[np.ndarray, str]:
     Tries the live client's bound tool first (so the lookup tracks
     whatever the user has selected — pneumatic gripper, swapped jaw
     variant, etc.). Falls back to ``parol6.tools.get_tool_transform("SSG-48",
-    _SSG48_JAW_VARIANT)`` if no tool is bound on this client yet (which
-    can happen if the GUI hasn't called ``select_tool`` on this fresh
-    connection).
+    settings.tool_jaw_variant)`` if no tool is bound on this client yet
+    (which can happen if the GUI hasn't called ``select_tool`` on this
+    fresh connection).
 
     Returns ``(T_flange2tcp, tool_label)``. ``tool_label`` is the tool's
     display name (or "SSG-48" on fallback) for the status line.
@@ -68,7 +68,7 @@ def _resolve_active_tool_transform(client: Any) -> tuple[np.ndarray, str]:
     except RuntimeError:
         # No tool bound — fall back to the configured default.
         T = np.asarray(
-            parol6_tools.get_tool_transform("SSG-48", _SSG48_JAW_VARIANT),
+            parol6_tools.get_tool_transform("SSG-48", str(settings.tool_jaw_variant)),
             dtype=np.float64,
         )
         return T, "SSG-48 (fallback)"

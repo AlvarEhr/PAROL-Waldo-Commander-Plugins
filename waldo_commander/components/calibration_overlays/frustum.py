@@ -9,17 +9,11 @@ import numpy as np
 from nicegui import ui
 from numpy.typing import NDArray
 
+from . import settings
 from .collision import _build_collision_manager
 from .constants import (
-    _CAM_MOUNT_TILT_DEG,
     _FRUSTUM_DEPTH_M,
     _FRUSTUM_FAR_DEPTH_M,
-    _INTR_CX,
-    _INTR_CY,
-    _INTR_FX,
-    _INTR_FY,
-    _INTR_H,
-    _INTR_W,
 )
 from .state import _T_BOARD2BASE, _state
 from .workspace import _ensure_workspace_envelope
@@ -31,9 +25,12 @@ def _frustum_corners_local(
     depth_m: float,
 ) -> list[tuple[float, float, float]]:
     """5 corner points of the frustum in the camera's optical frame."""
-    fx, fy = _INTR_FX, _INTR_FY
-    cx, cy = _INTR_CX, _INTR_CY
-    w, h = _INTR_W, _INTR_H
+    fx = float(settings.intr_fx)
+    fy = float(settings.intr_fy)
+    cx = float(settings.intr_cx)
+    cy = float(settings.intr_cy)
+    w = int(settings.intr_width)
+    h = int(settings.intr_height)
     pts: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
     for px, py in [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)]:
         x = (px - cx) * depth_m / fx
@@ -181,7 +178,7 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
         "frustum near-plane span (flange frame): X=%.1f mm, Y=%.1f mm "
         "(tilt_deg=%s, depth=%.2f m)",
         fx_span * 1000, fy_span * 1000,
-        _CAM_MOUNT_TILT_DEG, _FRUSTUM_DEPTH_M,
+        settings.cam_mount_tilt_deg, _FRUSTUM_DEPTH_M,
     )
 
     objects: list[Any] = []
@@ -265,7 +262,13 @@ def _footprint_inputs_changed(
     T_cam2flange: NDArray[np.float64],
 ) -> bool:
     """Return True iff the joint angles or mount differ enough from the
-    previous tick to warrant rebuilding the footprint geometry."""
+    previous tick to warrant rebuilding the footprint geometry. Also
+    returns True when there are no rendered objects yet — covers the
+    case where settings changed (or page rebuilt) and the dynamic
+    overlays got dropped without being re-rendered.
+    """
+    if not _state.get("footprint_objects"):
+        return True
     last_q = _state.get("footprint_last_q")
     last_mount = _state.get("footprint_last_mount")
     if last_q is None or last_mount is None:

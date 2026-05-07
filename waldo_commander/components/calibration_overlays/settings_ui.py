@@ -1,0 +1,750 @@
+"""UI builders for the calibration settings panel.
+
+Each ``build_*_section`` function renders one sub-expansion's worth of
+inputs. Inputs read their initial value from :mod:`settings`, persist on
+edit (via ``settings.set_value``), and trigger live-apply side effects
+where applicable.
+
+Unit handling: settings store SI internally (metres + radians) for
+geometry; the UI exposes the more ergonomic mm + degrees by passing a
+``scale`` factor to ``_tuple_input`` / ``_number_input`` (display = storage
+× scale). On read the inputs reverse the scale.
+"""
+
+from __future__ import annotations
+
+import logging
+import math
+from collections.abc import Callable
+from typing import Any
+
+from nicegui import ui
+
+from . import live_apply, settings
+
+logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Input helpers
+# ---------------------------------------------------------------------------
+
+
+# Common ArUco dictionaries available across OpenCV ≥4.10. Listed in
+# decreasing usefulness for ChArUco — 4x4_50 is the default for tablet
+# boards because it offers the smallest markers (more squares per board)
+# while keeping decoding robust.
+ARUCO_DICTIONARIES: tuple[str, ...] = (
+    "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
+    "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
+    "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+    "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
+)
+
+
+JAW_VARIANTS: tuple[str, ...] = ("finger", "pinch")
+
+
+def _on_setting_change(key: str, value: Any) -> None:
+    """Persist + live-apply a single setting. Used by every input handler.
+
+    For board geometry keys (square_length / marker_length), we surface a
+    warning when the marker/square invariant is violated. The setting
+    still applies — ``current_board_config`` clamps marker_length to a
+    valid value at consumer-read time so the scene keeps rendering — but
+    the user gets a visible nudge to fix the inconsistency.
+    """
+    try:
+        settings.set_value(key, value)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("settings.set_value(%s, %r) failed: %s", key, value, e)
+        return
+
+    # Marker/square invariant — surface a warning so the user knows the
+    # value they typed is being clamped at consumer-read time.
+    if key in ("board_square_length_m", "board_marker_length_m"):
+        sl = float(settings.get("board_square_length_m"))
+        ml = float(settings.get("board_marker_length_m"))
+        if ml <= 0.0 or ml >= sl:
+            ui.notify(
+                f"Marker length ({ml * 1000:.1f} mm) must be smaller than "
+                f"square length ({sl * 1000:.1f} mm). Using 60% of square "
+                f"({sl * 600:.1f} mm) until you fix it.",
+                color="warning", position="top",
+            )
+        else:
+            ratio = ml / sl
+            if ratio < 0.4 or ratio > 0.85:
+                ui.notify(
+                    f"Marker/square ratio {ratio:.2f} outside the recommended "
+                    f"0.40-0.85 range — detection accuracy may suffer.",
+                    color="info", position="top",
+                )
+
+    try:
+        live_apply.apply_setting_change(key)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("live_apply for %s failed: %s", key, e)
+
+
+def _number_input(
+    key: str,
+    label: str,
+    *,
+    scale: float = 1.0,  # storage * scale = display
+    fmt: str = "%.3f",
+    step: float = 0.01,
+    min_val: float | None = None,
+    max_val: float | None = None,
+    cast: Callable[[Any], Any] = float,
+    width: str = "w-32",
+    debounce_ms: int = 500,
+) -> ui.number:
+    """Render a single-number input bound to ``settings[key]``.
+
+    ``debounce_ms`` delays the on-change handler so rapid typing doesn't
+    flood the asyncio loop with live-apply events. Quasar's q-input
+    debounce prop holds back v-model emit until input has been idle for
+    that long, which is when ``update:model-value`` fires.
+    """
+    current = float(settings.get(key))
+    inp = (
+        ui.number(
+            label=label, value=current * scale,
+            format=fmt, step=step, min=min_val, max=max_val,
+        )
+        .props(f"dense debounce={debounce_ms}")
+        .classes(width)
+    )
+
+    def _on_change(_e: Any = None) -> None:
+        try:
+            display = float(inp.value if inp.value is not None else current * scale)
+        except (TypeError, ValueError):
+            return
+        new_storage = cast(display / scale)
+        _on_setting_change(key, new_storage)
+
+    inp.on("update:model-value", _on_change)
+    return inp
+
+
+def _int_input(
+    key: str,
+    label: str,
+    *,
+    step: int = 1,
+    min_val: int | None = None,
+    max_val: int | None = None,
+    width: str = "w-24",
+) -> ui.number:
+    return _number_input(
+        key, label, fmt="%d", step=step, min_val=min_val, max_val=max_val,
+        cast=int, width=width,
+    )
+
+
+def _tuple_input(
+    key: str,
+    labels: tuple[str, ...],
+    *,
+    scale: float = 1.0,
+    fmt: str = "%.3f",
+    step: float = 0.1,
+    min_val: float | None = None,
+    max_val: float | None = None,
+    width: str = "w-24",
+    debounce_ms: int = 500,
+) -> list[ui.number]:
+    """Render an N-element tuple as N number inputs in a single row, all
+    persisting+applying ``key`` together on any field change."""
+    current = settings.get(key)
+    inputs: list[ui.number] = []
+
+    def _on_change(_e: Any = None) -> None:
+        try:
+            new_display = tuple(
+                float(inp.value if inp.value is not None else 0.0)
+                for inp in inputs
+            )
+        except (TypeError, ValueError):
+            return
+        new_storage = tuple(v / scale for v in new_display)
+        _on_setting_change(key, new_storage)
+
+    with ui.row().classes("items-center gap-1 q-gutter-x-sm"):
+        for i, label in enumerate(labels):
+            initial = (
+                float(current[i]) * scale
+                if current is not None and i < len(current)
+                else 0.0
+            )
+            inp = (
+                ui.number(
+                    label=label, value=initial,
+                    format=fmt, step=step, min=min_val, max=max_val,
+                )
+                .props(f"dense debounce={debounce_ms}")
+                .classes(width)
+            )
+            inp.on("update:model-value", _on_change)
+            inputs.append(inp)
+    return inputs
+
+
+def _switch_input(key: str, label: str) -> ui.switch:
+    """Render a bool setting as a NiceGUI switch."""
+    sw = ui.switch(label, value=bool(settings.get(key))).props("dense")
+
+    def _on_change(_e: Any = None) -> None:
+        _on_setting_change(key, bool(sw.value))
+
+    sw.on("update:model-value", _on_change)
+    return sw
+
+
+def _select_input(
+    key: str,
+    label: str,
+    options: tuple[str, ...],
+    *,
+    width: str = "w-48",
+) -> ui.select:
+    """Render a string setting as a dropdown."""
+    current = str(settings.get(key))
+    sel = ui.select(
+        list(options), value=current if current in options else options[0],
+        label=label,
+    ).props("dense").classes(width)
+
+    def _on_change(_e: Any = None) -> None:
+        _on_setting_change(key, str(sel.value))
+
+    sel.on("update:model-value", _on_change)
+    return sel
+
+
+def _optional_xyz_input(
+    key: str,
+    label_prefix: str,
+    *,
+    scale: float = 1000.0,
+    fmt: str = "%.1f",
+) -> None:
+    """Render a ``tuple[float, float, float] | None`` setting with a
+    "use default" toggle and X/Y/Z fields underneath. Used for
+    ``hemi_centre_override_m``.
+    """
+    current = settings.get(key)
+    enabled_initial = current is not None
+    sw = ui.switch("Override (use custom centre)", value=enabled_initial).props(
+        "dense"
+    )
+
+    inputs: list[ui.number] = []
+
+    def _on_xyz_change(_e: Any = None) -> None:
+        if not bool(sw.value):
+            return
+        try:
+            new_display = tuple(
+                float(inp.value if inp.value is not None else 0.0)
+                for inp in inputs
+            )
+        except (TypeError, ValueError):
+            return
+        new_storage = tuple(v / scale for v in new_display)
+        _on_setting_change(key, new_storage)
+
+    def _on_switch(_e: Any = None) -> None:
+        if bool(sw.value):
+            # Switch ON: read whatever's in the inputs.
+            _on_xyz_change()
+            for inp in inputs:
+                inp.set_enabled(True)
+        else:
+            _on_setting_change(key, None)
+            for inp in inputs:
+                inp.set_enabled(False)
+
+    sw.on("update:model-value", _on_switch)
+
+    with ui.row().classes("items-center gap-1 q-mt-xs"):
+        seed = current if current is not None else (0.30, 0.0, 0.014)
+        for i, axis in enumerate("XYZ"):
+            inp = (
+                ui.number(
+                    label=f"{label_prefix} {axis} (mm)",
+                    value=float(seed[i]) * scale,
+                    format=fmt, step=1.0,
+                )
+                .props("dense debounce=500")
+                .classes("w-24")
+            )
+            inp.set_enabled(enabled_initial)
+            inp.on("update:model-value", _on_xyz_change)
+            inputs.append(inp)
+
+
+# ---------------------------------------------------------------------------
+# Section builders
+# ---------------------------------------------------------------------------
+
+
+def _render_charuco_png_dialog() -> None:
+    """Open a dialog that renders the current board to PNG at a chosen
+    physical scale, then offers it as a download.
+
+    The user picks display PPI (pixels-per-inch) — for a Samsung Galaxy
+    Tab S9 Ultra that's 240, for a typical printer ~300, for a high-DPI
+    monitor 96-150. We compute pixels-per-metre = ppi / 0.0254 and call
+    ``parol6_vision.calibration.board.render_board_png`` with it.
+    """
+    try:
+        from .state import current_board_config  # noqa: PLC0415
+        from parol6_vision.calibration.board import render_board_png  # noqa: PLC0415
+    except ImportError as e:
+        ui.notify(f"ChArUco render unavailable: {e}", color="warning")
+        return
+
+    cfg = current_board_config()
+    physical_w_mm, physical_h_mm = cfg.physical_size_mm
+
+    with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
+        ui.label("Generate ChArUco board PNG").classes(
+            "text-base font-semibold",
+        )
+        ui.label(
+            f"Board: {cfg.squares_x}×{cfg.squares_y} squares, "
+            f"{cfg.square_length * 1000:.1f} mm each. "
+            f"Physical size: {physical_w_mm:.0f} × {physical_h_mm:.0f} mm.",
+        ).classes("text-xs opacity-70")
+        ppi_input = ui.number(
+            label="Display / printer DPI", value=240.0,
+            step=1.0, min=50.0, max=2400.0, format="%.0f",
+        ).props("dense")
+        margin_input = ui.number(
+            label="Margin (squares)", value=0.5,
+            step=0.1, min=0.0, max=2.0, format="%.1f",
+        ).props("dense")
+        info_label = ui.label("").classes("text-xs opacity-70")
+
+        def _update_info(_e: Any = None) -> None:
+            try:
+                ppi = float(ppi_input.value or 240.0)
+                margin_sq = float(margin_input.value or 0.5)
+            except (TypeError, ValueError):
+                return
+            ppm = ppi / 0.0254
+            margin_m = margin_sq * cfg.square_length
+            full_w = (physical_w_mm / 1000.0 + 2 * margin_m) * ppm
+            full_h = (physical_h_mm / 1000.0 + 2 * margin_m) * ppm
+            info_label.text = (
+                f"Image: {int(round(full_w))} × {int(round(full_h))} px "
+                f"(physical {physical_w_mm + 2 * margin_m * 1000:.0f} × "
+                f"{physical_h_mm + 2 * margin_m * 1000:.0f} mm at {ppi:.0f} DPI)."
+            )
+        ppi_input.on("update:model-value", _update_info)
+        margin_input.on("update:model-value", _update_info)
+        _update_info()
+
+        def _on_render() -> None:
+            try:
+                ppi = float(ppi_input.value or 240.0)
+                margin_sq = float(margin_input.value or 0.5)
+            except (TypeError, ValueError):
+                ui.notify("Invalid DPI / margin", color="warning")
+                return
+            try:
+                import cv2  # noqa: PLC0415
+                ppm = ppi / 0.0254
+                img = render_board_png(
+                    cfg, pixels_per_metre=ppm, margin_squares=margin_sq,
+                )
+                ok, encoded = cv2.imencode(".png", img)
+                if not ok:
+                    ui.notify("PNG encode failed", color="warning")
+                    return
+                payload = bytes(encoded)
+            except Exception as e:  # noqa: BLE001
+                ui.notify(f"Render failed: {e}", color="warning")
+                return
+            filename = (
+                f"charuco_{cfg.squares_x}x{cfg.squares_y}_"
+                f"{int(cfg.square_length * 1000)}mm_{int(ppi)}dpi.png"
+            )
+            ui.download(payload, filename)
+            ui.notify(f"Generated {filename}", color="positive")
+            dialog.close()
+
+        with ui.row():
+            ui.button(
+                "Render & download", on_click=_on_render, color="primary",
+            ).props("size=sm")
+            ui.button("Cancel", on_click=dialog.close).props("size=sm")
+    dialog.open()
+
+
+def build_board_section() -> None:
+    """Calibration board: placement + geometry + dictionary."""
+    ui.label("Placement (board → base)").classes("text-xs opacity-70")
+    _tuple_input(
+        "board_translate_m",
+        ("X (mm)", "Y (mm)", "Z (mm)"),
+        scale=1000.0, fmt="%.1f", step=1.0,
+    )
+    rpy_inputs = _tuple_input(
+        "board_rpy_rad",
+        ("Rx (deg)", "Ry (deg)", "Rz (deg)"),
+        scale=180.0 / math.pi, fmt="%.2f", step=0.5,
+    )
+    # Hint annotation under RPY — XYZ-extrinsic (scipy "XYZ").
+    ui.label("Rotation order: scipy XYZ-extrinsic.").classes(
+        "text-xs opacity-60",
+    )
+    del rpy_inputs
+
+    ui.separator().classes("q-my-sm")
+    ui.label("Geometry").classes("text-xs opacity-70")
+    with ui.row().classes("items-center gap-1"):
+        _int_input("board_squares_x", "Squares X", step=1, min_val=3)
+        _int_input("board_squares_y", "Squares Y", step=1, min_val=3)
+    with ui.row().classes("items-center gap-1"):
+        _number_input(
+            "board_square_length_m", "Square length (mm)",
+            scale=1000.0, fmt="%.2f", step=0.5, min_val=1.0,
+        )
+        _number_input(
+            "board_marker_length_m", "Marker length (mm)",
+            scale=1000.0, fmt="%.2f", step=0.5, min_val=1.0,
+        )
+    _select_input("board_dictionary", "ArUco dictionary", ARUCO_DICTIONARIES)
+    _switch_input("board_legacy_pattern", "Legacy ChArUco corner ordering")
+    ui.separator().classes("q-my-sm")
+    ui.button(
+        "Generate board PNG...", icon="download",
+        on_click=_render_charuco_png_dialog,
+    ).props("size=sm outline")
+    ui.label(
+        "Renders the current geometry at chosen DPI for printing or "
+        "displaying on a tablet.",
+    ).classes("text-xs opacity-60")
+
+
+def build_surface_section() -> None:
+    """Mounting surface: collision primitive + safety margin."""
+    _switch_input(
+        "surface_enabled",
+        "Enable mounting surface (collision primitive)",
+    )
+    _switch_input(
+        "surface_show_overlay",
+        "Show translucent surface overlay in scene",
+    )
+    ui.label("Dimensions (board-local W × H × thickness)").classes(
+        "text-xs opacity-70 q-mt-sm",
+    )
+    _tuple_input(
+        "surface_dimensions_m",
+        ("W (mm)", "H (mm)", "Thickness (mm)"),
+        scale=1000.0, fmt="%.1f", step=1.0, min_val=1.0,
+    )
+    ui.label("Offset of surface centre from ChArUco centre (board-local)").classes(
+        "text-xs opacity-70 q-mt-sm",
+    )
+    _tuple_input(
+        "surface_offset_local_m",
+        ("X offset (mm)", "Y offset (mm)"),
+        scale=1000.0, fmt="%.1f", step=1.0,
+    )
+    ui.separator().classes("q-my-sm")
+    ui.label("Collision behaviour").classes("text-xs opacity-70")
+    _switch_input("floor_primitive_enabled", "Floor collision box (z<0)")
+    _switch_input("enable_self_collision_check", "Self-collision check")
+    _number_input(
+        "collision_safety_margin_m", "Safety margin (mm)",
+        scale=1000.0, fmt="%.1f", step=0.5, min_val=0.0,
+    )
+    ui.label(
+        "Lower margin = robot can approach closer to surface, "
+        "higher collision risk.",
+    ).classes("text-xs opacity-60")
+
+
+def build_intrinsics_section() -> None:
+    """Camera intrinsics."""
+    ui.label("Pinhole intrinsics (px)").classes("text-xs opacity-70")
+    with ui.row().classes("items-center gap-1"):
+        _number_input("intr_fx", "fx", fmt="%.1f", step=1.0, min_val=1.0)
+        _number_input("intr_fy", "fy", fmt="%.1f", step=1.0, min_val=1.0)
+    with ui.row().classes("items-center gap-1"):
+        _number_input("intr_cx", "cx", fmt="%.1f", step=1.0, min_val=0.0)
+        _number_input("intr_cy", "cy", fmt="%.1f", step=1.0, min_val=0.0)
+    ui.label("Image size").classes("text-xs opacity-70 q-mt-sm")
+    with ui.row().classes("items-center gap-1"):
+        _int_input("intr_width", "Width (px)", step=1, min_val=1)
+        _int_input("intr_height", "Height (px)", step=1, min_val=1)
+
+
+def build_cam_mount_section() -> None:
+    """Cold-start camera mount transform."""
+    ui.label("Translation (flange frame)").classes("text-xs opacity-70")
+    _tuple_input(
+        "cam_mount_translate_mm",
+        ("X (mm)", "Y (mm)", "Z (mm)"),
+        fmt="%.1f", step=0.5,
+    )
+    ui.label("Tilt (XYZ-extrinsic)").classes("text-xs opacity-70 q-mt-sm")
+    _tuple_input(
+        "cam_mount_tilt_deg",
+        ("Rx (deg)", "Ry (deg)", "Rz (deg)"),
+        fmt="%.2f", step=1.0,
+    )
+    ui.label(
+        "These are the SEED used for IK warm-starts and the live frustum. "
+        "The calibration recovers the precise mount.",
+    ).classes("text-xs opacity-60")
+
+
+def build_hemisphere_section() -> None:
+    """Hemisphere search region."""
+    ui.label("Distance shell (m)").classes("text-xs opacity-70")
+    _tuple_input(
+        "hemi_distance_range_m",
+        ("Min (m)", "Max (m)"),
+        fmt="%.3f", step=0.01, min_val=0.05,
+    )
+    ui.label("Elevation range (deg)").classes("text-xs opacity-70 q-mt-sm")
+    _tuple_input(
+        "hemi_elevation_range_deg",
+        ("Min (deg)", "Max (deg)"),
+        fmt="%.1f", step=1.0, min_val=0.0, max_val=89.0,
+    )
+    _number_input(
+        "hemi_azimuth_spread_deg", "Azimuth half-spread (deg)",
+        fmt="%.1f", step=5.0, min_val=0.0, max_val=180.0,
+    )
+    ui.separator().classes("q-my-sm")
+    ui.label("Hemisphere centre override").classes("text-xs opacity-70")
+    _optional_xyz_input("hemi_centre_override_m", "Centre")
+
+
+def build_localise_section() -> None:
+    """Localise sweep tunables."""
+    ui.label("Sweep mode").classes("text-xs opacity-70")
+    _switch_input("localise_use_j0_sweep", "J0-sweep mode (recommended)")
+    _switch_input("localise_continuous_sweep", "Continuous (vs discrete steps)")
+
+    ui.label("Sweep parameters").classes("text-xs opacity-70 q-mt-sm")
+    with ui.row().classes("items-center gap-1"):
+        _number_input(
+            "localise_sweep_speed", "Speed (frac)",
+            fmt="%.2f", step=0.05, min_val=0.01, max_val=1.0,
+        )
+        _number_input(
+            "localise_capture_period_s", "Capture period (s)",
+            fmt="%.2f", step=0.05, min_val=0.05,
+        )
+    with ui.row().classes("items-center gap-1"):
+        _number_input(
+            "localise_j0_sweep_half_deg", "J0 half-sweep (deg)",
+            fmt="%.1f", step=5.0, min_val=10.0,
+        )
+        _number_input(
+            "localise_j0_chunk_deg", "J0 chunk (deg)",
+            fmt="%.1f", step=1.0, min_val=1.0,
+        )
+    _int_input(
+        "localise_seed_n_candidates", "Seed-pose Sobol candidates",
+        step=32, min_val=16,
+    )
+
+    ui.label("Detection thresholds").classes("text-xs opacity-70 q-mt-sm")
+    with ui.row().classes("items-center gap-1"):
+        _int_input(
+            "localise_early_stop_detections", "Early-stop detections", min_val=1,
+        )
+        _int_input(
+            "localise_early_stop_inliers", "Early-stop inliers", min_val=1,
+        )
+    with ui.row().classes("items-center gap-1"):
+        _int_input(
+            "localise_min_inliers_to_proceed", "Min inliers to proceed", min_val=1,
+        )
+        _int_input(
+            "localise_min_detections", "Min detections", min_val=1,
+        )
+    _number_input(
+        "localise_inlier_threshold_m", "Inlier threshold (mm)",
+        scale=1000.0, fmt="%.1f", step=1.0, min_val=1.0,
+    )
+
+    ui.label("Stage-2 refinement").classes("text-xs opacity-70 q-mt-sm")
+    with ui.row().classes("items-center gap-1"):
+        _int_input(
+            "localise_refine_n_poses", "Refine poses", step=1, min_val=0,
+        )
+        _number_input(
+            "localise_refine_distance_m", "Refine distance (m)",
+            fmt="%.2f", step=0.02, min_val=0.10,
+        )
+        _number_input(
+            "localise_refine_elevation_deg", "Refine elevation (deg)",
+            fmt="%.1f", step=1.0, min_val=20.0, max_val=89.0,
+        )
+
+
+def build_gripper_section() -> None:
+    """Gripper notice — tool selection lives in the bottom-right
+    waldo-commander gripper panel, not here. This space is reserved for
+    Phase 1B (custom tool registration / drop-in STL configuration).
+    """
+    ui.label(
+        "Tool + jaw variant are configured via the bottom-right gripper "
+        "panel in waldo-commander. The active tool's TCP transform "
+        "(used by the Hover-above-board / TCP mode) is queried live "
+        "from the RobotClient.",
+    ).classes("text-xs opacity-70")
+    ui.label(
+        "Custom-tool STL ingestion (Phase 1B) will land here.",
+    ).classes("text-xs opacity-60 q-mt-sm")
+
+
+# ---------------------------------------------------------------------------
+# Top-level builder
+# ---------------------------------------------------------------------------
+
+
+def build_calibration_settings_expansion() -> None:
+    """Render the full "Calibration settings" expansion with all sub-sections."""
+    with ui.expansion("Calibration settings", icon="tune").classes("w-full"):
+        with ui.expansion("Calibration board", icon="grid_4x4").classes("w-full"):
+            build_board_section()
+        with ui.expansion("Mounting surface", icon="layers").classes("w-full"):
+            build_surface_section()
+        with ui.expansion("Camera intrinsics", icon="camera").classes("w-full"):
+            build_intrinsics_section()
+        with ui.expansion("Camera mount (cold-start)", icon="open_with").classes(
+            "w-full",
+        ):
+            build_cam_mount_section()
+        with ui.expansion("Hemisphere search", icon="motion_photos_on").classes(
+            "w-full",
+        ):
+            build_hemisphere_section()
+        with ui.expansion("Localise sweep", icon="search").classes("w-full"):
+            build_localise_section()
+        with ui.expansion("Gripper", icon="precision_manufacturing").classes(
+            "w-full",
+        ):
+            build_gripper_section()
+
+
+# ---------------------------------------------------------------------------
+# Preset bar
+# ---------------------------------------------------------------------------
+
+
+def build_preset_bar(refresh_panel: Callable[[], None]) -> None:
+    """Render the preset dropdown + Save / Save as / Delete / Reset / Export.
+
+    ``refresh_panel`` is called after a preset is loaded or after Reset so
+    the panel rebuilds with the new values shown in every input.
+    """
+    presets = settings.list_presets()
+    active = settings.get_active_preset()
+
+    options = ["(Defaults)"] + list(presets)
+    initial = active if active in presets else "(Defaults)"
+
+    with ui.row().classes("items-center gap-1 q-mt-xs"):
+        sel = ui.select(options, value=initial, label="Setup preset").props(
+            "dense",
+        ).classes("w-56")
+
+        def _on_select(_e: Any = None) -> None:
+            choice = str(sel.value or "(Defaults)")
+            if choice == "(Defaults)":
+                settings.reset_to_defaults()
+                # Re-apply every key's side effects so the scene rebuilds.
+                for key in settings.DEFAULTS:
+                    try:
+                        live_apply.apply_setting_change(key)
+                    except Exception:  # noqa: BLE001
+                        pass
+                refresh_panel()
+                ui.notify("Settings reset to defaults", color="info")
+                return
+            try:
+                settings.load_preset(choice)
+            except KeyError:
+                ui.notify(f"Preset {choice!r} not found", color="warning")
+                return
+            for key in settings.DEFAULTS:
+                try:
+                    live_apply.apply_setting_change(key)
+                except Exception:  # noqa: BLE001
+                    pass
+            refresh_panel()
+            ui.notify(f"Loaded preset: {choice}", color="positive")
+
+        sel.on("update:model-value", _on_select)
+
+        def _on_save_as() -> None:
+            with ui.dialog() as dialog, ui.card():
+                ui.label("Save current settings as preset").classes(
+                    "text-base font-semibold",
+                )
+                name_input = ui.input("Preset name").props("dense autofocus")
+                with ui.row():
+                    def _confirm() -> None:
+                        name = str(name_input.value or "").strip()
+                        if not name:
+                            ui.notify("Name cannot be empty", color="warning")
+                            return
+                        settings.save_preset(name)
+                        ui.notify(f"Saved preset: {name}", color="positive")
+                        dialog.close()
+                        refresh_panel()
+                    ui.button("Save", on_click=_confirm, color="primary").props(
+                        "size=sm",
+                    )
+                    ui.button("Cancel", on_click=dialog.close).props("size=sm")
+            dialog.open()
+
+        def _on_delete() -> None:
+            choice = str(sel.value or "(Defaults)")
+            if choice == "(Defaults)":
+                ui.notify("Cannot delete defaults", color="warning")
+                return
+            settings.delete_preset(choice)
+            ui.notify(f"Deleted preset: {choice}", color="info")
+            refresh_panel()
+
+        def _on_export() -> None:
+            choice = str(sel.value or "(Defaults)")
+            try:
+                payload = settings.export_preset_json(
+                    None if choice == "(Defaults)" else choice,
+                )
+            except KeyError:
+                ui.notify(f"Preset {choice!r} not found", color="warning")
+                return
+            # Show in a dialog so the user can copy-paste it.
+            with ui.dialog() as dialog, ui.card().classes("w-full max-w-2xl"):
+                ui.label(f"Preset JSON ({choice})").classes(
+                    "text-base font-semibold",
+                )
+                ui.textarea(value=payload).props(
+                    "outlined readonly dense",
+                ).classes("w-full font-mono text-xs").style("min-height: 300px")
+                ui.button("Close", on_click=dialog.close).props("size=sm")
+            dialog.open()
+
+        ui.button(
+            "Save as...", on_click=_on_save_as, color="primary",
+        ).props("size=sm outline")
+        ui.button("Delete", on_click=_on_delete, color="negative").props(
+            "size=sm outline",
+        )
+        ui.button("Export JSON", on_click=_on_export).props("size=sm outline")

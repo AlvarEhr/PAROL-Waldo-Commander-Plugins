@@ -11,11 +11,8 @@ import numpy as np
 from nicegui import ui
 from numpy.typing import NDArray
 
+from . import settings
 from .constants import (
-    _CAM_MOUNT_TILT_DEG,
-    _CAM_MOUNT_TRANSLATE_MM,
-    _HEMI_DISTANCE_RANGE_M,
-    _HEMI_ELEVATION_RANGE_DEG,
     _REACHABILITY_GRID,
     _REACHABILITY_KEEP_COUNT,
     _REACHABILITY_N_CANDIDATES,
@@ -57,17 +54,19 @@ def _compute_reachability_candidates(
 
     _ensure_workspace_envelope()
 
+    cam_translate = settings.cam_mount_translate_mm
+    cam_tilt = settings.cam_mount_tilt_deg
     cold_start = CameraMount.from_eyeball_estimate(
-        x_mm=_CAM_MOUNT_TRANSLATE_MM[0],
-        y_mm=_CAM_MOUNT_TRANSLATE_MM[1],
-        z_mm=_CAM_MOUNT_TRANSLATE_MM[2],
-        tilt_x_deg=_CAM_MOUNT_TILT_DEG[0],
-        tilt_y_deg=_CAM_MOUNT_TILT_DEG[1],
-        tilt_z_deg=_CAM_MOUNT_TILT_DEG[2],
+        x_mm=cam_translate[0],
+        y_mm=cam_translate[1],
+        z_mm=cam_translate[2],
+        tilt_x_deg=cam_tilt[0],
+        tilt_y_deg=cam_tilt[1],
+        tilt_z_deg=cam_tilt[2],
     )
 
-    d_min, d_max = _HEMI_DISTANCE_RANGE_M
-    ev_min, ev_max = _HEMI_ELEVATION_RANGE_DEG
+    d_min, d_max = settings.hemi_distance_range_m
+    ev_min, ev_max = settings.hemi_elevation_range_deg
     az_min, az_max = _hemi_azimuth_world_range_deg()
 
     try:

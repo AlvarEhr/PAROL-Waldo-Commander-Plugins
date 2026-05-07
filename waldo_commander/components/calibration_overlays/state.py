@@ -9,14 +9,7 @@ import numpy as np
 from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as SciRotation
 
-from .constants import (
-    _BOARD_RPY_RAD,
-    _BOARD_TRANSLATE_M,
-    _HEMI_AZIMUTH_SPREAD_DEG,
-    _HEMI_CENTRE_OVERRIDE_M,
-    _TABLET_DIMENSIONS_M,
-    _TABLET_PRIMITIVE_ENABLED,
-)
+from . import settings
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +76,70 @@ _state: dict[str, Any] = {
 }
 
 
+# ---------------------------------------------------------------------------
+# ArUco dictionary lookup — string → cv2 constant
+# ---------------------------------------------------------------------------
+
+
+def _aruco_dict_id(name: str) -> int:
+    """Translate a user-facing dictionary name (e.g. ``"DICT_4X4_50"``) to
+    OpenCV's integer constant. Falls back to ``DICT_4X4_50`` with a warning
+    if the name isn't recognised.
+    """
+    import cv2  # noqa: PLC0415
+    attr = getattr(cv2.aruco, name, None)
+    if isinstance(attr, int):
+        return attr
+    logger.warning(
+        "Unknown ArUco dictionary %r; falling back to DICT_4X4_50",
+        name,
+    )
+    return cv2.aruco.DICT_4X4_50
+
+
+def current_board_config() -> Any:
+    """Build a fresh ``BoardConfig`` from the current settings.
+
+    Imports parol6-vision lazily so this module loads cleanly even when
+    the calibration package isn't installed (e.g. in headless tests).
+
+    When the user is mid-edit (e.g. just changed square_length but not yet
+    marker_length, or vice-versa), the marker/square invariant
+    ``0 < marker < square`` may be temporarily violated. Rather than
+    raising and aborting every consumer, we clamp marker_length to
+    ``0.6 * square_length`` (the recommended sweet spot per
+    Garrido-Jurado 2014) and log a warning. The UI also surfaces the
+    invariant in real time when the user types invalid values, but
+    this ensures the scene keeps rendering regardless.
+    """
+    from parol6_vision.calibration.board import BoardConfig  # noqa: PLC0415
+
+    sl = float(settings.board_square_length_m)
+    ml = float(settings.board_marker_length_m)
+    if ml <= 0.0 or ml >= sl:
+        ml_clamped = sl * 0.6
+        logger.warning(
+            "marker_length %.4f m invalid for square_length %.4f m "
+            "(must be 0 < ml < sl); clamping to %.4f m",
+            ml, sl, ml_clamped,
+        )
+        ml = ml_clamped
+
+    return BoardConfig(
+        squares_x=int(settings.board_squares_x),
+        squares_y=int(settings.board_squares_y),
+        square_length=sl,
+        marker_length=ml,
+        aruco_dict_id=_aruco_dict_id(str(settings.board_dictionary)),
+        legacy_pattern=bool(settings.board_legacy_pattern),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Hemisphere helpers
+# ---------------------------------------------------------------------------
+
+
 def _hemi_azimuth_center_deg() -> float:
     """Direction from the robot base origin to the hemisphere anchor, in
     degrees measured from world +X (CCW). Used so the hemisphere naturally
@@ -96,29 +153,32 @@ def _hemi_azimuth_world_range_deg() -> tuple[float, float]:
     """World-frame azimuth range covering the hemisphere's spread, centered
     on the base→board direction. Used by both the viz and the orchestrator."""
     center = _hemi_azimuth_center_deg()
-    return (center - _HEMI_AZIMUTH_SPREAD_DEG, center + _HEMI_AZIMUTH_SPREAD_DEG)
+    spread = float(settings.hemi_azimuth_spread_deg)
+    return (center - spread, center + spread)
 
 
 def _build_T_board2base() -> NDArray[np.float64]:
-    """Compose the SE(3) board→base matrix from the position + RPY tunables.
+    """Compose the SE(3) board→base matrix from the board placement settings.
 
-    When ``_TABLET_PRIMITIVE_ENABLED`` is set, the board origin is
-    auto-lifted along its local +Z by ``_TABLET_DIMENSIONS_M[2]``. This
-    matches the physical reality of a tablet lying screen-up on a bench:
-    the bench surface is at world z=0, the tablet body sits on the bench,
-    and the ChArUco screen is at z = tablet_thickness above the bench.
-    The user-facing ``_BOARD_TRANSLATE_M`` continues to describe where
-    the board sits IF the tablet had zero thickness — ergonomic because
-    it preserves the natural mental model "the board's at this XY".
+    When the mounting surface is enabled, the board origin is auto-lifted
+    along its local +Z by the surface's thickness (``surface_dimensions_m[2]``).
+    This matches the physical reality of a tablet lying screen-up on a
+    bench: the bench surface is at world z=0, the surface body sits on the
+    bench, and the ChArUco face is at z = surface_thickness above the bench.
+    The user-facing ``board_translate_m`` continues to describe where the
+    board sits IF the surface had zero thickness — ergonomic because it
+    preserves the natural mental model "the board's at this XY".
     """
+    rpy = settings.board_rpy_rad
     R = np.eye(3, dtype=np.float64)
-    if any(abs(a) > 1e-9 for a in _BOARD_RPY_RAD):
-        R = SciRotation.from_euler("XYZ", _BOARD_RPY_RAD).as_matrix()
+    if any(abs(a) > 1e-9 for a in rpy):
+        R = SciRotation.from_euler("XYZ", rpy).as_matrix()
 
-    translation = np.asarray(_BOARD_TRANSLATE_M, dtype=np.float64).copy()
-    if _TABLET_PRIMITIVE_ENABLED:
-        # Lift along board's +Z (out of the screen face) by tablet thickness.
-        translation += R[:, 2] * _TABLET_DIMENSIONS_M[2]
+    translation = np.asarray(settings.board_translate_m, dtype=np.float64).copy()
+    if bool(settings.surface_enabled):
+        # Lift along board's +Z (out of the screen face) by surface thickness.
+        thickness = float(settings.surface_dimensions_m[2])
+        translation += R[:, 2] * thickness
 
     T = np.eye(4, dtype=np.float64)
     T[:3, :3] = R
@@ -135,24 +195,40 @@ def _board_center_world() -> NDArray[np.float64]:
     aiming at the corner would make the pose generator aim cameras at one
     edge of the board, leaving most of the printed pattern outside FOV.
     """
-    from parol6_vision.calibration.board import BOARD_TABLET_30MM as _cfg  # noqa: PLC0415
-    w_m = _cfg.squares_x * _cfg.square_length
-    h_m = _cfg.squares_y * _cfg.square_length
+    sx = int(settings.board_squares_x)
+    sy = int(settings.board_squares_y)
+    sl = float(settings.board_square_length_m)
+    w_m = sx * sl
+    h_m = sy * sl
     center_local = np.array([w_m / 2.0, h_m / 2.0, 0.0, 1.0], dtype=np.float64)
     return (_T_BOARD2BASE @ center_local)[:3]
 
 
 def _hemi_centre_world() -> NDArray[np.float64]:
-    """Hemisphere anchor — `_HEMI_CENTRE_OVERRIDE_M` if set, board centre
+    """Hemisphere anchor — ``hemi_centre_override_m`` if set, board centre
     otherwise. This is the SPATIAL anchor of the hemisphere (where the dome
     of camera positions sits in world frame). Distinct from the look-at
     target, which is always the actual board centre regardless of override.
     """
-    if _HEMI_CENTRE_OVERRIDE_M is not None:
-        return np.asarray(_HEMI_CENTRE_OVERRIDE_M, dtype=np.float64)
+    override = settings.hemi_centre_override_m
+    if override is not None:
+        return np.asarray(override, dtype=np.float64)
     return _board_center_world()
 
 
-# Module-level computed value. Must come AFTER `_build_T_board2base` is
-# defined so the call here resolves correctly.
+# Module-level computed value. Must come AFTER ``_build_T_board2base`` is
+# defined so the call here resolves correctly. Gets mutated in place via
+# slice assignment from ``rebuild_T_board2base`` and from auto-localise so
+# importers see updates without rebinding.
 _T_BOARD2BASE: NDArray[np.float64] = _build_T_board2base()
+
+
+def rebuild_T_board2base() -> None:
+    """Rebuild ``_T_BOARD2BASE`` from the current settings (board placement,
+    surface thickness) and write it in place via slice assignment.
+
+    Call this after any board-placement or surface-thickness setting
+    changes so all importing modules see the new value.
+    """
+    new_T = _build_T_board2base()
+    _T_BOARD2BASE[:] = new_T

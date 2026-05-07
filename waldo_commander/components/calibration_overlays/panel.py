@@ -8,11 +8,12 @@ from collections.abc import Callable
 
 from nicegui import ui
 
+from . import settings, settings_ui
 from .calibration_thread import _calibration_thread
 from .hover import _drive_hover_pose_thread
 from .localise import _localise_board_thread
 from .overlays import _set_overlay_visible
-from .state import _state
+from .state import _state, current_board_config
 
 logger = logging.getLogger(__name__)
 
@@ -238,6 +239,11 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
     for name, _label, _default in _OVERLAY_TOGGLES:
         _set_overlay_visible(name, _state.get(f"show_{name}", True))
 
+    # Pinned header — Calibration title + close button stay visible while
+    # the body below scrolls. Action row + status label live INSIDE the
+    # scroll area so an excess of expansions doesn't push them off-screen,
+    # but the user still has Run / Localise / STOP at the top of the
+    # scroll area before any expansions.
     with ui.row().classes("w-full items-center"):
         ui.label("Calibration").classes("text-lg font-medium")
         ui.space()
@@ -246,154 +252,177 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
                 "flat round dense color=white"
             )
 
-    _state["status_label"] = ui.label("Idle.").classes(
-        "text-xs opacity-80"
-    )
+    # Scrollable body. ``calc(100vh - 80px)`` reserves room for the page
+    # chrome above the panel; the column scrolls internally when content
+    # exceeds the viewport (which happens once the Calibration settings
+    # expansion is opened).
+    body = ui.column().classes("w-full")
+    body.style("max-height: calc(100vh - 80px); overflow-y: auto;")
+    with body:
 
-    with ui.row().classes("gap-1 q-mt-sm"):
-        ui.button("Run", on_click=_on_run, color="primary").props("size=sm")
-        ui.button(
-            "Localise Board", on_click=_on_localise, color="secondary",
-        ).props("size=sm")
-        ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
-
-    ui.separator().classes("q-my-sm")
-
-    with ui.expansion("View overlays", icon="visibility").classes("w-full"):
-        def _make_handler(name: str):
-            # Closure-free factory so each checkbox binds to its own name.
-            def _on_change(e) -> None:
-                visible = bool(e.value)
-                _set_overlay_visible(name, visible)
-                _persist_overlay_pref(name, visible)
-            return _on_change
-
-        for name, label, _default in _OVERLAY_TOGGLES:
-            ui.checkbox(
-                label,
-                value=bool(_state.get(f"show_{name}", True)),
-                on_change=_make_handler(name),
-            ).props("dense")
-
-    # Hover-above-board verification — drive the camera to a known XY on
-    # the board surface at a configurable standoff height, look straight
-    # down. Lets the user physically measure with a ruler/caliper and
-    # check whether the calibration's mount transform is right. Standoff
-    # is measured perpendicular to the board surface (board-local +Z).
-    with ui.expansion(
-        "Hover above board (verification)", icon="straighten",
-    ).classes("w-full"):
-        # Persist standoff and mode so they survive a page reload.
-        try:
-            from nicegui import app as _nicegui_app  # noqa: PLC0415
-            _persisted_standoff = float(
-                _nicegui_app.storage.user.get("calib_hover_standoff_mm", 100.0)
-            )
-            _persisted_hover_mode = str(
-                _nicegui_app.storage.user.get("calib_hover_mode", "camera")
-            )
-            if _persisted_hover_mode not in ("camera", "tcp"):
-                _persisted_hover_mode = "camera"
-        except Exception:  # noqa: BLE001
-            _persisted_standoff = 100.0
-            _persisted_hover_mode = "camera"
-
-        with ui.row().classes("items-center gap-2 q-mt-xs"):
-            standoff_input = (
-                ui.number(
-                    label="Standoff (mm)",
-                    value=_persisted_standoff,
-                    min=10.0, max=300.0, step=5.0, format="%.0f",
-                )
-                .props("dense")
-                .classes("w-32")
-            )
-
-            def _persist_standoff(_e) -> None:
-                try:
-                    from nicegui import app as _na  # noqa: PLC0415
-                    _na.storage.user["calib_hover_standoff_mm"] = float(
-                        standoff_input.value
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-            standoff_input.on("update:model-value", _persist_standoff)
-
-            # Reference-frame toggle: "Camera" hovers the optical centre
-            # (validates calibration), "TCP" hovers the gripper fingertips
-            # (validates kinematics chain only — independent of calibration).
-            hover_mode_input = (
-                ui.toggle(
-                    {"camera": "Camera", "tcp": "TCP"},
-                    value=_persisted_hover_mode,
-                )
-                .props("dense color=primary unelevated")
-            )
-
-            def _persist_hover_mode(_e) -> None:
-                try:
-                    from nicegui import app as _na  # noqa: PLC0415
-                    _na.storage.user["calib_hover_mode"] = str(
-                        hover_mode_input.value or "camera"
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
-
-            hover_mode_input.on("update:model-value", _persist_hover_mode)
-
-        from parol6_vision.calibration.board import (  # noqa: PLC0415
-            BOARD_TABLET_30MM as _hover_cfg,
+        _state["status_label"] = ui.label("Idle.").classes(
+            "text-xs opacity-80"
         )
-        bw_mm = _hover_cfg.squares_x * _hover_cfg.square_length * 1000.0
-        bh_mm = _hover_cfg.squares_y * _hover_cfg.square_length * 1000.0
-        # Board-local frame: origin at one corner, +X along squares_x (long
-        # edge, 210 mm), +Y along squares_y (short edge, 150 mm). The
-        # buttons label the corners by their (X-low/high, Y-low/high) name
-        # — "Origin" is (0, 0), "TR" = top-right = (max_x, max_y), etc.
-        hover_presets: list[tuple[str, float, float]] = [
-            ("Centre",  bw_mm / 2.0, bh_mm / 2.0),
-            ("Origin",  0.0,         0.0),
-            ("X+",      bw_mm,       0.0),
-            ("Y+",      0.0,         bh_mm),
-            ("X+Y+",    bw_mm,       bh_mm),
-        ]
-
-        def _make_hover_handler(local_x_mm: float, local_y_mm: float):
-            def _click() -> None:
-                if _busy_warn("Hover"):
-                    return
-                try:
-                    standoff_mm = float(standoff_input.value or 0.0)
-                except (TypeError, ValueError):
-                    ui.notify(
-                        "Hover: standoff must be a number", color="warning",
-                    )
-                    return
-                if standoff_mm < 10.0:
-                    ui.notify(
-                        f"Hover: standoff {standoff_mm:.0f} mm too small "
-                        f"(min 10 mm)",
-                        color="warning",
-                    )
-                    return
-                mode = str(hover_mode_input.value or "camera")
-                _state["is_hovering"] = True
-                _state["stop_requested"] = False
-                threading.Thread(
-                    target=_drive_hover_pose_thread,
-                    args=(
-                        local_x_mm / 1000.0,
-                        local_y_mm / 1000.0,
-                        standoff_mm / 1000.0,
-                        mode,
-                    ),
-                    daemon=True,
-                ).start()
-            return _click
 
         with ui.row().classes("gap-1 q-mt-sm"):
-            for label, local_x, local_y in hover_presets:
-                ui.button(
-                    label, on_click=_make_hover_handler(local_x, local_y),
-                ).props("size=sm outline")
+            ui.button("Run", on_click=_on_run, color="primary").props("size=sm")
+            ui.button(
+                "Localise Board", on_click=_on_localise, color="secondary",
+            ).props("size=sm")
+            ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
+
+        ui.separator().classes("q-my-sm")
+
+        with ui.expansion("View overlays", icon="visibility").classes("w-full"):
+            def _make_handler(name: str):
+                # Closure-free factory so each checkbox binds to its own name.
+                def _on_change(e) -> None:
+                    visible = bool(e.value)
+                    _set_overlay_visible(name, visible)
+                    _persist_overlay_pref(name, visible)
+                return _on_change
+
+            for name, label, _default in _OVERLAY_TOGGLES:
+                ui.checkbox(
+                    label,
+                    value=bool(_state.get(f"show_{name}", True)),
+                    on_change=_make_handler(name),
+                ).props("dense")
+
+        # Hover-above-board verification — drive the camera to a known XY on
+        # the board surface at a configurable standoff height, look straight
+        # down. Lets the user physically measure with a ruler/caliper and
+        # check whether the calibration's mount transform is right. Standoff
+        # is measured perpendicular to the board surface (board-local +Z).
+        with ui.expansion(
+            "Hover above board (verification)", icon="straighten",
+        ).classes("w-full"):
+            # Persist standoff and mode so they survive a page reload.
+            try:
+                from nicegui import app as _nicegui_app  # noqa: PLC0415
+                _persisted_standoff = float(
+                    _nicegui_app.storage.user.get("calib_hover_standoff_mm", 100.0)
+                )
+                _persisted_hover_mode = str(
+                    _nicegui_app.storage.user.get("calib_hover_mode", "camera")
+                )
+                if _persisted_hover_mode not in ("camera", "tcp"):
+                    _persisted_hover_mode = "camera"
+            except Exception:  # noqa: BLE001
+                _persisted_standoff = 100.0
+                _persisted_hover_mode = "camera"
+
+            with ui.row().classes("items-center gap-2 q-mt-xs"):
+                standoff_input = (
+                    ui.number(
+                        label="Standoff (mm)",
+                        value=_persisted_standoff,
+                        min=10.0, max=300.0, step=5.0, format="%.0f",
+                    )
+                    .props("dense")
+                    .classes("w-32")
+                )
+
+                def _persist_standoff(_e) -> None:
+                    try:
+                        from nicegui import app as _na  # noqa: PLC0415
+                        _na.storage.user["calib_hover_standoff_mm"] = float(
+                            standoff_input.value
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                standoff_input.on("update:model-value", _persist_standoff)
+
+                # Reference-frame toggle: "Camera" hovers the optical centre
+                # (validates calibration), "TCP" hovers the gripper fingertips
+                # (validates kinematics chain only — independent of calibration).
+                hover_mode_input = (
+                    ui.toggle(
+                        {"camera": "Camera", "tcp": "TCP"},
+                        value=_persisted_hover_mode,
+                    )
+                    .props("dense color=primary unelevated")
+                )
+
+                def _persist_hover_mode(_e) -> None:
+                    try:
+                        from nicegui import app as _na  # noqa: PLC0415
+                        _na.storage.user["calib_hover_mode"] = str(
+                            hover_mode_input.value or "camera"
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
+
+                hover_mode_input.on("update:model-value", _persist_hover_mode)
+
+            _hover_cfg = current_board_config()
+            bw_mm = _hover_cfg.squares_x * _hover_cfg.square_length * 1000.0
+            bh_mm = _hover_cfg.squares_y * _hover_cfg.square_length * 1000.0
+            # Board-local frame: origin at one corner, +X along squares_x (long
+            # edge, 210 mm), +Y along squares_y (short edge, 150 mm). The
+            # buttons label the corners by their (X-low/high, Y-low/high) name
+            # — "Origin" is (0, 0), "TR" = top-right = (max_x, max_y), etc.
+            hover_presets: list[tuple[str, float, float]] = [
+                ("Centre",  bw_mm / 2.0, bh_mm / 2.0),
+                ("Origin",  0.0,         0.0),
+                ("X+",      bw_mm,       0.0),
+                ("Y+",      0.0,         bh_mm),
+                ("X+Y+",    bw_mm,       bh_mm),
+            ]
+
+            def _make_hover_handler(local_x_mm: float, local_y_mm: float):
+                def _click() -> None:
+                    if _busy_warn("Hover"):
+                        return
+                    try:
+                        standoff_mm = float(standoff_input.value or 0.0)
+                    except (TypeError, ValueError):
+                        ui.notify(
+                            "Hover: standoff must be a number", color="warning",
+                        )
+                        return
+                    if standoff_mm < 10.0:
+                        ui.notify(
+                            f"Hover: standoff {standoff_mm:.0f} mm too small "
+                            f"(min 10 mm)",
+                            color="warning",
+                        )
+                        return
+                    mode = str(hover_mode_input.value or "camera")
+                    _state["is_hovering"] = True
+                    _state["stop_requested"] = False
+                    threading.Thread(
+                        target=_drive_hover_pose_thread,
+                        args=(
+                            local_x_mm / 1000.0,
+                            local_y_mm / 1000.0,
+                            standoff_mm / 1000.0,
+                            mode,
+                        ),
+                        daemon=True,
+                    ).start()
+                return _click
+
+            with ui.row().classes("gap-1 q-mt-sm"):
+                for label, local_x, local_y in hover_presets:
+                    ui.button(
+                        label, on_click=_make_hover_handler(local_x, local_y),
+                    ).props("size=sm outline")
+
+        # ------------------------------------------------------------------
+        # Calibration settings — UI-driven tunables persisted via
+        # app.storage.user. Live-applied where possible (board placement,
+        # hemisphere, surface, camera mount); the localise / collision / etc.
+        # values pick up on next thread invocation.
+        # ------------------------------------------------------------------
+        settings.load_from_storage()
+
+        @ui.refreshable
+        def _settings_panel() -> None:
+            # Preset bar at the top of the settings block.
+            settings_ui.build_preset_bar(refresh_panel=_settings_panel.refresh)
+            ui.separator().classes("q-my-sm")
+            settings_ui.build_calibration_settings_expansion()
+
+        _settings_panel()
