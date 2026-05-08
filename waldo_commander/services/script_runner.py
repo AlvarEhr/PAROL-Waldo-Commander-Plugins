@@ -89,6 +89,20 @@ async def run_script(
 
     env["WALDO_BACKEND_PACKAGE"] = ui_state.active_robot.backend_package
 
+    # Forward the mesh-collision master toggle so the subprocess's
+    # SteppingClientWrapper pre-flight matches the GUI's gating. Default
+    # "1" (on) when the storage key isn't set yet.
+    try:
+        from nicegui import app as _ng_app  # noqa: PLC0415
+
+        env["WALDO_MESH_COLLISION_ENABLED"] = (
+            "1"
+            if bool(_ng_app.storage.general.get("mesh_collision_check_enabled", True))
+            else "0"
+        )
+    except Exception:  # noqa: BLE001
+        env["WALDO_MESH_COLLISION_ENABLED"] = "1"
+
     # Determine which script to run
     if session_id:
         # Use bootstrap script to inject stepping wrapper

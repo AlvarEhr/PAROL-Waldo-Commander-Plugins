@@ -55,6 +55,52 @@ def _localise_board_thread() -> None:
     """
     # Lazy import to break panel<->localise cycle.
     from .panel import _post_status  # noqa: PLC0415
+
+    def _check_collision_or_warn(
+        target_q_deg: list[float],
+        context: str,
+    ) -> bool:
+        """Pre-flight collision check before dispatching a localise move.
+
+        Returns True if the move is safe (caller proceeds); False if
+        unsafe (caller skips). Posts both a panel-status update and a
+        top-of-page toast on rejection so the user sees the abort even
+        when their attention is on the 3D scene.
+
+        Fails open on any unexpected error so a transient glitch in the
+        check pipeline doesn't strand a localise run.
+        """
+        try:
+            from .collision import validate_joint_trajectory  # noqa: PLC0415
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+            from nicegui import ui as _ui  # noqa: PLC0415
+
+            current_q_deg = list(robot_state.angles.deg[:6])
+            check = validate_joint_trajectory(
+                current_q_deg, list(target_q_deg),
+            )
+            if check.get("safe", True):
+                return True
+            reason = check.get("reason", "unknown")
+            msg = (
+                f"Localise: {context}: aborted, would collide ({reason})."
+            )
+            _post_status(msg)
+            loop = _state.get("main_loop")
+            if loop is not None:
+                try:
+                    loop.call_soon_threadsafe(
+                        lambda m=msg: _ui.notify(
+                            m, color="warning", position="top",
+                        ),
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("localise toast schedule failed: %s", e)
+            return False
+        except Exception as e:  # noqa: BLE001
+            logger.debug("localise trajectory pre-check skipped (%s)", e)
+            return True
+
     try:
         import cv2  # noqa: PLC0415
 
@@ -612,6 +658,11 @@ def _localise_board_thread() -> None:
                     f"Localise: continuous sweep at seed ({seed_xy[0]:.2f}, "
                     f"{seed_xy[1]:.2f}) — moving to start"
                 )
+                if not _check_collision_or_warn(
+                    list(np.degrees(start_q)),
+                    f"sweep start ({seed_xy[0]:.2f}, {seed_xy[1]:.2f})",
+                ):
+                    continue
                 rc = raw_client.move_j(
                     angles=list(np.degrees(start_q)),
                     speed=0.3, accel=0.5, wait=True, timeout=15.0,
@@ -656,6 +707,20 @@ def _localise_board_thread() -> None:
                     cur += chunk_step_rad
                     chunk_targets.append(cur)
                 chunk_targets.append(end_j0_rad)
+
+                # Whole-sweep collision check: validate the full
+                # start_q → end_q trajectory once, rather than each
+                # ~20° chunk individually. The chunked dispatch is for
+                # halt-responsiveness, not for collision-state
+                # transitions — collision state can't change mid-chunk
+                # along J0-only motion. Saves ~1 check per chunk.
+                sweep_end_q = seed_q_rad.copy()
+                sweep_end_q[0] = end_j0_rad
+                if not _check_collision_or_warn(
+                    list(np.degrees(sweep_end_q)),
+                    f"full chunked sweep at ({seed_xy[0]:.2f}, {seed_xy[1]:.2f})",
+                ):
+                    continue
 
                 stop_outer = False
                 last_capture = 0.0
@@ -861,6 +926,11 @@ def _localise_board_thread() -> None:
                         f"Localise: discrete step at seed ({seed_xy[0]:.2f}, "
                         f"{seed_xy[1]:.2f}) — dJ0={dj0:+.0f}°"
                     )
+                    if not _check_collision_or_warn(
+                        list(np.degrees(q_rad)),
+                        f"discrete step ({seed_xy[0]:.2f}, {seed_xy[1]:.2f}) dJ0={dj0:+.0f}°",
+                    ):
+                        continue
                     try:
                         rc = raw_client.move_j(
                             angles=list(np.degrees(q_rad)),
@@ -888,9 +958,15 @@ def _localise_board_thread() -> None:
                     return
                 attempted += 1
                 _post_status(f"Localise: scan {i + 1}/{len(candidates)} — moving")
+                scan_q_deg = list(np.degrees(c.joint_angles_rad).tolist())
+                if not _check_collision_or_warn(
+                    scan_q_deg,
+                    f"scan {i + 1}/{len(candidates)}",
+                ):
+                    continue
                 try:
                     rc = raw_client.move_j(
-                        angles=list(np.degrees(c.joint_angles_rad).tolist()),
+                        angles=scan_q_deg,
                         speed=0.3, accel=0.5, wait=True, timeout=15.0,
                     )
                 except Exception as e:  # noqa: BLE001
@@ -1053,6 +1129,11 @@ def _localise_board_thread() -> None:
                     _post_status(
                         f"Localise refine: pose {ri + 1}/{len(picks)} — moving"
                     )
+                    if not _check_collision_or_warn(
+                        refine_q_deg,
+                        f"refine pose {ri + 1}/{len(picks)}",
+                    ):
+                        continue
                     try:
                         rc = raw_client.move_j(
                             angles=refine_q_deg,

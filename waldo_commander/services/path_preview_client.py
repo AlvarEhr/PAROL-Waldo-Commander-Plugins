@@ -277,6 +277,99 @@ class PathPreviewClient:
             self._collect_from_result(result, self._blend_move_type or "joints")
         self._blend_move_type = ""
 
+    def _check_segment_collision(
+        self,
+        prev_joints_rad: list[float] | None,
+        result: DryRunResult,
+        move_type: str,
+    ) -> None:
+        """Run a gripper-vs-environment pre-flight check on this move's
+        planned trajectory.
+
+        Skipped for jog / checkpoint segments and when the master
+        ``mesh_collision_check_enabled`` toggle is off. Failures append a
+        ``"Line {n}: collision: {reason}"`` entry to
+        :attr:`accumulated_errors`, which the editor's diagnostic pipeline
+        renders as an inline lint squiggle on the offending line.
+
+        Failure modes that fall back to fail-open silently:
+
+        * ``parol6_vision`` is not installed (collision_core unavailable).
+        * The parol6 mesh directory can't be located.
+        * The previous move's end-joints are unknown (first move in
+          program — script's starting joints come from the live robot
+          state, but we don't fault on the seed move).
+        """
+        if prev_joints_rad is None:
+            return
+        if move_type in ("jog", "checkpoint"):
+            return
+        if result.end_joints_rad.size == 0:
+            return
+
+        try:
+            from nicegui import app as _ng_app  # noqa: PLC0415
+
+            if not bool(
+                _ng_app.storage.general.get("mesh_collision_check_enabled", True),
+            ):
+                return
+        except Exception:  # noqa: BLE001
+            # No NiceGUI context (unlikely here, but tests run headless) —
+            # treat as on so a CI dry-run still surfaces collisions.
+            pass
+
+        try:
+            from parol6_vision.calibration.collision_core import (  # noqa: PLC0415
+                CollisionEnvironmentConfig,
+                parol6_mesh_dir,
+                resolve_tool_meshes_from_registry,
+                validate_joint_trajectory_core,
+            )
+        except ImportError:
+            return
+
+        mesh_dir = parol6_mesh_dir()
+        if mesh_dir is None:
+            return
+
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+
+            tool_key = getattr(robot_state, "tool_key", None) or "NONE"
+        except Exception:  # noqa: BLE001
+            tool_key = "NONE"
+
+        tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
+        config = CollisionEnvironmentConfig(
+            gripper_only=True,
+            tool_key=tool_key,
+            body_mesh_paths=tuple(tool_meshes["BODY"]),
+            jaw_mesh_paths=tuple(tool_meshes["JAW"]),
+            tablet_T_board2base=None,
+            tablet_dimensions_m=None,
+            floor_enabled=True,
+            safety_margin_m=0.008,
+        )
+        end_joints_rad = list(result.end_joints_rad.tolist())
+        try:
+            check = validate_joint_trajectory_core(
+                prev_joints_rad, end_joints_rad,
+                config=config,
+                n_samples=6,
+                degrees=False,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("preview collision check skipped: %s", e)
+            return
+
+        if not check.get("safe", True):
+            line_no = self._get_caller_line_number()
+            reason = check.get("reason", "collision")
+            self.accumulated_errors.append(
+                f"Line {line_no}: collision: {reason}",
+            )
+
     # ---- Source introspection ----
 
     def _get_caller_line_number(self) -> int:
@@ -319,8 +412,21 @@ class PathPreviewClient:
         if result is None:
             return
 
+        # Snapshot the prior move's end-joints BEFORE the update below
+        # so the edit-time collision check can use it as q_from.
+        prev_joints_rad = (
+            list(self.last_joints_rad) if self.last_joints_rad else None
+        )
+
         if result.end_joints_rad.size > 0:
             self.last_joints_rad = result.end_joints_rad.tolist()
+
+        # Edit-time gripper-vs-environment collision check. Best-effort,
+        # gripper-only, tablet-skipped (matches the program-runner
+        # subprocess gating). Surfaced as a "Line N: ..." entry in
+        # accumulated_errors — picked up by the editor's lint pipeline
+        # as a red squiggle on the offending line.
+        self._check_segment_collision(prev_joints_rad, result, move_type)
 
         if result.tcp_poses.shape[0] == 0:
             return

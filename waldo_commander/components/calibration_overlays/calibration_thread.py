@@ -825,13 +825,42 @@ def _calibration_thread() -> None:
                                     "%s: %s; going home instead",
                                     type(e).__name__, e,
                                 )
+                                # Pre-flight check on the home() recovery.
+                                home_safe = True
                                 try:
-                                    raw_client.home(wait=True, timeout=30.0)
-                                except Exception as e2:  # noqa: BLE001
-                                    logger.warning(
-                                        "post-calibration: home() also raised %s: %s",
-                                        type(e2).__name__, e2,
+                                    from .collision import (  # noqa: PLC0415
+                                        validate_joint_trajectory,
                                     )
+                                    from parol6.config import (  # noqa: PLC0415
+                                        HOME_ANGLES_DEG,
+                                    )
+                                    from waldo_commander.state import (  # noqa: PLC0415
+                                        robot_state as _rs,
+                                    )
+                                    current_q_deg = list(_rs.angles.deg[:6])
+                                    check = validate_joint_trajectory(
+                                        current_q_deg, list(HOME_ANGLES_DEG),
+                                    )
+                                    if not check.get("safe", True):
+                                        home_safe = False
+                                        _post_status(
+                                            f"Post-calibration: home() skipped, "
+                                            f"would collide "
+                                            f"({check.get('reason', 'collision')})."
+                                        )
+                                except Exception as e_check:  # noqa: BLE001
+                                    logger.debug(
+                                        "post-cal home() pre-check skipped: %s",
+                                        e_check,
+                                    )
+                                if home_safe:
+                                    try:
+                                        raw_client.home(wait=True, timeout=30.0)
+                                    except Exception as e2:  # noqa: BLE001
+                                        logger.warning(
+                                            "post-calibration: home() also raised %s: %s",
+                                            type(e2).__name__, e2,
+                                        )
                 else:
                     logger.info(
                         "post-calibration: no reachable view-board pose "
@@ -844,13 +873,42 @@ def _calibration_thread() -> None:
                         )
                     else:
                         _post_status("Calibrated, view pose unreachable, homing")
+                        # Pre-flight check on the home() recovery move.
+                        home_safe = True
                         try:
-                            raw_client.home(wait=True, timeout=30.0)
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning(
-                                "post-calibration: home() raised %s: %s",
-                                type(e).__name__, e,
+                            from .collision import (  # noqa: PLC0415
+                                validate_joint_trajectory,
                             )
+                            from parol6.config import (  # noqa: PLC0415
+                                HOME_ANGLES_DEG,
+                            )
+                            from waldo_commander.state import (  # noqa: PLC0415
+                                robot_state as _rs,
+                            )
+                            current_q_deg = list(_rs.angles.deg[:6])
+                            check = validate_joint_trajectory(
+                                current_q_deg, list(HOME_ANGLES_DEG),
+                            )
+                            if not check.get("safe", True):
+                                home_safe = False
+                                _post_status(
+                                    f"Calibrated, view pose unreachable; home() "
+                                    f"skipped, would collide "
+                                    f"({check.get('reason', 'collision')})."
+                                )
+                        except Exception as e_check:  # noqa: BLE001
+                            logger.debug(
+                                "post-cal home() pre-check skipped: %s",
+                                e_check,
+                            )
+                        if home_safe:
+                            try:
+                                raw_client.home(wait=True, timeout=30.0)
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(
+                                    "post-calibration: home() raised %s: %s",
+                                    type(e).__name__, e,
+                                )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "post-calibration view pose failed (%s: %s) — "

@@ -153,6 +153,122 @@ class StepIO:
 _STEPPABLE_TOOL_METHODS = frozenset({"set_position", "open", "close", "calibrate"})
 
 
+# Methods whose joint-space target we can extract without running IK.
+# move_l / move_p use Cartesian targets; the subprocess doesn't have a
+# parol6 IK accessor wired up here, so we skip them. Most user programs
+# use move_j; the FCL pre-flight is best-effort, not a substitute for
+# the controller-side soft-stop / current-limit safeties.
+_PREFLIGHT_CHECKABLE_METHODS = frozenset({"move_j", "home"})
+
+
+class CollisionPreFlightError(RuntimeError):
+    """Raised by the program runner's pre-flight check when a script's
+    move would clip a static obstacle (floor, gripper-vs-arm, etc.).
+
+    The exception unwinds through the user's script naturally and the
+    GUI's `_monitor_script_completion` reset path streams the message
+    to the program log. Users can override by flipping the
+    "Mesh collision check" toggle off in the bottom-right Settings tab.
+    """
+
+
+def _maybe_check_collision(
+    method_name: str,
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    wrapped_client: Any,
+) -> None:
+    """Pre-flight gripper-vs-environment collision check for a single
+    motion call inside the program-runner subprocess.
+
+    The check is gripper-only (skips arm-vs-arm self-collision; IK has
+    already constrained the joints to a non-self-intersecting config).
+    Master gate is the ``WALDO_MESH_COLLISION_ENABLED`` env var, set by
+    ``script_runner.py`` at subprocess launch from the GUI's storage.
+
+    No-ops cleanly when:
+
+    * The master toggle is off.
+    * ``method_name`` isn't one of move_j / home (move_l / move_p need
+      IK we don't run here).
+    * parol6-vision isn't importable (collision_core unavailable).
+    * The active tool's mesh dir can't be located.
+
+    Raises :class:`CollisionPreFlightError` on a real collision so the
+    user's script aborts with a visible traceback.
+    """
+    if os.environ.get("WALDO_MESH_COLLISION_ENABLED", "1") != "1":
+        return
+    if method_name not in _PREFLIGHT_CHECKABLE_METHODS:
+        return
+
+    try:
+        from parol6_vision.calibration.collision_core import (  # noqa: PLC0415
+            CollisionEnvironmentConfig,
+            parol6_mesh_dir,
+            resolve_tool_meshes_from_registry,
+            validate_joint_trajectory_core,
+        )
+    except ImportError:
+        return
+
+    mesh_dir = parol6_mesh_dir()
+    if mesh_dir is None:
+        return
+
+    if method_name == "move_j":
+        target = kwargs.get("angles")
+        if target is None and args:
+            target = args[0]
+        if target is None:
+            return
+        try:
+            target_q_deg = list(target)
+        except TypeError:
+            return
+    else:
+        try:
+            from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
+        except ImportError:
+            return
+        target_q_deg = list(HOME_ANGLES_DEG)
+
+    try:
+        current = wrapped_client.angles()
+        if current is None:
+            return
+        current_q_deg = list(current)[:6]
+    except Exception:  # noqa: BLE001
+        return
+
+    try:
+        tool_key = getattr(wrapped_client.tool, "key", None) or "NONE"
+    except Exception:  # noqa: BLE001
+        tool_key = "NONE"
+    tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
+
+    config = CollisionEnvironmentConfig(
+        gripper_only=True,
+        tool_key=tool_key,
+        body_mesh_paths=tuple(tool_meshes["BODY"]),
+        jaw_mesh_paths=tuple(tool_meshes["JAW"]),
+        tablet_T_board2base=None,
+        tablet_dimensions_m=None,
+        floor_enabled=True,
+        safety_margin_m=0.008,
+    )
+    result = validate_joint_trajectory_core(
+        current_q_deg, target_q_deg, config=config,
+    )
+    if not result.get("safe", True):
+        reason = result.get("reason", "collision")
+        raise CollisionPreFlightError(
+            f"{method_name}() pre-flight aborted, would collide "
+            f"({reason}). q_from={current_q_deg}, q_to={target_q_deg}. "
+            f"Flip 'Mesh collision check' off in Settings to override."
+        )
+
+
 class _SteppingToolProxy:
     """Proxy that wraps a sync tool's action methods with stepping behavior."""
 
@@ -282,6 +398,12 @@ class SteppingClientWrapper:
                 self._step_io.increment_step_count()
 
             self._step_io.emit_event("start", name)
+
+            # Pre-flight gripper-vs-environment collision check. Raises
+            # CollisionPreFlightError on a real collision, which unwinds
+            # through the user's script. No-op when the master toggle is
+            # off or when the method isn't a checkable joint-space move.
+            _maybe_check_collision(name, args, kwargs, self._wrapped)
 
             # Call the actual method
             result = method(*args, **kwargs)
