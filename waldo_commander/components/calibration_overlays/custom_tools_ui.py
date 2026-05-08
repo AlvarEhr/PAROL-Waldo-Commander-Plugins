@@ -133,19 +133,21 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                     ui.notify("Upload a body STL first", color="warning")
                     return
                 # Bake first — registry mutation should be in place before
-                # the controller asks for this tool's mesh path.
+                # the local apply queries meshes.
                 custom_tools.register_one(cfg)
-                ok = await custom_tools.select_as_active(cfg.name)
+                ok = await custom_tools.select_as_active(
+                    cfg.name, proxy_tool_key=str(cfg.proxy_tool_key or ""),
+                )
                 if ok:
-                    ui.notify(
-                        f"Switched active tool to custom:{cfg.name}",
-                        color="positive",
-                    )
+                    msg = f"Switched active tool to custom:{cfg.name}"
+                    if cfg.proxy_tool_key:
+                        msg += f" (controller proxied to {cfg.proxy_tool_key})"
+                    ui.notify(msg, color="positive")
                     refresh()
                 else:
                     ui.notify(
-                        f"Could not switch tools — controller may be "
-                        f"disconnected. Use the gripper panel manually.",
+                        f"Local apply failed for custom:{cfg.name} — "
+                        f"check the logs for details.",
                         color="warning",
                     )
 
@@ -403,6 +405,33 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
             ui.button(
                 "Snap mount hole", on_click=_snap_hole,
             ).props("size=sm outline")
+
+        # ----- Controller proxy -----
+        ui.separator().classes("q-my-sm")
+        ui.label(
+            "Controller proxy (motor commands)",
+        ).classes("text-xs opacity-70")
+        ui.label(
+            "Custom tools live only in the GUI — the controller doesn't "
+            "know about them. Pick a built-in tool that the controller "
+            "should act as for jaw motion / motor control. Leave empty "
+            "for visualisation-only.",
+        ).classes("text-xs opacity-60")
+        proxy_options: dict[str, str] = {"": "(none — visualisation only)"}
+        for key, display in custom_tools.list_registered_tools():
+            if key.startswith("custom:"):
+                continue  # avoid proxying through other custom tools
+            proxy_options[key] = f"{display}  ({key})"
+        proxy_select = ui.select(
+            options=proxy_options,
+            value=str(cfg.proxy_tool_key or ""),
+            label="Proxy tool",
+        ).props("dense").classes("w-64")
+
+        def _on_proxy_change(_e: Any = None) -> None:
+            cfg.proxy_tool_key = str(proxy_select.value or "")
+            _save_and_rebake()
+        proxy_select.on("update:model-value", _on_proxy_change)
 
         # ----- TCP transform -----
         ui.separator().classes("q-my-sm")

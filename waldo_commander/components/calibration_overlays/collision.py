@@ -66,37 +66,43 @@ def _build_collision_manager(
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for %s: %s", path, e)
             return None
-    # Merged gripper body (camera bracket fused in via the hijack).
-    grip_path = mesh_dir / "ssg48_body_realsense.stl"
-    if grip_path.exists():
+    # Active gripper body + jaws — sourced from whatever tool is currently
+    # selected in the parol6 registry (built-ins like SSG-48, MSG, or any
+    # ``custom:<name>`` registered by the custom-tools system). No
+    # hardcoded filenames — switching to a new gripper picks up its
+    # meshes automatically. Cache-bust ``?v=<mtime>`` suffixes that the
+    # legacy SSG-48 hijack added for browser invalidation are stripped
+    # before opening the file.
+    jaw_loaded: list[str] = []
+    active_tool_key, tool_meshes_by_role = _resolve_active_tool_meshes(mesh_dir)
+    body_mesh_files = tool_meshes_by_role.get("BODY", ())
+    jaw_mesh_files = tool_meshes_by_role.get("JAW", ())
+
+    for body_path in body_mesh_files:
+        if not body_path.exists():
+            logger.info(
+                "collision: gripper body STL missing at %s; "
+                "body collision skipped", body_path,
+            )
+            continue
         try:
-            grip_mesh = trimesh.load(grip_path, force="mesh")
+            grip_mesh = trimesh.load(body_path, force="mesh")
             mgr.add_object("gripper", grip_mesh, transform=np.eye(4))
             meshes["gripper"] = grip_mesh
         except Exception as e:  # noqa: BLE001
             logger.warning("collision mesh load failed for gripper: %s", e)
-    # Gripper FINGERS — loaded as separate collision objects because they
-    # extend ~50 mm beyond the body in flange -Z and are the part that
-    # actually clips into the workspace tablet/floor at low-elevation
-    # poses. Without them the collision check passes the body cleanly
-    # but the fingertips drag through the tablet surface — exactly the
-    # symptom the user reported. SSG-48 has two interchangeable jaw
-    # variants ("finger" or "pinch"); only one is physically mounted at
-    # a time, so we load only the configured tool_jaw_variant.
-    jaw_variant = str(settings.tool_jaw_variant)
-    jaw_loaded: list[str] = []
-    for side in ("left", "right"):
-        jaw_name = f"ssg48_{jaw_variant}_{side}"
-        jaw_path = mesh_dir / f"{jaw_name}_simplified.stl"
-        if not jaw_path.exists():
-            jaw_path = mesh_dir / f"{jaw_name}.stl"
+        # Only load the FIRST body mesh — there's typically just one,
+        # and the collision manager keys by name ("gripper").
+        break
+
+    for idx, jaw_path in enumerate(jaw_mesh_files):
         if not jaw_path.exists():
             logger.warning(
-                "collision mesh: %s STL not found in %s — fingertips will "
-                "NOT be collision-checked, low-elevation poses may clip "
-                "the workspace.", jaw_name, mesh_dir,
+                "collision: jaw mesh missing at %s — fingertip collision "
+                "not active for this jaw", jaw_path,
             )
             continue
+        jaw_name = f"jaw_{idx}"
         try:
             jaw_mesh = trimesh.load(jaw_path, force="mesh")
             mgr.add_object(jaw_name, jaw_mesh, transform=np.eye(4))
@@ -183,16 +189,16 @@ def _build_collision_manager(
         ("L3", "L4"), ("L4", "L5"), ("L5", "L6"),
         ("L6", "gripper"),
     }
-    # The fingers are rigidly attached to the gripper body (we move them
-    # with the same transform as the body). Whitelist body↔jaw and
-    # jaw↔jaw contacts so the (always-overlapping at the base) finger
-    # roots don't fire false self-collision rejections.
+    # Jaws are rigidly attached to the gripper body (we move them with
+    # the same flange transform). Whitelist body↔jaw and every jaw-pair
+    # so the always-overlapping-at-the-base roots don't fire false
+    # self-collision rejections. Generic across any jaw count — cooperates
+    # with custom tools that ship more than 2 jaws (rare but possible).
     for jaw in jaw_loaded:
-        adjacent |= {
-            ("L6", jaw), ("gripper", jaw),
-        }
-    if len(jaw_loaded) == 2:
-        adjacent |= {(jaw_loaded[0], jaw_loaded[1])}
+        adjacent |= {("L6", jaw), ("gripper", jaw)}
+    for i in range(len(jaw_loaded)):
+        for j in range(i + 1, len(jaw_loaded)):
+            adjacent |= {(jaw_loaded[i], jaw_loaded[j])}
     # The robot base sits at z=0 by definition, so base_link / FLOOR "collide"
     # at the contact patch. The tablet sits ON the floor too (back of tablet
     # box clips the floor box).
@@ -218,19 +224,70 @@ def _build_collision_manager(
     # Add reverse pairs for symmetric lookup.
     adjacent |= {(b, a) for a, b in adjacent}
     jaws_str = (
-        f" + {len(jaw_loaded)} jaws ({jaw_variant})" if jaw_loaded else ""
+        f" + {len(jaw_loaded)} jaws" if jaw_loaded else ""
     )
     logger.info(
-        "self-collision manager loaded: 7 links + gripper%s%s%s",
-        jaws_str,
+        "self-collision manager loaded for %s: 7 links + gripper%s%s%s",
+        active_tool_key, jaws_str,
         " + FLOOR" if floor_added else "",
         " + TABLET" if tablet_added else "",
     )
     # Stash the loaded jaw names on the manager so _self_collides can
     # apply the gripper transform to them too.
     mgr._loaded_jaw_names = list(jaw_loaded)  # type: ignore[attr-defined]
+    # Stash the tool key the cache was built for so callers can detect
+    # tool changes and invalidate the manager appropriately.
+    mgr._built_for_tool_key = active_tool_key  # type: ignore[attr-defined]
 
     return mgr, adjacent, meshes
+
+
+def _resolve_active_tool_meshes(
+    mesh_dir: Any,
+) -> tuple[str, dict[str, list[Any]]]:
+    """Look up the currently-active tool's mesh files from parol6's
+    ``_TOOL_REGISTRY``, grouped by role. Returns ``(tool_key,
+    {"BODY": [Path, ...], "JAW": [Path, ...]})``.
+
+    The active tool is sourced from ``robot_state.tool_key`` (the
+    controller's broadcast value) when populated, otherwise falls back
+    to ``"NONE"`` (which has no meshes and produces an empty result —
+    the collision manager builds with arm links only).
+
+    URL cache-bust suffixes (``?v=<mtime>``) on filenames are stripped
+    before resolving the filesystem path — they're valid as Three.js
+    URLs but invalid as ``open()`` arguments.
+    """
+    try:
+        from parol6 import tools as parol6_tools  # noqa: PLC0415
+        from waldo_commander.state import robot_state  # noqa: PLC0415
+    except Exception as e:  # noqa: BLE001
+        logger.debug("collision: tool/state lookup unavailable: %s", e)
+        return ("NONE", {"BODY": [], "JAW": []})
+
+    tool_key = getattr(robot_state, "tool_key", None) or "NONE"
+    cfg = parol6_tools._TOOL_REGISTRY.get(tool_key)
+    if cfg is None:
+        logger.debug(
+            "collision: tool key %r not in registry; collision built "
+            "with arm links only", tool_key,
+        )
+        return (tool_key, {"BODY": [], "JAW": []})
+
+    body_paths: list[Any] = []
+    jaw_paths: list[Any] = []
+    for spec in getattr(cfg, "meshes", ()):
+        # Strip the cache-bust suffix the legacy SSG-48 hijack added.
+        plain = str(spec.file).split("?", 1)[0]
+        path = mesh_dir / plain
+        # MeshRole is an enum; compare via .name to stay forward-
+        # compatible if parol6 introduces new roles.
+        role_name = getattr(getattr(spec, "role", None), "name", "")
+        if role_name == "BODY":
+            body_paths.append(path)
+        elif role_name == "JAW":
+            jaw_paths.append(path)
+    return (tool_key, {"BODY": body_paths, "JAW": jaw_paths})
 
 
 def _self_collides(
@@ -344,6 +401,27 @@ def validate_joint_trajectory(
         q_to_arr = np.deg2rad(q_to_arr)
 
     pair = _state.get("trajectory_collision_mgr_pair")
+    if pair is not None:
+        # Drop the cache when the active tool has changed since the
+        # manager was built — its loaded gripper / jaw meshes correspond
+        # to a different tool and would falsely accept collisions for
+        # the new gripper.
+        try:
+            from waldo_commander.state import robot_state as _rs  # noqa: PLC0415
+
+            cached_key = getattr(pair[0], "_built_for_tool_key", None)
+            current_key = getattr(_rs, "tool_key", None)
+            if cached_key is not None and cached_key != current_key:
+                logger.info(
+                    "collision: tool change %s -> %s; rebuilding manager",
+                    cached_key, current_key,
+                )
+                pair = None
+                _state["trajectory_collision_mgr_pair"] = None
+        except Exception:  # noqa: BLE001
+            # If state lookup fails, keep the cached manager — better
+            # to use the old one than to fail open.
+            pass
     if pair is None:
         # Include the tablet primitive at the current _T_BOARD2BASE so any
         # move that would clip the physical ChArUco display gets caught.

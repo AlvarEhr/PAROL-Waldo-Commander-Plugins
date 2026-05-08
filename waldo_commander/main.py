@@ -128,6 +128,18 @@ def _update_connection_notification() -> None:
         _connection_notification = None
 
 
+def _calibration_enabled() -> bool:
+    """Return True when the parol6-vision calibration features are
+    opted-in via the ``WALDO_CALIBRATION_ENABLED`` env var (set to "1").
+
+    Default OFF: no scene overlays, no panel tab, no STL bakes, no
+    timers — the calibration_overlays package is not even imported.
+    Users who want the feature set ``WALDO_CALIBRATION_ENABLED=1`` in
+    their launch environment.
+    """
+    return os.environ.get("WALDO_CALIBRATION_ENABLED", "0") == "1"
+
+
 # --------------- URDF Scene Functions ---------------
 async def initialize_urdf_scene() -> None:
     """Initialize the URDF scene with error handling."""
@@ -137,48 +149,43 @@ async def initialize_urdf_scene() -> None:
 
     # parol6-vision: hijack the SSG-48 BODY mesh to embed the user's merged
     # camera-bracket STL. Pass the active_robot so its tools collection
-    # The legacy SSG-48 hijack is intentionally NOT called here anymore.
-    # It mutated the built-in SSG-48 entry to point at one user's merged
-    # camera-bracket STL, which is correct for that user but wrong for
-    # everyone else. The first-run migration below converts the same
-    # historical setup into a regular custom tool (custom:ssg48_realsense)
-    # while leaving the SSG-48 entry as Jepson's stock body.
-
-    # Phase 1B + 1C: register every user-defined tool from
-    # ~/.waldo-commander/custom_tools/. Each one bakes its STL with the
-    # configured placement transform into parol6's mesh dir, then adds a
-    # ``custom:<name>`` entry to ``parol6.tools._TOOL_REGISTRY``. Must
-    # run before UrdfScene reads tool meshes.
-    try:
-        from waldo_commander.components.calibration_overlays import (
-            custom_tools as _calib_custom_tools,
-        )
-
-        # One-shot migration of the legacy SSG-48 + camera-bracket setup
-        # into a regular custom tool. No-op when the user doesn't have
-        # the merged STL (most users) or when the migration has already
-        # run once. Goes BEFORE register_all so the new tool gets
-        # registered along with everything else in the same pass.
+    # parol6-vision calibration features — opt-in via the
+    # ``WALDO_CALIBRATION_ENABLED`` env var (set to "1" to enable). When
+    # disabled (the default), this whole block is skipped: no imports of
+    # the calibration_overlays package, no STL bakes, no scene mutations,
+    # no per-tick timers, and the calibration tab is omitted from the
+    # left strip below. The result is zero runtime overhead for users
+    # who don't need the feature, which matters on lower-spec hardware.
+    if _calibration_enabled():
         try:
-            _calib_custom_tools.auto_migrate_ssg48_with_bracket()
-        except Exception as _ie:  # noqa: BLE001
-            logger.warning("ssg48 auto-migration failed: %s", _ie)
+            from waldo_commander.components.calibration_overlays import (
+                custom_tools as _calib_custom_tools,
+            )
 
-        _registered = _calib_custom_tools.register_all()
-        if _registered:
-            # Rebuild the active_robot's _tools so the freshly-registered
-            # entries are visible to the gripper dropdown.
+            # One-shot migration of the legacy SSG-48 + camera-bracket
+            # setup into a regular custom tool. No-op when the user
+            # doesn't have the merged STL (most users) or when the
+            # migration has already run once.
             try:
-                from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
-
-                robot._tools = _parol6_build_tools()  # type: ignore[attr-defined]
+                _calib_custom_tools.auto_migrate_ssg48_with_bracket()
             except Exception as _ie:  # noqa: BLE001
-                logger.debug(
-                    "custom_tools: active_robot._tools refresh failed: %s",
-                    _ie,
-                )
-    except Exception as _e:  # noqa: BLE001
-        logger.warning("custom_tools registration failed: %s", _e)
+                logger.warning("ssg48 auto-migration failed: %s", _ie)
+
+            _registered = _calib_custom_tools.register_all()
+            if _registered:
+                # Rebuild the active_robot's _tools so the freshly-
+                # registered entries are visible to the gripper dropdown.
+                try:
+                    from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
+
+                    robot._tools = _parol6_build_tools()  # type: ignore[attr-defined]
+                except Exception as _ie:  # noqa: BLE001
+                    logger.debug(
+                        "custom_tools: active_robot._tools refresh failed: %s",
+                        _ie,
+                    )
+        except Exception as _e:  # noqa: BLE001
+            logger.warning("custom_tools registration failed: %s", _e)
 
     # Detect theme and set appropriate colors
     is_dark = is_dark_theme()
@@ -268,16 +275,17 @@ async def initialize_urdf_scene() -> None:
 
     # parol6-vision: hand-eye calibration overlays + scene-driven timers.
     # The control panel is built later as the "Calibration" side-tab —
-    # see ``_build_left_panels``. Safe to call even if parol6-vision isn't
-    # installed — function is a no-op when imports fail.
-    try:
-        from waldo_commander.components.calibration_overlays import (
-            add_overlays as _calib_add_overlays,
-        )
+    # see ``_build_left_panels``. Gated on ``WALDO_CALIBRATION_ENABLED``
+    # so disabled installs incur no overhead.
+    if _calibration_enabled():
+        try:
+            from waldo_commander.components.calibration_overlays import (
+                add_overlays as _calib_add_overlays,
+            )
 
-        _calib_add_overlays(ui_state.urdf_scene)
-    except Exception as e:  # noqa: BLE001
-        logger.warning("calibration overlays failed: %s", e)
+            _calib_add_overlays(ui_state.urdf_scene)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("calibration overlays failed: %s", e)
 
     # Cache joint names for mapping
     ui_state.urdf_joint_names = list(ui_state.urdf_scene.get_joint_names())
@@ -547,11 +555,13 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
         gripper_tab.mark("tab-gripper")
         ui_state._gripper_tab = gripper_tab
         # parol6-vision calibration — Run / Localise / STOP + view-overlay
-        # toggles. Tab is disabled when parol6-vision isn't importable.
-        calibration_tab = ui.tab(
-            name="calibration", label="", icon="precision_manufacturing",
-        )
-        calibration_tab.mark("tab-calibration")
+        # toggles. Tab only exists when WALDO_CALIBRATION_ENABLED=1 so
+        # disabled installs see the same left strip as upstream.
+        if _calibration_enabled():
+            calibration_tab = ui.tab(
+                name="calibration", label="", icon="precision_manufacturing",
+            )
+            calibration_tab.mark("tab-calibration")
 
     # ---- Top panels container ----
     with (
@@ -647,27 +657,29 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
             ui_state._build_gripper_content = _build_gripper_content
 
         # parol6-vision calibration tab — Run / Localise / STOP + view
-        # overlays. Imports lazily so a missing parol6-vision install
-        # doesn't break the rest of the page.
-        with ui.tab_panel("calibration").classes(
-            "gap-2 overlay-card overflow-hidden"
-        ):
-            try:
-                from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
-                    build_calibration_panel_content as _calib_build_panel,
-                )
-                _calib_build_panel(close_callback=close_top_panels)
-            except Exception as e:  # noqa: BLE001
-                logger.warning("calibration panel build failed: %s", e)
-                with ui.row().classes("w-full items-center"):
-                    ui.label("Calibration").classes("text-lg font-medium")
-                    ui.space()
-                    ui.button(icon="close", on_click=close_top_panels).props(
-                        "flat round dense color=white"
+        # overlays. Tab panel only registered when the feature is opted
+        # in via ``WALDO_CALIBRATION_ENABLED`` (matching the tab-strip
+        # gate above).
+        if _calibration_enabled():
+            with ui.tab_panel("calibration").classes(
+                "gap-2 overlay-card overflow-hidden"
+            ):
+                try:
+                    from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
+                        build_calibration_panel_content as _calib_build_panel,
                     )
-                ui.label(
-                    "parol6-vision is not installed in this environment.",
-                ).classes("text-xs opacity-80")
+                    _calib_build_panel(close_callback=close_top_panels)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning("calibration panel build failed: %s", e)
+                    with ui.row().classes("w-full items-center"):
+                        ui.label("Calibration").classes("text-lg font-medium")
+                        ui.space()
+                        ui.button(icon="close", on_click=close_top_panels).props(
+                            "flat round dense color=white"
+                        )
+                    ui.label(
+                        "parol6-vision is not installed in this environment.",
+                    ).classes("text-xs opacity-80")
 
         def update_top_layout(e=None):
             new_tab = e.args if e and e.args else side_tabs.value or ""

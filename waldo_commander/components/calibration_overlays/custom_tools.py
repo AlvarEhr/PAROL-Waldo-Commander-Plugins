@@ -106,6 +106,14 @@ class CustomToolConfig:
     jaw_travel_m: float = 0.0
     jaw_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
     jaw_symmetric: bool = True
+    # Optional: when this custom tool is selected, also tell the
+    # CONTROLLER to act as ``proxy_tool_key`` (a built-in tool key like
+    # ``"SSG-48"``). Custom tools live only in the GUI process — the
+    # parol6-server doesn't know about them — so the visualisation +
+    # IK can use a custom mesh while motor control stays driven by a
+    # known built-in. Empty string / None means "no controller-side
+    # change; visualisation only".
+    proxy_tool_key: str = ""
     has_jaws: bool = False  # True when jaw_left.stl + jaw_right.stl exist
     has_body: bool = False  # True when body.stl exists
 
@@ -142,6 +150,7 @@ class CustomToolConfig:
             "jaw_travel_m": float(self.jaw_travel_m),
             "jaw_axis": list(self.jaw_axis),
             "jaw_symmetric": bool(self.jaw_symmetric),
+            "proxy_tool_key": str(self.proxy_tool_key or ""),
         }
         return json.dumps(payload, indent=2, sort_keys=True)
 
@@ -181,6 +190,7 @@ def load_config(name: str) -> CustomToolConfig | None:
         jaw_travel_m=float(raw.get("jaw_travel_m", 0.0)),
         jaw_axis=_coerce_tuple3(raw.get("jaw_axis"), (0.0, 1.0, 0.0)),
         jaw_symmetric=bool(raw.get("jaw_symmetric", True)),
+        proxy_tool_key=str(raw.get("proxy_tool_key") or ""),
     )
     cfg.has_body = (folder / BODY_STL_NAME).exists()
     cfg.has_jaws = (
@@ -818,6 +828,10 @@ def auto_migrate_ssg48_with_bracket() -> bool:
         jaw_travel_m=0.024,
         jaw_axis=(0.0, 1.0, 0.0),
         jaw_symmetric=True,
+        # The CONTROLLER doesn't know about ``custom:`` keys — proxy
+        # motor commands through the built-in SSG-48 entry so jaw
+        # motion / current ranges still work on hardware.
+        proxy_tool_key="SSG-48",
     )
     save_config(cfg)
     cfg.has_body = cfg.body_path.exists()
@@ -1027,6 +1041,10 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
         jaw_travel_m=jaw_travel_m,
         jaw_axis=jaw_axis,
         jaw_symmetric=jaw_symmetric,
+        # Proxy motor commands through the source built-in tool —
+        # the controller knows that key, our ``custom:`` key it
+        # doesn't.
+        proxy_tool_key=str(source_key),
     )
     save_config(cfg)
     # Refresh the derived flags now that body / jaws exist on disk.
@@ -1039,41 +1057,88 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
     return cfg
 
 
-async def select_as_active(name: str) -> bool:
-    """Send a ``select_tool`` to the controller so ``custom:<name>``
-    becomes the live active tool. Returns True on success.
+async def select_as_active(name: str, proxy_tool_key: str = "") -> bool:
+    """Make ``custom:<name>`` the actively-used tool.
 
-    Requires a running parol6-server connection — fails cleanly when the
-    controller isn't reachable. Mirrors what the gripper-panel dropdown
-    does when the user picks a tool there, so the behaviour is identical
-    after this call returns.
+    Custom tools live only in the GUI process — the parol6-server has
+    no awareness of them, so ``client.select_tool("custom:<name>")``
+    raises with "Unknown tool". The architecturally-correct answer is
+    to treat custom tools as a CLIENT-SIDE concept (visualisation +
+    IK) and decouple the controller's tool selection from the visual.
+
+    What this does:
+
+    1. Always: local apply on the GUI side — ``active_robot.set_active_tool``
+       (so FK/IK uses the custom TCP) plus ``urdf_scene.apply_tool`` (so
+       the 3D scene shows the custom meshes). These read from the
+       in-process ``_TOOL_REGISTRY`` and the custom key is fine there.
+    2. Optional: when ``proxy_tool_key`` is non-empty, also send
+       ``client.select_tool(proxy_tool_key)`` so the CONTROLLER acts as
+       that built-in tool — required for jaw motion / motor commands.
+       For the SSG-48 + bracket migration, ``proxy_tool_key="SSG-48"``
+       so jaws still drive on hardware.
+
+    Returns True iff the local apply succeeded; the proxy call is
+    best-effort and its failure is reported as a warning, not an error.
     """
     full_key = f"custom:{name}"
     try:
         from waldo_commander.state import ui_state  # noqa: PLC0415
     except Exception:  # noqa: BLE001
         return False
-    panel = getattr(ui_state, "control_panel", None)
-    client = getattr(panel, "client", None) if panel else None
-    if client is None:
-        logger.warning("custom_tools: no client; can't select %s", full_key)
-        return False
-    try:
-        await client.select_tool(full_key, variant_key="")
-    except Exception as e:  # noqa: BLE001
-        logger.warning("custom_tools: select_tool(%s) failed: %s", full_key, e)
-        return False
-    # Apply locally too (active_robot + scene). The select_tool RPC
-    # eventually triggers the broadcast that flips robot_state.tool_key,
-    # but applying immediately keeps the UI feeling responsive.
+
+    # ---- LOCAL APPLY (always) ------------------------------------------
+    local_ok = False
     try:
         ui_state.active_robot.set_active_tool(full_key, variant_key=None)
+        local_ok = True
     except Exception as e:  # noqa: BLE001
-        logger.debug("custom_tools: set_active_tool local apply failed: %s", e)
+        logger.warning(
+            "custom_tools: active_robot.set_active_tool(%s) failed: %s",
+            full_key, e,
+        )
     scene = getattr(ui_state, "urdf_scene", None)
     if scene is not None:
         try:
             scene.apply_tool(full_key, variant_key=None)
         except Exception as e:  # noqa: BLE001
-            logger.debug("custom_tools: scene apply_tool after select failed: %s", e)
-    return True
+            logger.warning(
+                "custom_tools: urdf_scene.apply_tool(%s) failed: %s",
+                full_key, e,
+            )
+
+    # ---- CONTROLLER PROXY (optional) -----------------------------------
+    if proxy_tool_key:
+        # ``ui_state.control_panel`` is a property that raises
+        # RuntimeError when uninitialised — wrap broadly.
+        client = None
+        try:
+            panel = ui_state.control_panel
+            client = getattr(panel, "client", None)
+        except Exception as e:  # noqa: BLE001
+            logger.info(
+                "custom_tools: control_panel unavailable (%s); skipping "
+                "proxy select_tool(%s)",
+                e, proxy_tool_key,
+            )
+        if client is None:
+            logger.info(
+                "custom_tools: no client to send proxy select_tool(%s); "
+                "controller stays at previous tool",
+                proxy_tool_key,
+            )
+        else:
+            try:
+                await client.select_tool(proxy_tool_key, variant_key="")
+                logger.info(
+                    "custom_tools: %s active locally; controller proxied to %s",
+                    full_key, proxy_tool_key,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "custom_tools: proxy select_tool(%s) failed: %s — "
+                    "visualisation/IK fine, motor control unchanged",
+                    proxy_tool_key, e,
+                )
+
+    return local_ok
