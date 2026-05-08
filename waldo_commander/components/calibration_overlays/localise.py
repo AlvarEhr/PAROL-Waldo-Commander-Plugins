@@ -1139,8 +1139,33 @@ def _localise_board_thread() -> None:
                 float(R_detected[2, 2]),
             )
         else:
-            R_to_use = R_detected
             old_R = _T_BOARD2BASE[:3, :3].copy()
+            # Sanity-check the detected rotation against the configured
+            # one before adopting it. solvePnP can converge to a
+            # mirror solution on a planar target with poor conditioning
+            # (low-corner detections at oblique angles); a single bad
+            # convergence would otherwise rotate _T_BOARD2BASE wildly
+            # and poison every subsequent calibration / hover read. We
+            # keep the rotation only when its +Z axis aligns with the
+            # configured one's +Z within ~30 deg; otherwise fall back
+            # to the configured rotation and warn the user.
+            z_align = float(R_detected[:, 2] @ old_R[:, 2])
+            if z_align >= 0.866:  # cos(30 deg)
+                R_to_use = R_detected
+            else:
+                R_to_use = old_R
+                logger.warning(
+                    "localise: detected rotation R[:,2] dot configured "
+                    "R[:,2] = %.3f (< 0.866); detected R is wildly "
+                    "different from configured. Keeping configured "
+                    "rotation; check the physical board orientation.",
+                    z_align,
+                )
+                _post_status(
+                    "Localise WARNING: detected board orientation "
+                    "doesn't match configured; keeping configured "
+                    "rotation. Translation update applied."
+                )
 
         # Build the new full 4x4 transform first, then assign atomically. The
         # previous in-memory rotation/translation are snapshotted for the

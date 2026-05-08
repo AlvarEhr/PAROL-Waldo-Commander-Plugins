@@ -76,8 +76,8 @@ def _on_setting_change(key: str, value: Any) -> None:
             ratio = ml / sl
             if ratio < 0.4 or ratio > 0.85:
                 ui.notify(
-                    f"Marker/square ratio {ratio:.2f} outside the recommended "
-                    f"0.40-0.85 range — detection accuracy may suffer.",
+                    f"Marker/square ratio {ratio:.2f} outside 0.40-0.85; "
+                    f"detection accuracy may suffer.",
                     color="info", position="top",
                 )
 
@@ -426,8 +426,7 @@ def build_board_section() -> None:
         on_click=_render_charuco_png_dialog,
     ).props("size=sm outline")
     ui.label(
-        "Renders the current geometry at chosen DPI for printing or "
-        "displaying on a tablet.",
+        "Renders the current geometry at chosen DPI for print or tablet display.",
     ).classes("text-xs opacity-60")
 
 
@@ -466,8 +465,7 @@ def build_surface_section() -> None:
         scale=1000.0, fmt="%.1f", step=0.5, min_val=0.0,
     )
     ui.label(
-        "Lower margin = robot can approach closer to surface, "
-        "higher collision risk.",
+        "Lower margin lets the robot approach closer, with higher collision risk.",
     ).classes("text-xs opacity-60")
 
 
@@ -501,9 +499,237 @@ def build_cam_mount_section() -> None:
         fmt="%.2f", step=1.0,
     )
     ui.label(
-        "These are the SEED used for IK warm-starts and the live frustum. "
-        "The calibration recovers the precise mount.",
+        "Seed values for IK warm-starts and the live frustum.",
     ).classes("text-xs opacity-60")
+
+
+# ---------------------------------------------------------------------------
+# Per-tool camera config (active tool override)
+# ---------------------------------------------------------------------------
+
+
+def _per_tool_number_input(
+    tool_key: str,
+    setting_key: str,
+    label: str,
+    *,
+    scale: float = 1.0,
+    fmt: str = "%.3f",
+    step: float = 0.01,
+    cast: Callable[[Any], Any] = float,
+    width: str = "w-32",
+) -> ui.number:
+    """Number input bound to ``app.storage.user[calib_tool_<key>_<setting>]``
+    for ``tool_key``. Initial value: per-tool override if set, otherwise
+    the current global value (from ``settings.get``). Editing
+    auto-writes to per-tool storage."""
+    from . import custom_tools  # noqa: PLC0415
+
+    override = custom_tools.get_per_tool_override(tool_key, setting_key)
+    if override is None:
+        current = float(settings.get(setting_key))
+    else:
+        current = float(override)
+    def _on_change(e: Any = None) -> None:
+        # Read e.value over inp.value so the post-debounce model-value
+        # commit doesn't race against Quasar's underlying updates.
+        # Same pattern the master-toggle / force-show switches use.
+        raw = getattr(e, "value", None)
+        if raw is None:
+            raw = inp.value if inp is not None else current * scale
+        try:
+            display = float(raw if raw is not None else current * scale)
+        except (TypeError, ValueError):
+            return
+        new_storage = cast(display / scale)
+        custom_tools.set_per_tool_override(tool_key, setting_key, new_storage)
+        # Live-apply: rebuild camera mount / redraw frustum so the
+        # running scene picks up the new value. Same dispatcher the
+        # global settings panel uses (intrinsic keys redraw the
+        # frustum, cam_mount keys rebuild the CameraMount + redraw).
+        try:
+            from . import live_apply  # noqa: PLC0415
+
+            live_apply.apply_setting_change(setting_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    inp = (
+        ui.number(
+            label=label, value=current * scale,
+            format=fmt, step=step, on_change=_on_change,
+        )
+        .props("dense debounce=500")
+        .classes(width)
+    )
+    return inp
+
+
+def _per_tool_tuple_input(
+    tool_key: str,
+    setting_key: str,
+    labels: tuple[str, ...],
+    *,
+    scale: float = 1.0,
+    fmt: str = "%.3f",
+    step: float = 0.1,
+    width: str = "w-24",
+) -> list[ui.number]:
+    from . import custom_tools  # noqa: PLC0415
+
+    override = custom_tools.get_per_tool_override(tool_key, setting_key)
+    if override is None:
+        current = settings.get(setting_key)
+    else:
+        current = override
+    inputs: list[ui.number] = []
+
+    def _on_change(_e: Any = None) -> None:
+        # Read every input's current value to build the tuple. Bound
+        # to ``on_change=`` (kwarg) instead of ``.on("update:model-value")``
+        # to avoid the post-debounce read race the switch-handler fix
+        # established as the right pattern.
+        try:
+            new_display = tuple(
+                float(inp.value if inp.value is not None else 0.0)
+                for inp in inputs
+            )
+        except (TypeError, ValueError):
+            return
+        new_storage = tuple(v / scale for v in new_display)
+        custom_tools.set_per_tool_override(tool_key, setting_key, new_storage)
+        # Live-apply: rebuild camera mount / redraw frustum so the
+        # running scene picks up the new value. Sibling function
+        # ``_per_tool_number_input`` covers the per-key dispatch.
+        try:
+            from . import live_apply  # noqa: PLC0415
+
+            live_apply.apply_setting_change(setting_key)
+        except Exception:  # noqa: BLE001
+            pass
+
+    with ui.row().classes("items-center gap-1 q-gutter-x-sm"):
+        for i, label in enumerate(labels):
+            initial = (
+                float(current[i]) * scale
+                if current is not None and i < len(current)
+                else 0.0
+            )
+            inp = (
+                ui.number(
+                    label=label, value=initial,
+                    format=fmt, step=step,
+                    on_change=_on_change,
+                )
+                .props("dense debounce=500")
+                .classes(width)
+            )
+            inputs.append(inp)
+    return inputs
+
+
+def build_per_tool_camera_section() -> None:
+    """Per-tool camera intrinsics + cold-start mount override editor for
+    the GUI's currently-active tool.
+
+    Where: a sub-expansion in the global Calibration settings panel.
+    Why separate from the global Camera intrinsics + Camera mount
+    sections above: those edit GLOBAL DEFAULTS (apply to any tool that
+    doesn't have a per-tool override). This section writes to
+    ``app.storage.user[calib_tool_<tool_key>_<setting>]`` so each
+    camera-bearing tool can carry its own values — when the user
+    switches between tools (Alvar's SSG-48 + bracket vs MSG AI), the
+    intrinsics + mount auto-swap.
+
+    Page-reload required after switching tools to refresh the inputs
+    + the overlays — same pattern as the master switch.
+    """
+    from . import custom_tools  # noqa: PLC0415
+
+    @ui.refreshable
+    def _content() -> None:
+        active = custom_tools._active_gui_tool_key()
+        if not active or active == "NONE":
+            ui.label(
+                "No tool active. Pick one in the gripper panel.",
+            ).classes("text-xs opacity-70")
+            return
+        if not custom_tools.is_camera_bearing(active):
+            ui.label(
+                f"Active tool {active!r} isn't flagged as camera-bearing.",
+            ).classes("text-xs opacity-70")
+            return
+
+        ui.label(f"Active tool: {active}").classes("text-xs opacity-70")
+        has_any = custom_tools.has_per_tool_override(active)
+        ui.label(
+            "Per-tool override active."
+            if has_any
+            else "No per-tool override yet. Editing any field saves one.",
+        ).classes(
+            "text-xs " + ("text-green-7" if has_any else "opacity-60"),
+        )
+
+        ui.separator().classes("q-my-sm")
+        ui.label("Camera intrinsics (px)").classes("text-xs opacity-70")
+        with ui.row().classes("items-center gap-1"):
+            _per_tool_number_input(
+                active, "intr_fx", "fx", fmt="%.1f", step=1.0,
+            )
+            _per_tool_number_input(
+                active, "intr_fy", "fy", fmt="%.1f", step=1.0,
+            )
+        with ui.row().classes("items-center gap-1"):
+            _per_tool_number_input(
+                active, "intr_cx", "cx", fmt="%.1f", step=1.0,
+            )
+            _per_tool_number_input(
+                active, "intr_cy", "cy", fmt="%.1f", step=1.0,
+            )
+        with ui.row().classes("items-center gap-1"):
+            _per_tool_number_input(
+                active, "intr_width", "Width (px)", fmt="%d",
+                step=1, cast=int, width="w-28",
+            )
+            _per_tool_number_input(
+                active, "intr_height", "Height (px)", fmt="%d",
+                step=1, cast=int, width="w-28",
+            )
+
+        ui.separator().classes("q-my-sm")
+        ui.label("Camera mount (cold-start)").classes("text-xs opacity-70")
+        ui.label("Translation (flange frame)").classes(
+            "text-xs opacity-70 q-mt-xs",
+        )
+        _per_tool_tuple_input(
+            active, "cam_mount_translate_mm",
+            ("X (mm)", "Y (mm)", "Z (mm)"),
+            fmt="%.1f", step=0.5,
+        )
+        ui.label("Tilt (XYZ-extrinsic)").classes(
+            "text-xs opacity-70 q-mt-xs",
+        )
+        _per_tool_tuple_input(
+            active, "cam_mount_tilt_deg",
+            ("Rx (deg)", "Ry (deg)", "Rz (deg)"),
+            fmt="%.2f", step=1.0,
+        )
+
+        ui.separator().classes("q-my-sm")
+
+        def _reset_overrides() -> None:
+            custom_tools.clear_per_tool_overrides(active)
+            ui.notify(
+                f"Cleared all per-tool overrides for {active}.",
+                color="info", position="top",
+            )
+            _content.refresh()
+
+        ui.button(
+            "Reset all to globals", on_click=_reset_overrides, icon="restart_alt",
+        ).props("size=sm outline color=warning")
+
+    _content()
 
 
 def build_hemisphere_section() -> None:
@@ -527,6 +753,83 @@ def build_hemisphere_section() -> None:
     ui.separator().classes("q-my-sm")
     ui.label("Hemisphere centre override").classes("text-xs opacity-70")
     _optional_xyz_input("hemi_centre_override_m", "Centre")
+
+
+def build_reachability_section() -> None:
+    """Reachability dot count + size. Live-applied via ``live_apply``:
+    count change re-runs the IK sweep; radius change just re-runs the
+    non-overlap selection at the new size.
+    """
+    ui.label("Sphere radius (mm)").classes("text-xs opacity-70")
+    _number_input(
+        "reachability_dot_radius_m", "Radius",
+        scale=1000.0, fmt="%.1f", step=0.5, min_val=0.5, max_val=20.0,
+    )
+    ui.label("Sweep candidate count").classes("text-xs opacity-70 q-mt-sm")
+    _int_input(
+        "reachability_n_candidates", "Candidates",
+        step=8, min_val=8, max_val=4096,
+    )
+    ui.label(
+        "More candidates means a denser pre-filter pool; the non-overlap "
+        "selector keeps only spread-out dots so the rendered count is "
+        "usually lower.",
+    ).classes("text-xs opacity-60 q-mt-xs")
+
+    # Live count info: total reachable + drawn (non-overlapping) updated
+    # after each sweep / re-render via the callback registered into
+    # ``_state['reachability_info_refresh']``.
+    @ui.refreshable
+    def _info_label() -> None:
+        from .state import _state as _s  # noqa: PLC0415
+
+        all_pts = _s.get("reachable_points_all")
+        candidates_visible = _s.get("reachable_candidates") or []
+        drawn = len(candidates_visible)
+        try:
+            target = int(settings.get("reachability_n_candidates"))
+        except Exception:  # noqa: BLE001
+            target = drawn
+        if all_pts is None:
+            ui.label("Sweep pending...").classes(
+                "text-xs opacity-60 q-mt-xs",
+            )
+            return
+        total = len(all_pts)
+        if total == 0:
+            ui.label(
+                "No reachable poses found. Try lowering the sweep "
+                "elevation range or expanding the workspace.",
+            ).classes("text-xs text-amber-7 q-mt-xs")
+            return
+        # We hit the user's target count. No need to nag about overlap.
+        if drawn >= target:
+            ui.label(
+                f"Drawing {drawn} reachable poses.",
+            ).classes("text-xs opacity-70 q-mt-xs")
+            return
+        # Drew fewer than the target: explain whether the bottleneck
+        # was reachability (not enough valid IK solutions) or overlap
+        # (radius too large to fit the rest without intersecting).
+        if drawn >= total:
+            ui.label(
+                f"Only {total} reachable poses found "
+                f"(target was {target}).",
+            ).classes("text-xs opacity-70 q-mt-xs")
+        else:
+            ui.label(
+                f"Drawing {drawn} non-overlapping of {total} reachable "
+                f"poses. Shrink the sphere radius to see more.",
+            ).classes("text-xs opacity-70 q-mt-xs")
+
+    _info_label()
+    # Register the refresh callback so reachability.py can poke it
+    # after each sweep / re-render. Idempotent: a previous callback
+    # gets replaced. The callback is best-effort, so a stale one
+    # (from an older panel render) won't crash the render path.
+    from .state import _state as _s_module  # noqa: PLC0415
+
+    _s_module["reachability_info_refresh"] = _info_label.refresh
 
 
 def build_localise_section() -> None:
@@ -600,14 +903,8 @@ def build_gripper_section() -> None:
     Phase 1B (custom tool registration / drop-in STL configuration).
     """
     ui.label(
-        "Tool + jaw variant are configured via the bottom-right gripper "
-        "panel in waldo-commander. The active tool's TCP transform "
-        "(used by the Hover-above-board / TCP mode) is queried live "
-        "from the RobotClient.",
+        "Tool and jaw variant are configured via the bottom-right gripper panel.",
     ).classes("text-xs opacity-70")
-    ui.label(
-        "Custom-tool STL ingestion (Phase 1B) will land here.",
-    ).classes("text-xs opacity-60 q-mt-sm")
 
 
 # ---------------------------------------------------------------------------
@@ -622,16 +919,23 @@ def build_calibration_settings_expansion() -> None:
             build_board_section()
         with ui.expansion("Mounting surface", icon="layers").classes("w-full"):
             build_surface_section()
-        with ui.expansion("Camera intrinsics", icon="camera").classes("w-full"):
+        with ui.expansion(
+            "Camera config (active tool override)",
+            icon="precision_manufacturing",
+        ).classes("w-full"):
+            build_per_tool_camera_section()
+        with ui.expansion("Camera intrinsics (global default)", icon="camera").classes("w-full"):
             build_intrinsics_section()
-        with ui.expansion("Camera mount (cold-start)", icon="open_with").classes(
-            "w-full",
-        ):
+        with ui.expansion(
+            "Camera mount (global default)", icon="open_with",
+        ).classes("w-full"):
             build_cam_mount_section()
         with ui.expansion("Hemisphere search", icon="motion_photos_on").classes(
             "w-full",
         ):
             build_hemisphere_section()
+        with ui.expansion("Reachability dots", icon="grain").classes("w-full"):
+            build_reachability_section()
         with ui.expansion("Localise sweep", icon="search").classes("w-full"):
             build_localise_section()
         with ui.expansion("Gripper", icon="precision_manufacturing").classes(

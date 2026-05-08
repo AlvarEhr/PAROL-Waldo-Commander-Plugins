@@ -129,6 +129,16 @@ def _calibration_thread() -> None:
         # treat each remaining pose as a MotionError and the orchestrator
         # gives up cleanly with ``insufficient_samples_pass1``.
         class _HaltableClient:
+            """Thin wrapper that short-circuits motion-bearing calls
+            after the user pressed STOP. Without this, calls like
+            ``home()`` and ``move_l()`` proxy directly through to the
+            underlying client and ignore the stop flag.
+            """
+
+            _MOTION_METHODS: frozenset[str] = frozenset({
+                "move_j", "move_l", "move_p", "home",
+            })
+
             def __init__(self, inner: Any) -> None:
                 self._inner = inner
 
@@ -138,7 +148,14 @@ def _calibration_thread() -> None:
                 return self._inner.move_j(*args, **kwargs)
 
             def __getattr__(self, name: str) -> Any:
-                return getattr(self._inner, name)
+                attr = getattr(self._inner, name)
+                if name in self._MOTION_METHODS and callable(attr):
+                    def _gated(*a: Any, **kw: Any) -> Any:
+                        if _state.get("stop_requested"):
+                            return -1
+                        return attr(*a, **kw)
+                    return _gated
+                return attr
 
         client = _HaltableClient(raw_client)
         # Stash the raw client so the STOP button can call halt() directly.
@@ -253,16 +270,26 @@ def _calibration_thread() -> None:
         FLOOR_Z_MIN_M = 0.005  # 5 mm safety margin above the workbench
         TCP_OFFSET_FLANGE = np.array([0.0, 0.0, -0.105, 1.0])  # SSG-48 TCP point in flange frame
 
-        # Build collision manager + occlusion meshes once (loads 7 link meshes
-        # + gripper for collision; 7 link meshes for occlusion). The tablet
-        # primitive is placed at the current _T_BOARD2BASE so the robot won't
-        # drive into the physical ChArUco display.
+        # Build collision manager + occlusion meshes once (loads 7 link
+        # meshes + gripper for collision; 7 link meshes for occlusion).
+        # The tablet primitive is placed at the current _T_BOARD2BASE
+        # so the robot won't drive into the physical ChArUco display.
+        # Master gate: the bottom-right Settings tab's "Mesh collision
+        # check" toggle (default True) overrides the calibration-only
+        # ``enable_self_collision_check`` setting — when the master is
+        # off, no collision filtering happens during pose generation.
+        from .collision import _mesh_collision_enabled  # noqa: PLC0415
+
+        _collision_active = (
+            bool(settings.enable_self_collision_check)
+            and _mesh_collision_enabled()
+        )
         collision_mgr_pair = (
             _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
-            if bool(settings.enable_self_collision_check) else None
+            if _collision_active else None
         )
         occlusion_meshes = (
-            _build_occlusion_mesh() if bool(settings.enable_self_collision_check) else None
+            _build_occlusion_mesh() if _collision_active else None
         )
 
         class HullFilteredPoseGenerator(PoseGenerator):
@@ -610,14 +637,51 @@ def _calibration_thread() -> None:
         if output.failed:
             _post_status(f"Calibration FAILED: {output.failure_reason}")
         else:
-            gt = ground_truth_mount.T_cam2flange[:3, 3]
-            cal = output.mount.T_cam2flange[:3, 3]
-            pos_err = float(np.linalg.norm(gt - cal)) * 1000.0
-            _post_status(
-                f"DONE ({wall_s:.1f}s, {output.n_samples_collected} samples). "
-                f"Best={output.best_method}, error={pos_err:.2f}mm"
-            )
+            # In sim mode we have a known perturbation as ground truth
+            # so we can report position error directly. Real hardware
+            # has no ground truth; report just the calibrated mount.
+            if is_sim_mode and ground_truth_mount is not None:
+                gt = ground_truth_mount.T_cam2flange[:3, 3]
+                cal = output.mount.T_cam2flange[:3, 3]
+                pos_err = float(np.linalg.norm(gt - cal)) * 1000.0
+                _post_status(
+                    f"DONE ({wall_s:.1f}s, {output.n_samples_collected} "
+                    f"samples). Best={output.best_method}, "
+                    f"error={pos_err:.2f}mm"
+                )
+            else:
+                cal = output.mount.T_cam2flange[:3, 3] * 1000.0
+                _post_status(
+                    f"DONE ({wall_s:.1f}s, {output.n_samples_collected} "
+                    f"samples). Best={output.best_method}, "
+                    f"mount=({cal[0]:.1f}, {cal[1]:.1f}, {cal[2]:.1f}) mm"
+                )
             _state["calibrated_mount"] = output.mount
+
+            # Persist the calibrated mount onto the active custom tool's
+            # config (when applicable). The next time the user activates
+            # this tool, settings.get() reads the calibrated values via
+            # the per-tool override layer — calibration result follows
+            # the gripper instead of being a global one-shot.
+            try:
+                from . import custom_tools as _calib_ct  # noqa: PLC0415
+                from scipy.spatial.transform import Rotation as _SciR  # noqa: PLC0415
+
+                T_cf = output.mount.T_cam2flange
+                translate_mm = tuple(float(v) * 1000.0 for v in T_cf[:3, 3])
+                tilt_deg = tuple(
+                    float(v) for v in _SciR.from_matrix(T_cf[:3, :3])
+                    .as_euler("XYZ", degrees=True)
+                )
+                _calib_ct.update_active_tool_calibrated_mount(
+                    cam_mount_translate_mm=translate_mm,
+                    cam_mount_tilt_deg=tilt_deg,
+                )
+            except Exception as _e:  # noqa: BLE001
+                logger.debug(
+                    "calibrated mount auto-save to custom tool failed: %s",
+                    _e,
+                )
 
             # Post-calibration: drive to a "view board" pose using the
             # freshly-calibrated mount (much more accurate than cold-start).
@@ -706,41 +770,87 @@ def _calibration_thread() -> None:
                         best_info["distance_m"] * 1000,
                         d_min * 1000, d_max * 1000, len(view_cands),
                     )
-                    _post_status("Calibrated — moving to view-board pose")
-                    try:
-                        raw_client.move_j(
-                            angles=list(
-                                np.degrees(best_view.joint_angles_rad).tolist()
-                            ),
-                            speed=0.3, accel=0.5, wait=True, timeout=20.0,
+                    # Honour STOP between calibration end and the view-pose
+                    # move: the user may have hit STOP near the end of the
+                    # last sample's motion; calibration still succeeds but
+                    # the post-cal courtesy move shouldn't fire.
+                    if _state.get("stop_requested"):
+                        _post_status(
+                            "Calibration done; STOP pressed, skipping "
+                            "view-board pose."
                         )
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "post-calibration: view-pose move_j raised "
-                            "%s: %s — going home instead",
-                            type(e).__name__, e,
+                    else:
+                        view_angles_deg = list(
+                            np.degrees(best_view.joint_angles_rad).tolist()
                         )
+                        # Pre-flight self/board/tablet collision check.
+                        # The view-pose generator above used PoseGenerator
+                        # (not the hull-filtered subclass) so candidates
+                        # are NOT collision-screened. Run the same check
+                        # hover and pose-popup use.
+                        view_safe = True
                         try:
-                            raw_client.home(wait=True, timeout=30.0)
-                        except Exception as e2:  # noqa: BLE001
-                            logger.warning(
-                                "post-calibration: home() also raised %s: %s",
-                                type(e2).__name__, e2,
+                            from .collision import (  # noqa: PLC0415
+                                validate_joint_trajectory,
                             )
+                            from waldo_commander.state import (  # noqa: PLC0415
+                                robot_state as _rs,
+                            )
+
+                            current_q_deg = list(_rs.angles.deg[:6])
+                            check = validate_joint_trajectory(
+                                current_q_deg, view_angles_deg,
+                            )
+                            if not check.get("safe", True):
+                                view_safe = False
+                                _post_status(
+                                    f"Calibrated; view-board pose "
+                                    f"skipped, would collide "
+                                    f"({check.get('reason', 'collision')})."
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            logger.debug(
+                                "post-cal collision pre-check skipped: %s", e,
+                            )
+                        if view_safe:
+                            _post_status("Calibrated, moving to view-board pose")
+                            try:
+                                raw_client.move_j(
+                                    angles=view_angles_deg,
+                                    speed=0.3, accel=0.5, wait=True, timeout=20.0,
+                                )
+                            except Exception as e:  # noqa: BLE001
+                                logger.warning(
+                                    "post-calibration: view-pose move_j raised "
+                                    "%s: %s; going home instead",
+                                    type(e).__name__, e,
+                                )
+                                try:
+                                    raw_client.home(wait=True, timeout=30.0)
+                                except Exception as e2:  # noqa: BLE001
+                                    logger.warning(
+                                        "post-calibration: home() also raised %s: %s",
+                                        type(e2).__name__, e2,
+                                    )
                 else:
                     logger.info(
                         "post-calibration: no reachable view-board pose "
                         "(0/%d candidates, d_range=%.0f-%.0f mm), going home",
                         view_params.n_candidates, d_min * 1000, d_max * 1000,
                     )
-                    _post_status("Calibrated — view pose unreachable, homing")
-                    try:
-                        raw_client.home(wait=True, timeout=30.0)
-                    except Exception as e:  # noqa: BLE001
-                        logger.warning(
-                            "post-calibration: home() raised %s: %s",
-                            type(e).__name__, e,
+                    if _state.get("stop_requested"):
+                        _post_status(
+                            "Calibrated; STOP pressed, skipping home()."
                         )
+                    else:
+                        _post_status("Calibrated, view pose unreachable, homing")
+                        try:
+                            raw_client.home(wait=True, timeout=30.0)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning(
+                                "post-calibration: home() raised %s: %s",
+                                type(e).__name__, e,
+                            )
             except Exception as e:  # noqa: BLE001
                 logger.warning(
                     "post-calibration view pose failed (%s: %s) — "

@@ -106,6 +106,20 @@ _CAM_MOUNT_KEYS: frozenset[str] = frozenset({
 })
 
 
+# Settings whose change requires re-running the reachability IK sweep
+# (the candidate count changes the sweep itself).
+_REACHABILITY_RESWEEP_KEYS: frozenset[str] = frozenset({
+    "reachability_n_candidates",
+})
+
+
+# Settings whose change only requires re-rendering the existing
+# reachability dots (no IK sweep, just new sphere geometry).
+_REACHABILITY_RERENDER_KEYS: frozenset[str] = frozenset({
+    "reachability_dot_radius_m",
+})
+
+
 # ---------------------------------------------------------------------------
 # Side-effect runners
 # ---------------------------------------------------------------------------
@@ -185,7 +199,7 @@ def _redraw_frustum() -> None:
 def apply_setting_change(key: str) -> None:
     """Run the side effects associated with ``key`` having just changed.
 
-    Idempotent — calling this twice for the same key is harmless. Order
+    Idempotent: calling this twice for the same key is harmless. Order
     matters: rebuild ``_T_BOARD2BASE`` first, then the camera mount (so
     the frustum redraw uses the new mount), then regenerate the board
     PNG, then drop caches, then refresh overlays (so they pick up the
@@ -197,6 +211,8 @@ def apply_setting_change(key: str) -> None:
     needs_png_regen = key in _BOARD_PNG_KEYS
     needs_frustum_redraw = key in _FRUSTUM_KEYS
     needs_overlay_refresh = needs_t_rebuild or needs_png_regen
+    needs_reachability_resweep = key in _REACHABILITY_RESWEEP_KEYS
+    needs_reachability_rerender = key in _REACHABILITY_RERENDER_KEYS
 
     if needs_t_rebuild:
         try:
@@ -213,3 +229,17 @@ def apply_setting_change(key: str) -> None:
         _drop_collision_cache()
     if needs_overlay_refresh:
         _refresh_overlays()
+    if needs_reachability_resweep:
+        try:
+            from .reachability import refresh_reachability_for_active_tool  # noqa: PLC0415
+
+            refresh_reachability_for_active_tool()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reachability resweep failed: %s", e)
+    if needs_reachability_rerender:
+        try:
+            from .reachability import re_render_reachability_dots  # noqa: PLC0415
+
+            re_render_reachability_dots()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reachability rerender failed: %s", e)

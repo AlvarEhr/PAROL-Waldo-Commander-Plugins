@@ -8,7 +8,7 @@ from collections.abc import Callable
 
 from nicegui import ui
 
-from . import custom_tools_ui, settings, settings_ui
+from . import custom_tools, custom_tools_ui, settings, settings_ui
 from .calibration_thread import _calibration_thread
 from .hover import _drive_hover_pose_thread
 from .localise import _localise_board_thread
@@ -99,45 +99,512 @@ def _persist_overlay_pref(name: str, visible: bool) -> None:
         logger.debug("calibration prefs: persist failed for %s (%s)", name, e)
 
 
+def _features_active() -> bool:
+    """Read the soft-toggle state from ``app.storage.general``. Default OFF.
+
+    Mirrors ``main._calibration_features_active`` but lives in this
+    module so the panel can flip the storage value + render
+    differently without crossing module boundaries.
+    """
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        return bool(app.storage.general.get("calibration_features_active", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _set_features_active(active: bool) -> None:
+    """Persist the soft toggle to ``app.storage.general``."""
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        app.storage.general["calibration_features_active"] = bool(active)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not persist calibration_features_active: %s", e)
+
+
+def _no_camera_override() -> bool:
+    """Per-user override that lets the calibration panel + overlays render
+    even when the active tool isn't camera-bearing. Persisted via
+    ``app.storage.user`` so it survives reloads. Default OFF — without
+    this, the panel hides the calibration scaffolding when no camera
+    tool is selected.
+
+    When ON, a persistent warning banner reminds the user the values
+    they're seeing aren't tied to a real camera.
+    """
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        return bool(app.storage.user.get("calib_no_camera_override", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _set_no_camera_override(value: bool) -> None:
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        app.storage.user["calib_no_camera_override"] = bool(value)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("could not persist calib_no_camera_override: %s", e)
+
+
+def _camera_gate_open() -> bool:
+    """The camera-related calibration UI renders iff the active tool has
+    a camera (built-in MSG, or any custom tool flagged ``has_camera``)
+    OR the per-user override is on.
+    """
+    return custom_tools.active_tool_is_camera_bearing() or _no_camera_override()
+
+
+# ---------------------------------------------------------------------------
+# Live-apply machinery — replaces the previous "reload page to apply" pattern
+# ---------------------------------------------------------------------------
+
+
+def _teardown_overlays() -> None:
+    """Delete every scene group + dynamic-overlay handle. Called on
+    transitions out of the camera-bearing-render state (master toggle
+    flipped off, or active tool became no-camera with no override on).
+
+    Per-tick scene timers (post-cal 4 Hz, footprint 5 Hz) are NOT
+    cancelled here — they self-skip when their preconditions go away
+    (no ``_state['current_mount']``). Storing handles to cancel them
+    would require changes in :mod:`overlays`; the early-exit path is
+    sufficient and matches the existing pattern.
+    """
+    for key in (
+        "frustum_group", "board_group", "tablet_group",
+        "hemisphere_group", "near_cone_group",
+        "hemisphere_wireframe_group", "reachability_group",
+        "detection_overlay_group",
+    ):
+        grp = _state.get(key)
+        if grp is not None:
+            try:
+                grp.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        _state[key] = None
+    # Dynamic objects (frustum lines, footprint polyline, centerline).
+    for objs_key in ("frustum_objects", "footprint_objects"):
+        for obj in _state.get(objs_key, []) or []:
+            try:
+                obj.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        _state[objs_key] = []
+    # Cancel scene timers tracked by add_overlays so they don't keep
+    # firing against a torn-down scene + don't accumulate when the
+    # user toggles features off/on or switches camera-bearing tools.
+    for timer in _state.get("calib_timers", []) or []:
+        try:
+            timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    _state["calib_timers"] = []
+    det_timer = _state.get("detection_overlay_timer")
+    if det_timer is not None:
+        try:
+            det_timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["detection_overlay_timer"] = None
+    # Cached state for the per-tick rebuild detection: clear so a
+    # future rebuild doesn't get short-circuited.
+    _state["footprint_last_q"] = None
+    _state["footprint_last_mount"] = None
+    # Reachability cache: drop the candidate list + cached points so a
+    # stale entry can't be served to the click handler after teardown.
+    _state["reachable_candidates"] = []
+    _state["reachable_points_world"] = None
+    _state["reachable_target_world"] = None
+    # Tear down the click-on-dot popup container + remove the scene
+    # click handler so they don't survive into the next add_overlays
+    # call (which re-creates both fresh).
+    popup_container = _state.get("pose_popup_container")
+    if popup_container is not None:
+        try:
+            popup_container.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["pose_popup_container"] = None
+    old_click_handler = _state.get("dot_click_handler")
+    if old_click_handler is not None:
+        try:
+            from waldo_commander.state import ui_state  # noqa: PLC0415
+
+            scene = getattr(getattr(ui_state, "urdf_scene", None), "scene", None)
+            handlers = getattr(scene, "_click_handlers", None)
+            if isinstance(handlers, list):
+                try:
+                    handlers.remove(old_click_handler)
+                except ValueError:
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+        _state["dot_click_handler"] = None
+    # ``current_mount`` gates the footprint tick; clearing it makes
+    # the tick no-op until rebuilt. ``scene_root`` is left intact:
+    # it's the URDF scene root, used elsewhere.
+    _state["current_mount"] = None
+    _state["overlays_built"] = False
+
+
+def _ensure_features_loaded() -> None:
+    """Idempotent one-shot init: SSG-48 auto-migrate + custom-tool
+    register_all + active_robot tools rebuild. Mirrors what
+    ``main.initialize_urdf_scene`` does when
+    ``calibration_features_active`` is on at page-build time, so a
+    live off→on flip gets the same result as a reload would.
+
+    First flip: ~1–2 s on disk (STL bake for ssg48_realsense + any
+    other custom tools). Subsequent flips: fast (sentinel + cached
+    bakes).
+    """
+    try:
+        custom_tools.auto_migrate_ssg48_with_bracket()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("ssg48 auto-migration failed: %s", e)
+    try:
+        registered = custom_tools.register_all()
+        if registered:
+            try:
+                from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
+                from waldo_commander.state import ui_state  # noqa: PLC0415
+
+                ui_state.active_robot._tools = _parol6_build_tools()  # type: ignore[attr-defined]
+            except Exception as e:  # noqa: BLE001
+                logger.debug("active_robot._tools rebuild failed: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("register_all failed: %s", e)
+
+
+def apply_calibration_state() -> None:
+    """Reconcile the rendered scene + panel UI with the current toggles
+    and active tool. Idempotent.
+
+    Call after any of these changes:
+
+    * ``app.storage.general["calibration_features_active"]`` flipped
+      (the master toggle in the panel header OR the bottom-right
+      Settings tab's Calibration features switch).
+    * Active tool changed (the gripper-panel dropdown OR the
+      "Use this tool" button on a custom-tool card).
+    * ``app.storage.user["calib_no_camera_override"]`` flipped (the
+      Force-show toggle in the no-camera placeholder OR the
+      View overlays expansion).
+
+    Performs the minimum scene mutation needed to bring the rendered
+    overlays + panel state into agreement. Replaces the previous
+    "reload the page to apply" notify pattern.
+
+    Three coarse transitions:
+
+    * ``should_render`` AND not built — heavy: runs auto-migrate +
+      register_all (idempotent) + ``add_overlays``. First off→on
+      may take ~1–2 s on disk for the SSG-48 STL bake; subsequent
+      flips are fast (sentinel + cached bakes).
+    * ``should_render`` AND built — cheap: rebuild ``CameraMount``
+      so per-tool intrinsic / mount overrides take effect, redraw
+      frustum geometry.
+    * Not ``should_render`` AND built — cheap: tear down scene
+      groups, clear dynamic caches.
+
+    The panel UI is always refreshed so its three-state branch picks
+    up the new ``(features_on, gate_open)`` combination.
+    """
+    # Prime the thread-safe per-tool override cache from this request
+    # context so any worker thread spawned downstream (calibration,
+    # localise, hover, reachability) can read the active tool's
+    # values via ``settings.get`` without touching app.storage.user.
+    try:
+        custom_tools.prime_per_tool_overrides_cache()
+    except Exception as e:  # noqa: BLE001
+        logger.debug("apply_calibration_state: cache prime skipped (%s)", e)
+
+    features_on = _features_active()
+    gate_open = _camera_gate_open()
+    overlays_built = bool(_state.get("overlays_built", False))
+    should_render = features_on and gate_open
+
+    try:
+        from waldo_commander.state import ui_state  # noqa: PLC0415
+
+        scene = getattr(ui_state, "urdf_scene", None)
+    except Exception:  # noqa: BLE001
+        scene = None
+
+    if should_render and not overlays_built:
+        if features_on:
+            _ensure_features_loaded()
+        if scene is not None:
+            try:
+                from .overlays import add_overlays as _add_overlays  # noqa: PLC0415
+
+                _add_overlays(scene)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "apply_calibration_state: add_overlays failed: %s", e,
+                )
+    elif should_render and overlays_built:
+        # Tool change (or any other state change) where overlays
+        # already exist: re-pick up per-tool intrinsics + cam_mount
+        # via ``settings.get`` resolution and redraw frustum geometry.
+        try:
+            from .live_apply import _rebuild_camera_mount  # noqa: PLC0415
+
+            _rebuild_camera_mount()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "apply_calibration_state: _rebuild_camera_mount failed: %s", e,
+            )
+        # Force the dynamic projections (centerline + projected
+        # footprint) to redraw on the next 5 Hz tick. Without this
+        # the cache check in ``_footprint_inputs_changed`` may keep
+        # the OLD tool's lines visible until the robot moves enough
+        # for the joint-angle epsilon check to trip. Deleting the
+        # tracked objects here removes them visually immediately;
+        # the next tick redraws against the new mount.
+        for obj in _state.get("footprint_objects", []) or []:
+            try:
+                obj.delete()
+            except Exception:  # noqa: BLE001
+                pass
+        _state["footprint_objects"] = []
+        _state["footprint_last_q"] = None
+        _state["footprint_last_mount"] = None
+        # Reachable-pose set depends on the active tool's mount + body
+        # (different camera position changes which IK solutions are
+        # valid; different gripper mesh changes self-collision). Drop
+        # the cached candidates and re-run the IK sweep so the green
+        # dots reflect the new tool.
+        try:
+            from .reachability import refresh_reachability_for_active_tool  # noqa: PLC0415
+
+            refresh_reachability_for_active_tool()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "apply_calibration_state: reachability refresh failed: %s", e,
+            )
+    elif not should_render and overlays_built:
+        _teardown_overlays()
+    # else: not should_render and not overlays_built → no-op.
+
+    # Always refresh the panel so its three-state branch picks up the
+    # new state. ``panel_refresh`` is set by
+    # ``build_calibration_panel_content`` when the panel last rendered.
+    refresh = _state.get("panel_refresh")
+    if refresh is not None:
+        try:
+            refresh()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("panel refresh failed: %s", e)
+
+
+def _build_inactive_placeholder(close_callback: Callable[[], None] | None) -> None:
+    """Render the panel content when features are toggled OFF: just a
+    header, an explanatory paragraph, and the master toggle. No
+    scene mutations, no timers, no STL bakes — the soft gate stops
+    everything heavy at the ``add_overlays`` / ``register_all`` calls
+    in ``main.py``.
+    """
+    with ui.row().classes("w-full items-center"):
+        ui.label("Calibration").classes("text-lg font-medium")
+        ui.space()
+        if close_callback is not None:
+            ui.button(icon="close", on_click=close_callback).props(
+                "flat round dense color=white"
+            )
+    ui.label(
+        "Calibration features are disabled.",
+    ).classes("text-xs opacity-80")
+    ui.label(
+        "Toggle on to enable.",
+    ).classes("text-xs opacity-60 q-mt-xs")
+
+    def _on_toggle(e) -> None:
+        # NiceGUI's on_change kwarg passes the new value via e.value —
+        # reading it that way avoids the timing race where ``sw.value``
+        # might still hold the previous state when ``update:model-value``
+        # fires on the underlying Quasar component.
+        new_value = bool(getattr(e, "value", False))
+        if not new_value:
+            return  # only acting on flips to ON here; OFF is a no-op
+        _set_features_active(True)
+        # Live-apply: register custom tools + add overlays (if a
+        # camera-bearing tool is active or override on) + refresh
+        # this panel.
+        ui.notify(
+            "Loading calibration features...", color="info", position="top",
+        )
+        apply_calibration_state()
+        ui.notify(
+            "Calibration features active.",
+            color="positive", position="top",
+        )
+
+    ui.switch(
+        "Enable calibration features", value=False, on_change=_on_toggle,
+    ).props("dense")
+
+
+def _build_no_camera_placeholder(close_callback: Callable[[], None] | None) -> None:
+    """Render the panel content when features are ON but the active tool
+    isn't camera-bearing. The calibration scaffolding (Run / Localise /
+    Hover + scene overlays) only makes sense alongside a calibratable
+    camera, so we hide it and surface (a) the issue, (b) a force-show
+    override, and (c) the custom-tools UI so the user can flag an
+    existing custom tool as ``has_camera`` from here.
+    """
+    try:
+        from waldo_commander.state import robot_state  # noqa: PLC0415
+        active_key = getattr(robot_state, "tool_key", None) or "NONE"
+    except Exception:  # noqa: BLE001
+        active_key = "(unknown)"
+
+    with ui.row().classes("w-full items-center"):
+        ui.label("Calibration").classes("text-lg font-medium")
+        ui.space()
+        if close_callback is not None:
+            ui.button(icon="close", on_click=close_callback).props(
+                "flat round dense color=white"
+            )
+
+    with ui.card().classes("w-full bg-amber-9 text-white q-mt-xs"):
+        ui.label("Active tool has no camera").classes(
+            "text-sm font-semibold",
+        )
+        ui.label(
+            f"Active tool: {active_key}. To use calibration:",
+        ).classes("text-xs")
+        ui.label(
+            "1. Switch to a camera-bearing tool in the gripper panel.",
+        ).classes("text-xs q-mt-xs")
+        ui.label(
+            "2. Or flag a custom tool as having a camera below.",
+        ).classes("text-xs")
+        ui.label(
+            "3. Or enable Force-show overlays for UI inspection only.",
+        ).classes("text-xs")
+
+    def _on_override(e) -> None:
+        new_value = bool(getattr(e, "value", False))
+        _set_no_camera_override(new_value)
+        # Live-apply: build / tear down overlays + refresh the panel
+        # so the three-state branch picks up the new gate state.
+        apply_calibration_state()
+        if new_value:
+            ui.notify(
+                "Override enabled. Calibration data is for UI inspection only.",
+                color="warning", position="top",
+            )
+        else:
+            ui.notify(
+                "Override disabled.", color="info", position="top",
+            )
+
+    ui.switch(
+        "Force-show overlays (no camera tool active)",
+        value=_no_camera_override(),
+        on_change=_on_override,
+    ).props("dense")
+
+    # Custom tools UI lives down here too so the user can flag a tool as
+    # camera-bearing without leaving the panel.
+    ui.separator().classes("q-my-sm")
+    custom_tools_ui.build_custom_tools_expansion()
+
+
 def build_calibration_panel_content(close_callback: Callable[[], None] | None = None) -> None:
     """Build the calibration tab's contents.
 
-    The panel hosts both the action buttons (Run / Localise / STOP) that
-    drive the calibration + localise threads, and the view-overlay
-    checkboxes that toggle visibility of each scene element. Designed to
-    live inside a ``ui.tab_panel`` in ``main.py``'s side-tab system, so the
-    calibration tooling shares a common UI pattern with Program / I/O /
-    Gripper. Pass ``close_callback`` to wire up the panel's close button.
+    Three states:
+
+    * **Features off** (``app.storage.general['calibration_features_active']``
+      is False, default): renders only the master toggle + explanation.
+      ``main.py`` skips ``add_overlays`` / ``register_all`` so no scene
+      timers / STL bakes run.
+
+    * **Features on, no camera-bearing active tool** (and no override):
+      renders the no-camera placeholder + override toggle + custom-tools
+      UI. ``main.py`` skips ``add_overlays`` so still no scene mutations.
+
+    * **Features on + camera-bearing active tool (or override on)**:
+      full panel — Run / Localise / STOP + view-overlay toggles +
+      hover-above-board + calibration-settings expansion + custom-tools
+      section. Banner at top when override is active.
+
+    Pass ``close_callback`` to wire up the panel's close button.
+
+    The three-state branch is wrapped in :func:`ui.refreshable` so a
+    tool change, a master-toggle flip, or a force-show toggle can
+    repaint the panel in place without a page reload —
+    :func:`apply_calibration_state` calls ``_content.refresh`` after
+    its scene mutations.
+    """
+
+    @ui.refreshable
+    def _content() -> None:
+        if not _features_active():
+            _build_inactive_placeholder(close_callback)
+            return
+        if not _camera_gate_open():
+            _build_no_camera_placeholder(close_callback)
+            return
+        _build_full_panel(close_callback)
+
+    _state["panel_refresh"] = _content.refresh
+    _content()
+
+
+def _build_full_panel(close_callback: Callable[[], None] | None = None) -> None:
+    """Render the camera-bearing full calibration panel — Run /
+    Localise / STOP + view-overlay toggles + hover-above-board +
+    calibration settings + custom-tools UI.
+
+    Extracted from :func:`build_calibration_panel_content` so the
+    ``@ui.refreshable`` wrapper there covers all three states
+    (inactive placeholder / no-camera placeholder / this full panel).
     """
 
     def _busy_warn(msg: str) -> bool:
-        """Reject button press if calibration / localise / hover is running,
-        or if the localise-before-Run dialog is open. Returns True if a
-        warning was issued."""
+        """Reject button press if any motion-bearing thread is running,
+        or if the localise-before-Run dialog is open. Returns True if
+        a warning was issued."""
         if _state.get("is_running"):
             ui.notify(
-                f"{msg}: calibration already running — wait for it to finish",
+                f"{msg}: calibration already running, wait for it to finish",
                 color="warning",
                 position="top",
             )
             return True
         if _state.get("is_localising"):
             ui.notify(
-                f"{msg}: board localise already running — wait for it to finish",
+                f"{msg}: board localise already running, wait for it to finish",
                 color="warning",
                 position="top",
             )
             return True
         if _state.get("is_hovering"):
             ui.notify(
-                f"{msg}: hover move in progress — wait for it to finish",
+                f"{msg}: hover move in progress, wait for it to finish",
+                color="warning",
+                position="top",
+            )
+            return True
+        if _state.get("is_going_to_pose"):
+            ui.notify(
+                f"{msg}: go-to-pose move in progress, wait for it to finish",
                 color="warning",
                 position="top",
             )
             return True
         if _state.get("dialog_open"):
             ui.notify(
-                f"{msg}: confirmation dialog open — answer it first",
+                f"{msg}: confirmation dialog open, answer it first",
                 color="warning",
                 position="top",
             )
@@ -149,6 +616,15 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
         _state["is_running"] = True
         _state["stop_requested"] = False
         _state["calibrated_mount"] = None
+        # Prime the per-tool override cache from the request context
+        # before spawning the worker. The worker can't read
+        # app.storage.user (request-context-bound, raises from threads),
+        # so calibrating without this prime would silently drop the
+        # active tool's calibrated mount + intrinsics and fall back to
+        # globals.
+        custom_tools.prime_per_tool_overrides_cache()
+        # Same for the global runtime cache (settings._runtime).
+        settings.load_from_storage()
         _post_status("Running calibration via parol6-server...")
         threading.Thread(target=_calibration_thread, daemon=True).start()
 
@@ -168,9 +644,8 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
                     "text-base font-semibold"
                 )
                 ui.label(
-                    "Calibration will use the configured _BOARD_TRANSLATE_M as "
-                    "the bootstrap target. If your physical tablet isn't there, "
-                    "bootstrap will fail to find the board."
+                    "Calibration will aim at the configured board position; "
+                    "if the physical tablet isn't there, bootstrap will fail."
                 ).classes("text-sm")
                 ui.label(
                     "Recommended: Cancel, click Localise Board first, then Run."
@@ -199,7 +674,11 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
             return
         _state["is_localising"] = True
         _state["stop_requested"] = False
-        _post_status("Localising board — driving lookout sweep...")
+        # Prime the per-tool override cache so the localise worker
+        # can read the active tool's intrinsics + cam mount.
+        custom_tools.prime_per_tool_overrides_cache()
+        settings.load_from_storage()
+        _post_status("Localising board, driving lookout sweep...")
         threading.Thread(target=_localise_board_thread, daemon=True).start()
 
     def _on_stop() -> None:
@@ -214,6 +693,7 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
             _state.get("is_running")
             or _state.get("is_localising")
             or _state.get("is_hovering")
+            or _state.get("is_going_to_pose")
         ):
             return
         _state["stop_requested"] = True
@@ -225,8 +705,8 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
                 except Exception as e:  # noqa: BLE001
                     logger.warning("halt() in worker thread failed: %s", e)
             threading.Thread(target=_halt_in_thread, daemon=True).start()
-            ui.notify("HALTED — robot motion stopped", color="warning")
-        _post_status("Stop requested — wait for current move to finish")
+            ui.notify("HALTED, robot motion stopped", color="warning")
+        _post_status("Stop requested, wait for current move to finish")
 
     # Load persisted toggle prefs into _state BEFORE the scene builds (this
     # function runs during page render, after add_overlays). The first-page
@@ -246,13 +726,57 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
     # scroll area so an excess of expansions doesn't push them off-screen,
     # but the user still has Run / Localise / STOP at the top of the
     # scroll area before any expansions.
+    def _on_disable_features() -> None:
+        with ui.dialog() as confirm, ui.card():
+            ui.label("Disable calibration features?").classes(
+                "text-base font-semibold",
+            )
+            ui.label(
+                "Tears down overlays. Re-enable any time from the same toggle.",
+            ).classes("text-xs opacity-70")
+            with ui.row():
+                def _confirm() -> None:
+                    _set_features_active(False)
+                    confirm.close()
+                    # Live-apply: tear down scene overlays + refresh
+                    # this panel to its inactive placeholder.
+                    apply_calibration_state()
+                    ui.notify(
+                        "Calibration features disabled.",
+                        color="info", position="top",
+                    )
+                ui.button(
+                    "Disable", on_click=_confirm, color="warning",
+                ).props("size=sm")
+                ui.button("Cancel", on_click=confirm.close).props("size=sm")
+        confirm.open()
+
     with ui.row().classes("w-full items-center"):
         ui.label("Calibration").classes("text-lg font-medium")
         ui.space()
+        ui.button(
+            icon="power_settings_new", on_click=_on_disable_features,
+        ).props(
+            "flat round dense color=warning size=sm",
+        ).tooltip("Disable calibration features")
         if close_callback is not None:
             ui.button(icon="close", on_click=close_callback).props(
                 "flat round dense color=white"
             )
+
+    # Persistent warning when the override is the only reason we're
+    # here — i.e. there's no camera-bearing tool active but overlays
+    # render anyway. Reminds the user the calibration data shown is
+    # not meaningful.
+    if _no_camera_override() and not custom_tools.active_tool_is_camera_bearing():
+        with ui.card().classes("w-full bg-amber-9 text-white q-mt-xs"):
+            ui.label("Force-show override active").classes(
+                "text-sm font-semibold",
+            )
+            ui.label(
+                "No camera-bearing tool is active. "
+                "Calibration data is for UI inspection only.",
+            ).classes("text-xs")
 
     # Scrollable body. ``calc(100vh - 80px)`` reserves room for the page
     # chrome above the panel; the column scrolls internally when content
@@ -290,6 +814,31 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
                     value=bool(_state.get(f"show_{name}", True)),
                     on_change=_make_handler(name),
                 ).props("dense")
+
+            ui.separator().classes("q-my-xs")
+
+            def _on_override_toggle(e) -> None:
+                value = bool(getattr(e, "value", False))
+                _set_no_camera_override(value)
+                # Live-apply: build / tear down overlays + refresh
+                # this panel so its three-state branch picks up the
+                # new gate state.
+                apply_calibration_state()
+                if value:
+                    ui.notify(
+                        "Override on. Calibration data is for UI inspection only.",
+                        color="warning", position="top",
+                    )
+                else:
+                    ui.notify(
+                        "Override off.", color="info", position="top",
+                    )
+
+            ui.checkbox(
+                "Force-show overlays without a camera tool",
+                value=_no_camera_override(),
+                on_change=_on_override_toggle,
+            ).props("dense")
 
         # Hover-above-board verification — drive the camera to a known XY on
         # the board surface at a configurable standoff height, look straight
@@ -394,6 +943,10 @@ def build_calibration_panel_content(close_callback: Callable[[], None] | None = 
                     mode = str(hover_mode_input.value or "camera")
                     _state["is_hovering"] = True
                     _state["stop_requested"] = False
+                    # Prime the per-tool override cache so the hover
+                    # worker can read the active tool's mount.
+                    custom_tools.prime_per_tool_overrides_cache()
+                    settings.load_from_storage()
                     threading.Thread(
                         target=_drive_hover_pose_thread,
                         args=(

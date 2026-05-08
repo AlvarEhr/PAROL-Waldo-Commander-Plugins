@@ -49,11 +49,12 @@ Layout of the package:
 from . import custom_tools
 from .collision import validate_joint_trajectory
 from .overlays import add_overlays, refresh_board_dependent_overlays
-from .panel import build_calibration_panel_content
+from .panel import apply_calibration_state, build_calibration_panel_content
 from .ssg48_hijack import hijack_ssg48_body_mesh
 
 __all__ = [
     "add_overlays",
+    "apply_calibration_state",
     "build_calibration_panel_content",
     "custom_tools",
     "hijack_ssg48_body_mesh",

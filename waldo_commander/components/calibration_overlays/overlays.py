@@ -134,10 +134,21 @@ def add_overlays(urdf_scene: Any) -> None:
     )
 
     # ------------------------------------------------------------------
-    # Camera frustum group, parented to tcp_anchor. The merged STL with
-    # the camera bracket is mounted automatically because we hijacked the
-    # SSG-48 BODY mesh in the parol6 tool registry at startup.
+    # Camera frustum group, parented to tcp_anchor.
+    #
+    # Idempotent: a leftover frustum_group from a previous add_overlays
+    # call (live re-add path after teardown) is deleted before creating
+    # a fresh one. Otherwise the old group accumulates as the user
+    # toggles features off/on or switches between camera-bearing tools.
     # ------------------------------------------------------------------
+    old_frustum = _state.get("frustum_group")
+    if old_frustum is not None:
+        try:
+            old_frustum.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["frustum_group"] = None
+        _state["near_cone_group"] = None
     if urdf_scene.tcp_anchor is not None:
         with urdf_scene.tcp_anchor:
             frustum_group = ui.scene.group().with_name("calib:frustum")
@@ -155,6 +166,20 @@ def add_overlays(urdf_scene: Any) -> None:
     scene_root = urdf_scene.scene
     _state["scene_root"] = scene_root
 
+    # ``_state`` is a module-level dict that survives a browser refresh
+    # (the Python process keeps running). After a refresh, the per-tick
+    # raycast cache (``footprint_objects`` / ``footprint_last_q`` /
+    # ``footprint_last_mount``) still holds handles parented to the
+    # destroyed prior scene_root and joint values matching the current
+    # robot pose — so ``_footprint_inputs_changed`` returns False, the
+    # 5 Hz tick early-exits, and the dynamic centerline + footprint
+    # never render into the new scene. Clearing the cache here is the
+    # same pattern ``live_apply._redraw_frustum`` uses after intrinsic
+    # changes.
+    _state["footprint_objects"] = []
+    _state["footprint_last_q"] = None
+    _state["footprint_last_mount"] = None
+
     # All board-dependent overlays (board, tablet, hemisphere wireframe,
     # reachability dots) are built through a single helper so initial build
     # and post-localise refresh share one code path. Each child group's
@@ -163,7 +188,22 @@ def add_overlays(urdf_scene: Any) -> None:
     # before this function is called (see ``add_control_panel``).
     _build_board_dependent_overlays(scene_root, png_url)
 
-    # Detection-overlay polling — repaints AABB boxes from the perception
+    # Cancel any timers from a prior add_overlays call (live re-add path
+    # after teardown) so they don't accumulate. Each fresh call installs
+    # its own set tracked in ``_state["calib_timers"]``.
+    for old_timer in _state.get("calib_timers", []) or []:
+        try:
+            old_timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    old_det_timer = _state.get("detection_overlay_timer")
+    if old_det_timer is not None:
+        try:
+            old_det_timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Detection-overlay polling: repaints AABB boxes from the perception
     # pipeline's last_detection.json snapshot when its mtime changes.
     _state["detection_overlay_timer"] = ui.timer(
         _DETECTION_POLL_INTERVAL_S, _poll_detection_json,
@@ -181,8 +221,29 @@ def add_overlays(urdf_scene: Any) -> None:
     #     are off, or when the joint/mount inputs haven't changed since the
     #     last frame (keeps the asyncio loop responsive during heavy CPU
     #     spikes from the calibration thread + 50 Hz status broadcasts).
-    ui.timer(0.25, _post_calibration_tick, active=True)
-    ui.timer(1.0 / _FOOTPRINT_TICK_HZ, _raycast_footprint_tick, active=True)
+    _state["calib_timers"] = [
+        ui.timer(0.25, _post_calibration_tick, active=True),
+        ui.timer(1.0 / _FOOTPRINT_TICK_HZ, _raycast_footprint_tick, active=True),
+    ]
+
+    # Click-on-dot popup: page-level fixed-position container + a
+    # scene click handler that opens the "Go to pose" tooltip when
+    # the user clicks one of the green reachability spheres. Both
+    # are idempotent: a re-run replaces any prior container +
+    # handler so we don't stack them across feature on/off cycles.
+    try:
+        from . import pose_popup  # noqa: PLC0415
+
+        pose_popup.init_popup_container()
+        pose_popup.register_click_handler(urdf_scene.scene)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("pose popup setup failed: %s", e)
+
+    # Marker for ``apply_calibration_state`` so it can tell whether the
+    # overlays are currently built (don't re-add) vs. previously torn
+    # down (need to call this function). Initial page-load gets the
+    # flag set here; live tear-down clears it.
+    _state["overlays_built"] = True
 
 
 def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:

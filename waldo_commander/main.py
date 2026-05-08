@@ -129,15 +129,71 @@ def _update_connection_notification() -> None:
 
 
 def _calibration_enabled() -> bool:
-    """Return True when the parol6-vision calibration features are
-    opted-in via the ``WALDO_CALIBRATION_ENABLED`` env var (set to "1").
+    """Master kill switch for parol6-vision calibration. Default ON.
 
-    Default OFF: no scene overlays, no panel tab, no STL bakes, no
-    timers — the calibration_overlays package is not even imported.
-    Users who want the feature set ``WALDO_CALIBRATION_ENABLED=1`` in
-    their launch environment.
+    Hard gate: when ``WALDO_CALIBRATION_ENABLED=0``, the
+    calibration_overlays package is not imported, the calibration tab
+    is not added to the left strip, and no calibration scaffolding
+    runs. For genuinely low-spec machines or users who never want any
+    of the feature near their process — env var has to be flipped to
+    "0" to fully eliminate.
+
+    Whether the feature ACTUALLY DOES anything visible / heavy is a
+    separate question controlled by ``_calibration_features_active``
+    below — which is what the in-app toggle flips.
     """
-    return os.environ.get("WALDO_CALIBRATION_ENABLED", "0") == "1"
+    return os.environ.get("WALDO_CALIBRATION_ENABLED", "1") == "1"
+
+
+def _calibration_features_active() -> bool:
+    """Soft gate for the calibration features themselves. Defaults OFF.
+
+    When this is False but ``_calibration_enabled`` is True:
+    * Calibration tab IS visible in the left strip.
+    * Panel renders as just a master toggle + a "reload to apply" hint.
+    * ``add_overlays`` is NOT called — no scene timers, no IK sweeps,
+      no STL bakes, no scene groups added. Resource impact stays at
+      the package-import cost only.
+
+    Persisted via NiceGUI's ``app.storage.general`` so the toggle
+    survives restarts. The env var still wins — when it's off, this
+    returns False regardless of storage.
+    """
+    if not _calibration_enabled():
+        return False
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        return bool(app.storage.general.get("calibration_features_active", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _calibration_overlays_should_render() -> bool:
+    """Returns True iff the calibration scene overlays should be added
+    to the URDF scene this page-build. Gates on the active tool being
+    camera-bearing (built-in MSG, or any custom tool flagged
+    ``has_camera``) OR the per-user "Force-show overlays" override
+    being on.
+
+    Without this, overlays would render for every tool — including
+    ones with no camera (Jepson's stock SSG-48, Pneumatic, etc.) —
+    which is misleading: the frustum, hemisphere, etc. all assume a
+    camera is mounted.
+    """
+    try:
+        from waldo_commander.components.calibration_overlays import (
+            custom_tools as _ct,
+        )
+        from nicegui import app  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return False
+    if _ct.active_tool_is_camera_bearing():
+        return True
+    try:
+        return bool(app.storage.user.get("calib_no_camera_override", False))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 # --------------- URDF Scene Functions ---------------
@@ -149,14 +205,12 @@ async def initialize_urdf_scene() -> None:
 
     # parol6-vision: hijack the SSG-48 BODY mesh to embed the user's merged
     # camera-bracket STL. Pass the active_robot so its tools collection
-    # parol6-vision calibration features — opt-in via the
-    # ``WALDO_CALIBRATION_ENABLED`` env var (set to "1" to enable). When
-    # disabled (the default), this whole block is skipped: no imports of
-    # the calibration_overlays package, no STL bakes, no scene mutations,
-    # no per-tick timers, and the calibration tab is omitted from the
-    # left strip below. The result is zero runtime overhead for users
-    # who don't need the feature, which matters on lower-spec hardware.
-    if _calibration_enabled():
+    # parol6-vision calibration — startup migration + tool registration.
+    # Heavy: bakes STLs into parol6's mesh dir, mutates the tool registry.
+    # Gated on the soft toggle ``_calibration_features_active`` (default
+    # OFF) so a fresh user gets the calibration tab visible but no
+    # disk-write side effects until they explicitly opt in.
+    if _calibration_features_active():
         try:
             from waldo_commander.components.calibration_overlays import (
                 custom_tools as _calib_custom_tools,
@@ -275,9 +329,16 @@ async def initialize_urdf_scene() -> None:
 
     # parol6-vision: hand-eye calibration overlays + scene-driven timers.
     # The control panel is built later as the "Calibration" side-tab —
-    # see ``_build_left_panels``. Gated on ``WALDO_CALIBRATION_ENABLED``
-    # so disabled installs incur no overhead.
-    if _calibration_enabled():
+    # see ``_build_left_panels``. ``add_overlays`` is heavy: it adds
+    # scene groups (board, hemisphere, frustum, reachability dots) and
+    # registers the per-tick timers (post-cal 4 Hz, footprint 5 Hz,
+    # detection poll 0.5 Hz). Two layers of gating:
+    #   - ``_calibration_features_active``: the user master toggle
+    #   - ``custom_tools.active_tool_is_camera_bearing`` OR
+    #     the per-user "Force-show overlays" override: the active
+    #     gripper tool needs a camera, otherwise the overlays don't
+    #     render anything meaningful.
+    if _calibration_features_active() and _calibration_overlays_should_render():
         try:
             from waldo_commander.components.calibration_overlays import (
                 add_overlays as _calib_add_overlays,

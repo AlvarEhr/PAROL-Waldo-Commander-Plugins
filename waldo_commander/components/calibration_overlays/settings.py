@@ -84,6 +84,17 @@ DEFAULTS: dict[str, Any] = {
     "hemi_elevation_range_deg": _c._HEMI_ELEVATION_RANGE_DEG,
     "hemi_azimuth_spread_deg": _c._HEMI_AZIMUTH_SPREAD_DEG,
     "hemi_centre_override_m": _c._HEMI_CENTRE_OVERRIDE_M,
+    # ---- Reachability dots (visualization-only) -------------------------
+    # Number of Sobol candidates the IK sweep tries; survivors render as
+    # green dots after a non-overlap spread filter. Lower = faster
+    # sweep, fewer dots; higher = slower sweep, denser pre-filter pool.
+    # The dots actually drawn are typically far fewer than this number
+    # because the spread filter discards dots that would overlap.
+    "reachability_n_candidates": 64,
+    # Sphere radius for each green dot (metres). Doubles as the
+    # min-distance threshold for the non-overlap selector, so larger
+    # radius means fewer but more spaced-out dots.
+    "reachability_dot_radius_m": 0.005,
     # ---- Localise sweep -------------------------------------------------
     "localise_use_j0_sweep": _c._LOCALISE_USE_J0_SWEEP,
     "localise_continuous_sweep": _c._LOCALISE_CONTINUOUS_SWEEP,
@@ -146,11 +157,36 @@ _runtime: dict[str, Any] = {}
 
 
 def get(key: str) -> Any:
-    """Return the current value of ``key`` (runtime override else default)."""
+    """Return the current value of ``key`` from the highest-priority
+    layer that defines it:
+
+    1. Active-tool override (per-tool ``CustomToolConfig`` field) —
+       only for keys in ``custom_tools._PER_TOOL_OVERRIDABLE_KEYS``
+       (camera intrinsics + cold-start mount). Lets each camera-
+       bearing custom tool carry its own values.
+    2. Runtime override (set via ``set_value`` from the global
+       Calibration settings panel; persisted in app.storage.user).
+    3. Module default (the constants imported from ``constants.py``).
+
+    Workspace-properties (board placement, hemisphere search, localise
+    tunables, etc.) skip layer 1 — those are properties of the user's
+    setup, not the tool.
+    """
     if key not in DEFAULTS:
         raise KeyError(f"Unknown calibration setting: {key}")
+    # Layer 1: per-tool override.
+    try:
+        from . import custom_tools  # noqa: PLC0415
+
+        override = custom_tools.active_tool_override(key)
+        if override is not None:
+            return override
+    except Exception:  # noqa: BLE001
+        pass
+    # Layer 2: runtime (storage-backed) override.
     if key in _runtime:
         return _coerce(key, _runtime[key])
+    # Layer 3: shipped default.
     return DEFAULTS[key]
 
 

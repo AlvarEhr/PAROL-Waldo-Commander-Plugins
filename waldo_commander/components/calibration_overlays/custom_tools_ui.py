@@ -104,6 +104,398 @@ def _tuple3_inputs(
     return inputs
 
 
+def _build_intrinsics_override(
+    cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
+) -> None:
+    """Per-tool intrinsics override section. Toggle-on to override the
+    globals; off resets every per-tool intrinsics field to None
+    (inherit). When on, the six fields are pre-populated with the
+    current global values so the user has a starting point.
+    """
+    from . import settings  # noqa: PLC0415
+
+    has_override = (
+        cfg.intr_fx is not None or cfg.intr_fy is not None
+        or cfg.intr_cx is not None or cfg.intr_cy is not None
+        or cfg.intr_width is not None or cfg.intr_height is not None
+    )
+
+    inputs_box = ui.column().classes("w-full q-mt-xs").style(
+        f"display: {'block' if has_override else 'none'};",
+    )
+
+    def _seed_value(attr: str, fallback_key: str) -> float:
+        v = getattr(cfg, attr)
+        if v is not None:
+            return float(v)
+        return float(settings.get(fallback_key))
+
+    fx = _seed_value("intr_fx", "intr_fx")
+    fy = _seed_value("intr_fy", "intr_fy")
+    cx = _seed_value("intr_cx", "intr_cx")
+    cy = _seed_value("intr_cy", "intr_cy")
+    w = int(_seed_value("intr_width", "intr_width"))
+    h = int(_seed_value("intr_height", "intr_height"))
+
+    inputs: dict[str, Any] = {}
+    with inputs_box:
+        with ui.row().classes("items-center gap-1"):
+            inputs["fx"] = ui.number(
+                label="fx", value=fx, format="%.1f", step=1.0,
+            ).props("dense debounce=500").classes("w-24")
+            inputs["fy"] = ui.number(
+                label="fy", value=fy, format="%.1f", step=1.0,
+            ).props("dense debounce=500").classes("w-24")
+        with ui.row().classes("items-center gap-1"):
+            inputs["cx"] = ui.number(
+                label="cx", value=cx, format="%.1f", step=1.0,
+            ).props("dense debounce=500").classes("w-24")
+            inputs["cy"] = ui.number(
+                label="cy", value=cy, format="%.1f", step=1.0,
+            ).props("dense debounce=500").classes("w-24")
+        with ui.row().classes("items-center gap-1"):
+            inputs["w"] = ui.number(
+                label="Width (px)", value=w, format="%d", step=1, min=1,
+            ).props("dense debounce=500").classes("w-28")
+            inputs["h"] = ui.number(
+                label="Height (px)", value=h, format="%d", step=1, min=1,
+            ).props("dense debounce=500").classes("w-28")
+
+    def _save_overrides(_e: Any = None) -> None:
+        try:
+            cfg.intr_fx = float(inputs["fx"].value)
+            cfg.intr_fy = float(inputs["fy"].value)
+            cfg.intr_cx = float(inputs["cx"].value)
+            cfg.intr_cy = float(inputs["cy"].value)
+            cfg.intr_width = int(inputs["w"].value)
+            cfg.intr_height = int(inputs["h"].value)
+        except (TypeError, ValueError):
+            return
+        custom_tools.save_config(cfg)
+
+    for inp in inputs.values():
+        inp.on("update:model-value", _save_overrides)
+
+    def _on_toggle(e) -> None:
+        new_value = bool(getattr(e, "value", False))
+        if new_value:
+            inputs_box.style("display: block;")
+            _save_overrides()
+            ui.notify(
+                f"Per-tool intrinsics enabled for custom:{cfg.name}.",
+                color="info",
+            )
+        else:
+            inputs_box.style("display: none;")
+            cfg.intr_fx = None
+            cfg.intr_fy = None
+            cfg.intr_cx = None
+            cfg.intr_cy = None
+            cfg.intr_width = None
+            cfg.intr_height = None
+            custom_tools.save_config(cfg)
+            ui.notify(
+                f"Per-tool intrinsics reset for custom:{cfg.name}.",
+                color="info",
+            )
+
+    ui.switch(
+        "Override globals for this tool", value=has_override,
+        on_change=_on_toggle,
+    ).props("dense")
+
+
+def _build_cam_mount_override(
+    cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
+) -> None:
+    """Per-tool camera-mount override (translate + tilt). Same pattern
+    as the intrinsics override — toggle-on populates from globals,
+    toggle-off resets to None. Also displays a "Save calibrated mount
+    here" button — when calibration writes a result via the calibration
+    panel, this is where it lands automatically.
+    """
+    import math  # noqa: PLC0415
+
+    from . import settings  # noqa: PLC0415
+
+    has_override = (
+        cfg.cam_mount_translate_mm is not None
+        or cfg.cam_mount_tilt_deg is not None
+    )
+
+    inputs_box = ui.column().classes("w-full q-mt-xs").style(
+        f"display: {'block' if has_override else 'none'};",
+    )
+
+    seed_translate = (
+        cfg.cam_mount_translate_mm
+        if cfg.cam_mount_translate_mm is not None
+        else tuple(settings.get("cam_mount_translate_mm"))
+    )
+    seed_tilt = (
+        cfg.cam_mount_tilt_deg
+        if cfg.cam_mount_tilt_deg is not None
+        else tuple(settings.get("cam_mount_tilt_deg"))
+    )
+
+    translate_inputs: list[ui.number] = []
+    tilt_inputs: list[ui.number] = []
+
+    with inputs_box:
+        ui.label("Translate (flange frame, mm)").classes(
+            "text-xs opacity-70",
+        )
+        with ui.row().classes("items-center gap-1"):
+            for i, axis in enumerate("XYZ"):
+                inp = (
+                    ui.number(
+                        label=axis,
+                        value=float(seed_translate[i]),
+                        format="%.1f", step=0.5,
+                    )
+                    .props("dense debounce=500")
+                    .classes("w-24")
+                )
+                translate_inputs.append(inp)
+        ui.label("Tilt (XYZ-extrinsic, deg)").classes(
+            "text-xs opacity-70 q-mt-xs",
+        )
+        with ui.row().classes("items-center gap-1"):
+            for i, axis in enumerate(("Rx", "Ry", "Rz")):
+                inp = (
+                    ui.number(
+                        label=axis,
+                        value=float(seed_tilt[i]),
+                        format="%.2f", step=1.0,
+                    )
+                    .props("dense debounce=500")
+                    .classes("w-24")
+                )
+                tilt_inputs.append(inp)
+
+    def _save_overrides(_e: Any = None) -> None:
+        try:
+            cfg.cam_mount_translate_mm = tuple(
+                float(inp.value or 0.0) for inp in translate_inputs
+            )
+            cfg.cam_mount_tilt_deg = tuple(
+                float(inp.value or 0.0) for inp in tilt_inputs
+            )
+        except (TypeError, ValueError):
+            return
+        custom_tools.save_config(cfg)
+
+    for inp in translate_inputs + tilt_inputs:
+        inp.on("update:model-value", _save_overrides)
+
+    def _on_toggle(e) -> None:
+        new_value = bool(getattr(e, "value", False))
+        if new_value:
+            inputs_box.style("display: block;")
+            _save_overrides()
+            ui.notify(
+                f"Per-tool cam mount enabled for custom:{cfg.name}.",
+                color="info",
+            )
+        else:
+            inputs_box.style("display: none;")
+            cfg.cam_mount_translate_mm = None
+            cfg.cam_mount_tilt_deg = None
+            custom_tools.save_config(cfg)
+            ui.notify(
+                f"Per-tool cam mount reset for custom:{cfg.name}.",
+                color="info",
+            )
+
+    ui.switch(
+        "Override globals for this tool", value=has_override,
+        on_change=_on_toggle,
+    ).props("dense")
+
+
+def _build_variants_section(
+    cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
+) -> None:
+    """Per-tool variants editor. Each variant ships its own jaw STL pair
+    + jaw motion and gets a ``ToolVariant`` entry in the parol6 registry
+    so the gripper panel's variant dropdown can swap among them.
+
+    Default tool jaws (jaw_left.stl / jaw_right.stl) stay around — they
+    apply when the user picks the tool with no variant selected. The
+    per-variant jaws override at variant-pick time.
+    """
+    ui.label(
+        "Each variant has its own jaw STL pair and jaw motion.",
+    ).classes("text-xs opacity-70")
+
+    def _on_add_variant() -> None:
+        with ui.dialog() as dialog, ui.card():
+            ui.label(f"Add variant to custom:{cfg.name}").classes(
+                "text-base font-semibold",
+            )
+            key_input = ui.input(
+                label="Variant key (alnum + underscore)",
+                placeholder="e.g. finger, pinch, custom",
+            ).props("dense autofocus")
+            display_input = ui.input(
+                label="Display name (optional)",
+                placeholder="e.g. Finger",
+            ).props("dense")
+
+            def _on_create() -> None:
+                vkey = str(key_input.value or "").strip()
+                if not vkey or not all(c.isalnum() or c == "_" for c in vkey):
+                    ui.notify(
+                        "Key must be non-empty, letters/digits/underscore only",
+                        color="warning",
+                    )
+                    return
+                if any(v.key == vkey for v in cfg.variants):
+                    ui.notify(
+                        f"Variant {vkey!r} already exists", color="warning",
+                    )
+                    return
+                cfg.variants.append(
+                    custom_tools.CustomToolVariant(
+                        key=vkey,
+                        display_name=str(display_input.value or "").strip() or vkey,
+                    )
+                )
+                custom_tools.save_config(cfg)
+                dialog.close()
+                refresh()
+                ui.notify(
+                    f"Added variant {vkey}. Upload its jaw STLs in the card.",
+                    color="positive",
+                )
+
+            with ui.row():
+                ui.button("Create", on_click=_on_create, color="primary").props(
+                    "size=sm",
+                )
+                ui.button("Cancel", on_click=dialog.close).props("size=sm")
+        dialog.open()
+
+    ui.button(
+        "Add variant", on_click=_on_add_variant, icon="add",
+    ).props("size=sm outline")
+
+    if not cfg.variants:
+        return
+
+    for variant in cfg.variants:
+        _build_variant_card(cfg, variant, refresh)
+
+
+def _build_variant_card(
+    cfg: custom_tools.CustomToolConfig,
+    variant: custom_tools.CustomToolVariant,
+    refresh: Callable[[], None],
+) -> None:
+    """Editor for one variant — STL upload slots + jaw motion params."""
+    with ui.card().classes("w-full q-mt-xs bg-blue-grey-9"):
+        with ui.row().classes("w-full items-center"):
+            ui.label(variant.display_name or variant.key).classes(
+                "text-sm font-medium",
+            )
+            ui.label(f"({variant.key})").classes("text-xs opacity-60")
+            ui.space()
+            ui.label(
+                "jaws ✓" if variant.has_jaws else "jaws ✗",
+            ).classes(
+                "text-xs " + (
+                    "text-green-7" if variant.has_jaws else "text-red-7"
+                ),
+            )
+
+            def _on_delete_variant(v=variant) -> None:
+                cfg.variants = [x for x in cfg.variants if x.key != v.key]
+                # Best-effort delete the on-disk variant STLs too.
+                for side in ("left", "right"):
+                    p = cfg.variant_jaw_path(v.key, side)
+                    try:
+                        if p.exists():
+                            p.unlink()
+                    except OSError as e:
+                        logger.debug(
+                            "couldn't delete variant STL %s: %s", p, e,
+                        )
+                custom_tools.save_config(cfg)
+                ui.notify(f"Deleted variant {v.key}", color="info")
+                refresh()
+
+            ui.button(
+                icon="delete", on_click=_on_delete_variant,
+            ).props("flat round dense color=negative size=sm")
+
+        # STL upload slots
+        ui.label("STL files").classes("text-xs opacity-70 q-mt-xs")
+
+        def _make_variant_upload_handler(side: str, v=variant):
+            def _handle(e: events.UploadEventArguments) -> None:
+                try:
+                    suffix = Path(e.name).suffix or ".stl"
+                    with tempfile.NamedTemporaryFile(
+                        suffix=suffix, delete=False,
+                    ) as tmp:
+                        tmp.write(e.content.read())
+                        tmp_path = Path(tmp.name)
+                    custom_tools.import_variant_stl(
+                        cfg.name, v.key, side, tmp_path,
+                    )
+                    tmp_path.unlink(missing_ok=True)
+                    ui.notify(
+                        f"Uploaded variant {v.key}/{side} STL",
+                        color="positive",
+                    )
+                    refresh()
+                except Exception as ex:  # noqa: BLE001
+                    ui.notify(f"Upload failed: {ex}", color="warning")
+            return _handle
+
+        with ui.row().classes("items-center gap-2"):
+            ui.upload(
+                label="Jaw left",
+                on_upload=_make_variant_upload_handler("left"),
+                auto_upload=True, max_files=1,
+            ).props("dense accept=.stl").classes("w-48")
+            ui.upload(
+                label="Jaw right",
+                on_upload=_make_variant_upload_handler("right"),
+                auto_upload=True, max_files=1,
+            ).props("dense accept=.stl").classes("w-48")
+
+        # Jaw motion
+        ui.label("Jaw motion").classes("text-xs opacity-70 q-mt-xs")
+        with ui.row().classes("items-center gap-1"):
+            travel_input = (
+                ui.number(
+                    label="Travel (mm)",
+                    value=float(variant.jaw_travel_m) * 1000.0,
+                    format="%.2f", step=0.5, min=0.0,
+                )
+                .props("dense debounce=500")
+                .classes("w-32")
+            )
+
+            def _save_travel(_e: Any = None, v=variant) -> None:
+                try:
+                    v.jaw_travel_m = float(travel_input.value or 0.0) / 1000.0
+                except (TypeError, ValueError):
+                    return
+                custom_tools.save_config(cfg)
+
+            def _save_symmetric(e, v=variant) -> None:
+                v.jaw_symmetric = bool(getattr(e, "value", False))
+                custom_tools.save_config(cfg)
+
+            travel_input.on("update:model-value", _save_travel)
+            ui.switch(
+                "Symmetric", value=bool(variant.jaw_symmetric),
+                on_change=_save_symmetric,
+            ).props("dense")
+
+
 def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None]) -> None:
     """Render the editor for one custom tool. ``refresh`` rebuilds the
     list view after a structural change (delete, rename, etc.).
@@ -132,8 +524,8 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 if not cfg.has_body:
                     ui.notify("Upload a body STL first", color="warning")
                     return
-                # Bake first — registry mutation should be in place before
-                # the local apply queries meshes.
+                # Bake first — registry mutation should be in place
+                # before the local apply queries meshes.
                 custom_tools.register_one(cfg)
                 ok = await custom_tools.select_as_active(
                     cfg.name, proxy_tool_key=str(cfg.proxy_tool_key or ""),
@@ -141,13 +533,26 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 if ok:
                     msg = f"Switched active tool to custom:{cfg.name}"
                     if cfg.proxy_tool_key:
-                        msg += f" (controller proxied to {cfg.proxy_tool_key})"
-                    ui.notify(msg, color="positive")
+                        msg += f" (motor proxied to {cfg.proxy_tool_key})"
+                    ui.notify(msg, color="positive", position="top")
+                    # Live-apply calibration overlays + panel for the
+                    # new tool: re-evaluates camera-bearing gating,
+                    # picks up per-tool intrinsic / mount overrides,
+                    # builds or tears down scene overlays as needed.
+                    # No page reload required.
+                    try:
+                        from .panel import apply_calibration_state  # noqa: PLC0415
+
+                        apply_calibration_state()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.debug(
+                            "apply_calibration_state failed: %s", exc,
+                        )
                     refresh()
                 else:
                     ui.notify(
-                        f"Local apply failed for custom:{cfg.name} — "
-                        f"check the logs for details.",
+                        f"Local apply failed for custom:{cfg.name}. "
+                        f"Check the logs for details.",
                         color="warning",
                     )
 
@@ -162,8 +567,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                         "text-base font-semibold",
                     )
                     ui.label(
-                        "Removes the folder, config, and all baked STLs. "
-                        "Restart waldo-commander to fully unregister.",
+                        "Removes the folder, config, and all baked STLs.",
                     ).classes("text-xs opacity-70")
                     with ui.row():
                         def _confirm() -> None:
@@ -257,7 +661,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
             ok = custom_tools.register_one(cfg)
             if not ok:
                 ui.notify(
-                    "Re-bake failed — check logs (probably no body.stl yet).",
+                    "Re-bake failed. Check logs (probably no body.stl yet).",
                     color="warning",
                 )
                 return
@@ -270,8 +674,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 # User is editing a non-active tool. Quiet info-level
                 # toast so they remember to switch when they're done.
                 ui.notify(
-                    f"Re-baked custom:{cfg.name}. Click \"Use this tool\" "
-                    f"or pick it in the gripper panel to view the change.",
+                    f"Re-baked custom:{cfg.name}. Click \"Use this tool\" to view.",
                     color="info", position="top", timeout=2000,
                 )
 
@@ -386,8 +789,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
             t = custom_tools.snap_to_largest_circular_hole(cfg.body_path)
             if t is None:
                 ui.notify(
-                    "No circular hole found in the largest planar facet — "
-                    "try the flange-face snap instead.",
+                    "No circular hole found. Try the flange-face snap instead.",
                     color="warning", position="top",
                 )
                 return
@@ -406,18 +808,46 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 "Snap mount hole", on_click=_snap_hole,
             ).props("size=sm outline")
 
+        # ----- Camera flag + per-tool calibration overrides -----
+        ui.separator().classes("q-my-sm")
+        ui.label("Calibration").classes("text-xs opacity-70")
+        def _on_camera_toggle(e) -> None:
+            cfg.has_camera = bool(getattr(e, "value", False))
+            custom_tools.save_config(cfg)
+            ui.notify(
+                f"has_camera = {cfg.has_camera}.",
+                color="info", position="top",
+            )
+        ui.switch(
+            "Tool has a calibratable camera",
+            value=bool(cfg.has_camera),
+            on_change=_on_camera_toggle,
+        ).props("dense")
+
+        # ----- Per-tool intrinsics override -----
+        with ui.expansion(
+            "Camera intrinsics (override globals for this tool)",
+            icon="camera",
+        ).classes("w-full q-mt-xs"):
+            _build_intrinsics_override(cfg, refresh)
+
+        # ----- Per-tool cam mount override -----
+        with ui.expansion(
+            "Camera mount (override globals for this tool)",
+            icon="open_with",
+        ).classes("w-full"):
+            _build_cam_mount_override(cfg, refresh)
+
         # ----- Controller proxy -----
         ui.separator().classes("q-my-sm")
         ui.label(
             "Controller proxy (motor commands)",
         ).classes("text-xs opacity-70")
         ui.label(
-            "Custom tools live only in the GUI — the controller doesn't "
-            "know about them. Pick a built-in tool that the controller "
-            "should act as for jaw motion / motor control. Leave empty "
-            "for visualisation-only.",
+            "Pick a built-in tool the controller should act as for jaw "
+            "motion. Leave empty for visualisation only.",
         ).classes("text-xs opacity-60")
-        proxy_options: dict[str, str] = {"": "(none — visualisation only)"}
+        proxy_options: dict[str, str] = {"": "(none, visualisation only)"}
         for key, display in custom_tools.list_registered_tools():
             if key.startswith("custom:"):
                 continue  # avoid proxying through other custom tools
@@ -480,14 +910,13 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                     _save_and_rebake()
                 travel_input.on("update:model-value", _on_travel)
 
-                sym_switch = ui.switch(
-                    "Symmetric", value=bool(cfg.jaw_symmetric),
-                ).props("dense")
-
-                def _on_symmetric(_e: Any = None) -> None:
-                    cfg.jaw_symmetric = bool(sym_switch.value)
+                def _on_symmetric(e) -> None:
+                    cfg.jaw_symmetric = bool(getattr(e, "value", False))
                     _save_and_rebake()
-                sym_switch.on("update:model-value", _on_symmetric)
+                ui.switch(
+                    "Symmetric", value=bool(cfg.jaw_symmetric),
+                    on_change=_on_symmetric,
+                ).props("dense")
 
             ui.label("Axis").classes("text-xs opacity-70 q-mt-xs")
 
@@ -500,6 +929,11 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 cfg.jaw_axis, scale=1.0, fmt="%.2f", step=0.1,
                 on_change=_on_jaw_axis,
             )
+
+        # ----- Variants -----
+        ui.separator().classes("q-my-sm")
+        with ui.expansion("Variants", icon="layers").classes("w-full"):
+            _build_variants_section(cfg, refresh)
 
 
 # ---------------------------------------------------------------------------
@@ -520,7 +954,7 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
     available = custom_tools.list_registered_tools()
     if not available:
         ui.notify(
-            "No source tools available — parol6 registry is empty.",
+            "No source tools available. parol6 registry is empty.",
             color="warning",
         )
         return
@@ -531,11 +965,8 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
             "text-base font-semibold",
         )
         ui.label(
-            "Forks any tool from parol6's registry — including the "
-            "SSG-48 entry mutated by the mesh hijack — into a custom "
-            "tool you can iterate on. Mesh files are copied; the new "
-            "custom tool starts with an identity placement transform "
-            "since the source meshes are already in flange coordinates.",
+            "Forks any tool from parol6's registry into a custom tool "
+            "you can iterate on. Mesh files are copied with an identity transform.",
         ).classes("text-xs opacity-70")
         first_key = next(iter(options))
         source_select = ui.select(
@@ -561,8 +992,8 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
             cfg = custom_tools.import_from_registered(source_key, target)
             if cfg is None:
                 ui.notify(
-                    f"Import failed — check logs (target may already "
-                    f"exist or source has no body mesh).",
+                    f"Import failed. Check logs (target may already exist "
+                    f"or source has no body mesh).",
                     color="warning",
                 )
                 return
@@ -570,9 +1001,7 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
             # without a restart.
             custom_tools.register_one(cfg)
             ui.notify(
-                f"Imported {source_key} → custom:{target}. "
-                f"Use it from the gripper panel or the card's "
-                f"'Use this tool' button.",
+                f"Imported {source_key} as custom:{target}.",
                 color="positive", position="top",
             )
             dialog.close()
@@ -593,7 +1022,6 @@ def _add_tool_dialog(refresh: Callable[[], None]) -> None:
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
         ui.label("Add custom tool").classes("text-base font-semibold")
         ui.label(
-            "Creates a new entry under ~/.waldo-commander/custom_tools/. "
             "STLs and transforms can be edited after creation.",
         ).classes("text-xs opacity-70")
         name_input = ui.input(
@@ -601,8 +1029,7 @@ def _add_tool_dialog(refresh: Callable[[], None]) -> None:
             placeholder="my_gripper",
         ).props("dense autofocus")
         ui.label(
-            "Letters/digits/underscore only. Becomes 'custom:<name>' in "
-            "the tool dropdown.",
+            "Letters, digits, underscore only.",
         ).classes("text-xs opacity-60")
         display_input = ui.input(
             label="Display name (optional)",
@@ -661,18 +1088,14 @@ def build_custom_tools_expansion() -> None:
         configs = custom_tools.list_configs()
         if not configs:
             ui.label(
-                "No custom tools yet. Click \"Add custom tool\" to create one — "
-                "drop your gripper / bracket STL files into the tool's card "
-                "afterwards.",
+                "No custom tools yet. Click \"Add custom tool\" to create one.",
             ).classes("text-xs opacity-70")
         for cfg in configs:
             _build_tool_card(cfg, refresh=_list_view.refresh)
 
     with ui.expansion("Custom tools", icon="extension").classes("w-full"):
         ui.label(
-            f"Drop STLs into ~/.waldo-commander/custom_tools/<name>/ "
-            f"or use the wizard. Registered tools appear in the gripper "
-            f"dropdown as ‘custom:<name>’ after the next tool refresh.",
+            "Registered tools appear in the gripper dropdown as 'custom:<name>'.",
         ).classes("text-xs opacity-70")
         with ui.row().classes("q-mt-xs"):
             ui.button(

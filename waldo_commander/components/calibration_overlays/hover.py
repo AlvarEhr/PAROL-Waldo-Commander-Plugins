@@ -205,6 +205,44 @@ def _drive_hover_pose_thread(
             return
 
         angles_deg = np.degrees(q_rad).tolist()
+
+        # Collision pre-check against the calibration board / tablet
+        # primitive + workspace + self. Skips when the master toggle
+        # ``mesh_collision_check_enabled`` is off (validate returns
+        # safe=True without checking). The check uses the live joint
+        # broadcast as q_from so the swept trajectory is valid.
+        try:
+            from nicegui import ui as _ui  # noqa: PLC0415
+
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+
+            from .collision import validate_joint_trajectory  # noqa: PLC0415
+
+            current_q_deg = list(robot_state.angles.deg[:6])
+            check = validate_joint_trajectory(current_q_deg, list(angles_deg))
+            if not check.get("safe", True):
+                reason = check.get("reason", "collision")
+                msg = (
+                    f"Hover ({ref_label}): aborted, would collide ({reason})."
+                )
+                _post_status(msg)
+                # Surface a toast too: status-line updates are easy
+                # to miss when the user's attention is on the 3D
+                # scene area.
+                loop = _state.get("main_loop")
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(
+                            lambda m=msg: _ui.notify(
+                                m, color="warning", position="top",
+                            ),
+                        )
+                    except RuntimeError:
+                        pass
+                return
+        except Exception as e:  # noqa: BLE001
+            logger.debug("hover trajectory pre-check skipped (%s)", e)
+
         _post_status(
             f"Hover ({ref_label}): moving to "
             f"({board_local_x_m * 1000:.0f}, {board_local_y_m * 1000:.0f}) mm "

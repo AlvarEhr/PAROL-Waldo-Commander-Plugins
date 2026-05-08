@@ -208,11 +208,30 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
 
 def update_frustum(T_cam2flange: NDArray[np.float64]) -> None:
-    """Replace frustum lines after a mount update."""
+    """Replace frustum lines after a mount update.
+
+    Deletes the entire ``near_cone_group`` (not just its line children),
+    then rebuilds. Deleting only the lines leaves an empty group behind
+    in the three.js scene tree; on browsers that batch the websocket
+    diffs lazily, the OLD lines may not actually disappear visually
+    even after the line ``delete()`` calls succeed server-side, so
+    switching tools showed both the OLD tool's frustum AND the new
+    one's. Deleting the whole group forces the browser to drop every
+    line at once.
+    """
     group = _state.get("frustum_group")
     if group is None:
         return
-    for obj in _state.get("frustum_objects", []):
+    old_cone = _state.get("near_cone_group")
+    if old_cone is not None:
+        try:
+            old_cone.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["near_cone_group"] = None
+    # Belt and braces: also delete each tracked line in case the
+    # near_cone_group reference was stale.
+    for obj in _state.get("frustum_objects", []) or []:
         try:
             obj.delete()
         except Exception:  # noqa: BLE001

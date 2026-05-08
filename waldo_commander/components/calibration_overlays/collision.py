@@ -12,6 +12,20 @@ from numpy.typing import NDArray
 from . import settings
 from .state import _T_BOARD2BASE, _state, current_board_config
 
+
+def _mesh_collision_enabled() -> bool:
+    """Master gate for the mesh-collision machinery. Read from
+    ``app.storage.general['mesh_collision_check_enabled']`` (default
+    True). Flipped from the bottom-right Settings tab in waldo-
+    commander.
+    """
+    try:
+        from nicegui import app  # noqa: PLC0415
+
+        return bool(app.storage.general.get("mesh_collision_check_enabled", True))
+    except Exception:  # noqa: BLE001
+        return True
+
 logger = logging.getLogger(__name__)
 
 
@@ -82,7 +96,7 @@ def _build_collision_manager(
         if not body_path.exists():
             logger.info(
                 "collision: gripper body STL missing at %s; "
-                "body collision skipped", body_path,
+                "trying next body mesh if any", body_path,
             )
             continue
         try:
@@ -90,9 +104,14 @@ def _build_collision_manager(
             mgr.add_object("gripper", grip_mesh, transform=np.eye(4))
             meshes["gripper"] = grip_mesh
         except Exception as e:  # noqa: BLE001
-            logger.warning("collision mesh load failed for gripper: %s", e)
-        # Only load the FIRST body mesh — there's typically just one,
-        # and the collision manager keys by name ("gripper").
+            logger.warning(
+                "collision mesh load failed for %s: %s; "
+                "trying next body mesh if any", body_path, e,
+            )
+            continue
+        # First successful body mesh wins; the collision manager keys
+        # by name ("gripper") so additional bodies wouldn't be tracked
+        # separately anyway. Break only after a confirmed-good load.
         break
 
     for idx, jaw_path in enumerate(jaw_mesh_files):
@@ -399,6 +418,21 @@ def validate_joint_trajectory(
     if degrees:
         q_from_arr = np.deg2rad(q_from_arr)
         q_to_arr = np.deg2rad(q_to_arr)
+
+    # Master gate from the bottom-right Settings tab. When the user
+    # has the "Mesh collision check" toggle off, return safe=True
+    # without doing any work — useful on low-spec machines or when
+    # the user wants to skip checks entirely. manager_ready=False
+    # makes the bypass detectable to callers that care.
+    if not _mesh_collision_enabled():
+        return {
+            "safe": True,
+            "start_safe": True,
+            "end_safe": True,
+            "interior_safe": True,
+            "manager_ready": False,
+            "reason": "mesh collision check disabled in Settings",
+        }
 
     pair = _state.get("trajectory_collision_mgr_pair")
     if pair is not None:
