@@ -28,15 +28,33 @@ from waldo_commander.components.settings import SettingsContent
 logger = logging.getLogger(__name__)
 
 
-def _collision_pre_check(target_q_deg: list[float], context: str) -> bool:
-    """Inline pre-flight check on a discrete-target move dispatched from
-    the bottom-left control panel (Home, joint limits, go-to-angle).
+def _collision_check_with_dialog(
+    target_q_deg: list[float],
+    context: str,
+    on_send_anyway: Callable[[], None],
+) -> bool:
+    """Pre-flight collision check for a discrete-target control-panel
+    move (Home, joint-limit, go-to-angle).
 
-    Returns True to proceed, False to abort. On collision posts a
-    top-of-page warning toast. Skipped when calibration_overlays is
-    hard-off (env var WALDO_CALIBRATION_ENABLED=0; package not
-    importable) or the master mesh-collision toggle is off (the
-    underlying validator returns ``manager_ready=False``).
+    Returns True if the dispatch should proceed (safe, check
+    unavailable, or master gate off). Returns False if a collision
+    was detected — in that case the shared collision dialog is opened
+    (Cancel / Preview in sim / Send anyway), and ``on_send_anyway``
+    will be invoked when the user clicks the override button.
+
+    The dialog handles the override path itself, so the caller
+    should just ``return`` when this helper returns False.
+
+    Skipped (returns True) when:
+
+    * ``calibration_overlays`` is hard-off via
+      ``WALDO_CALIBRATION_ENABLED=0`` (package not importable).
+    * Master mesh-collision toggle is off (validator returns
+      ``manager_ready=False``).
+    * ``robot_state.angles`` hasn't been populated by the live
+      broadcast yet — using stale zeros as q_from would falsely
+      flag the trajectory through unrealistic configurations
+      (e.g. arm-flat-out at startup before connection).
 
     The check runs synchronously on the main loop. FCL queries are
     fast (~50ms total); not enough to noticeably block UI.
@@ -45,10 +63,29 @@ def _collision_pre_check(target_q_deg: list[float], context: str) -> bool:
         from waldo_commander.components.calibration_overlays.collision import (  # noqa: PLC0415
             validate_joint_trajectory,
         )
+        from waldo_commander.components.calibration_overlays.preview_dialog import (  # noqa: PLC0415
+            show_collision_dialog,
+        )
     except ImportError:
         return True
     try:
         current = list(robot_state.angles.deg[:6])
+    except Exception as e:  # noqa: BLE001
+        logger.debug("control collision pre-check skipped (angles): %s", e)
+        return True
+
+    # Startup heuristic: if the live broadcast hasn't populated yet,
+    # robot_state.angles is the dataclass default (zeros). Checking
+    # a trajectory from [0, 0, 0, 0, 0, 0] (arm pointing straight
+    # along +X) to anything else interpolates through configs that
+    # almost certainly clip the floor in our simplified-mesh world,
+    # producing a false rejection — most visibly on the very first
+    # Home button click after launching the GUI. Skip the check when
+    # the broadcast hasn't given us real joint state yet.
+    if all(abs(v) < 1e-9 for v in current):
+        return True
+
+    try:
         result = validate_joint_trajectory(
             current, list(target_q_deg), gripper_only=False,
         )
@@ -59,10 +96,19 @@ def _collision_pre_check(target_q_deg: list[float], context: str) -> bool:
         return True
     if result.get("safe", True):
         return True
+
     reason = result.get("reason", "collision")
-    ui.notify(
-        f"{context}: would collide ({reason}). Aborted.",
-        color="warning", position="top",
+    pair = result.get("colliding_pair")
+    pair_str = (
+        f", {pair[0]} <-> {pair[1]}"
+        if isinstance(pair, tuple) and len(pair) == 2
+        else ""
+    )
+    msg = f"{context}: would collide ({reason}{pair_str})."
+    show_collision_dialog(
+        message=msg,
+        target_q_deg=list(target_q_deg),
+        on_send_anyway=on_send_anyway,
     )
     return False
 
@@ -1361,8 +1407,19 @@ class ControlPanel:
             pose[joint_index] = tgt
             spd = _norm_speed()
 
-            if not _collision_pre_check(pose, f"Go-to J{joint_index + 1}={tgt:.1f}"):
-                return
+            async def _do_move() -> None:
+                try:
+                    await self.client.move_j(pose, speed=spd)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Send-anyway go-to-angle failed: %s", e)
+
+            def _send_anyway() -> None:
+                asyncio.create_task(_do_move())
+
+            if not _collision_check_with_dialog(
+                pose, f"Go-to J{joint_index + 1}={tgt:.1f}", _send_anyway,
+            ):
+                return  # dialog opened; user decides
 
             await self.client.move_j(pose, speed=spd)
         except Exception as e:
@@ -1385,8 +1442,20 @@ class ControlPanel:
             target[joint_index] = float(lo if which == "min" else hi)
             spd = _norm_speed()
 
-            if not _collision_pre_check(
-                target, f"J{joint_index + 1} {'min' if which == 'min' else 'max'}",
+            async def _do_move() -> None:
+                try:
+                    await self.client.move_j(target, speed=spd)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Send-anyway joint-limit failed: %s", e)
+                    ui.notify(f"Failed joint move: {e}", color="negative")
+
+            def _send_anyway() -> None:
+                asyncio.create_task(_do_move())
+
+            if not _collision_check_with_dialog(
+                target,
+                f"J{joint_index + 1} {'min' if which == 'min' else 'max'}",
+                _send_anyway,
             ):
                 return
 
@@ -1463,12 +1532,29 @@ class ControlPanel:
         if not self._movement_allowed():
             return
 
-        # Pre-flight check on the home target.
+        # Pre-flight check on the home target. Home is a recovery
+        # move, so a hard-block here is particularly painful — wire
+        # the override dialog so the user can always Send anyway.
         try:
             from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
 
-            if not _collision_pre_check(list(HOME_ANGLES_DEG), "Home"):
-                return
+            home_target = list(HOME_ANGLES_DEG)
+
+            async def _do_home() -> None:
+                try:
+                    await self.client.home()
+                    motion_recorder.record_action("home")
+                    logger.info("HOME sent (override)")
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Send-anyway home failed: %s", e)
+
+            def _send_anyway() -> None:
+                asyncio.create_task(_do_home())
+
+            if not _collision_check_with_dialog(
+                home_target, "Home", _send_anyway,
+            ):
+                return  # dialog opened; user decides
         except ImportError:
             pass  # parol6 not importable; fall through and let home() try
 
