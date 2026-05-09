@@ -34,6 +34,15 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 
+def _mark_scene_initialized(*_args: Any, **_kwargs: Any) -> None:
+    """Set ``_state['scene_initialized']`` when the URDF scene's
+    'init' event fires. Used as the gate for timer-driven scene
+    mutations — see the long comment in :func:`add_overlays` where
+    this is wired up.
+    """
+    _state["scene_initialized"] = True
+
+
 def _live_pose_indicator_tick() -> None:
     """2 Hz background poll that updates the live-pose collision-status
     indicator chip in the calibration panel header.
@@ -179,6 +188,29 @@ def add_overlays(urdf_scene: Any) -> None:
         _state["main_loop"] = asyncio.get_running_loop()
     except RuntimeError:
         _state["main_loop"] = None
+
+    # Hook the scene's 'init' event so timer-driven scene mutations
+    # (footprint tick, reachability dots) know whether the browser
+    # has processed init_objects yet. Without this gate,
+    # ``run_method('create', ...)`` calls fired before init are
+    # silently DROPPED by NiceGUI's three.js handler:
+    #
+    #   create(type, id, parent_id, ...args) {
+    #     if (!this.is_initialized) return;  // scene.js:416
+    #
+    # The result is invisible objects (server-side they exist in
+    # ``scene.objects`` but the 3JS scene never sees them), causing
+    # the user-reported "centerline + footprint don't appear until
+    # I press anything" symptom (later events incidentally trigger
+    # re-sends that arrive after init has flipped is_initialized).
+    _state["scene_initialized"] = False
+    try:
+        urdf_scene.scene.on("init", _mark_scene_initialized)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("scene init hook failed: %s", e)
+        # Fall back to optimistic-true so the gate doesn't break
+        # cases where the hook can't attach.
+        _state["scene_initialized"] = True
 
     # Cache mount + paths for the worker thread.
     _state["merged_stl_path"] = merged_stl

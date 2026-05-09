@@ -348,7 +348,18 @@ def _raycast_footprint_tick() -> None:
                 _state["footprint_last_mount"] = None
             return
 
-        # Early exit (1.5): if the status consumer hasn't received a
+        # Early exit (1.5a): NiceGUI's three.js handler silently drops
+        # ``create`` messages until the browser has processed
+        # ``init_objects`` (scene.js:416 ``if (!this.is_initialized)
+        # return;``). If our timer fires before the browser's 'init'
+        # event reaches the server, anything we add to the scene is
+        # lost (server-side it's in ``scene.objects`` but the 3JS
+        # scene never sees it). ``add_overlays`` hooks 'init' to flip
+        # this slot to True; until then, skip drawing entirely.
+        if not _state.get("scene_initialized", False):
+            return
+
+        # Early exit (1.5b): if the status consumer hasn't received a
         # broadcast yet, ``robot_state.angles`` is the dataclass
         # default (zeros). Drawing a frustum + raycast hits at the
         # zero pose leaves a stale overlay floating at coordinates

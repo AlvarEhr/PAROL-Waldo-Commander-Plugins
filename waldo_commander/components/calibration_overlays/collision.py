@@ -72,17 +72,40 @@ def _resolve_active_tool_meshes(
 
     Returns ``(tool_key, {"BODY": [Path, ...], "JAW": [Path, ...]})``.
 
-    Resolves the active tool from ``robot_state.tool_key`` (the
-    controller's broadcast value); falls back to ``"NONE"`` (no
-    gripper meshes) if the lookup fails.
-    """
-    try:
-        from waldo_commander.state import robot_state  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        logger.debug("collision: robot_state unavailable: %s", e)
-        return ("NONE", {"BODY": [], "JAW": []})
+    Resolves the active tool from the GUI's logical selection
+    (``app.storage.general["selected_tool"]``) — which includes
+    ``custom:<name>`` keys — rather than ``robot_state.tool_key``,
+    which only reflects what the controller broadcasts and only ever
+    knows BUILT-IN tool keys. For custom tools that have a
+    ``proxy_tool_key`` set (so motor commands route through a
+    built-in), the controller broadcasts the proxy and
+    ``robot_state.tool_key`` would yield e.g. ``"VACUUM"`` even when
+    the GUI is actually presenting ``custom:msg_ai_realsense``.
+    Using the GUI selection means the collision check loads the
+    correct gripper meshes for the user's actual tool.
 
-    tool_key = getattr(robot_state, "tool_key", None) or "NONE"
+    Falls back to ``robot_state.tool_key``, then ``"NONE"`` (no
+    gripper meshes) when both lookups fail.
+    """
+    tool_key: str | None = None
+    try:
+        from .custom_tools import _active_gui_tool_key  # noqa: PLC0415
+
+        tool_key = _active_gui_tool_key()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "collision: GUI active-tool lookup failed (%s); falling back "
+            "to robot_state", e,
+        )
+    if not tool_key:
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+
+            tool_key = getattr(robot_state, "tool_key", None)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("collision: robot_state unavailable: %s", e)
+    if not tool_key:
+        tool_key = "NONE"
     return tool_key, resolve_tool_meshes_from_registry(tool_key, Path(mesh_dir))
 
 

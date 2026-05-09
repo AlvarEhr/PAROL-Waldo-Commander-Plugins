@@ -206,6 +206,23 @@ def _render_reachability_dots(
     """
     if scene_group is None:
         return
+
+    # Defer if NiceGUI's three.js scene hasn't reported 'init' yet —
+    # otherwise the create RPCs are silently dropped (scene.js:416).
+    # Re-schedule via a 0.1s timer; the same check on the next firing
+    # will succeed once init has landed.
+    if not _state.get("scene_initialized", False):
+        try:
+            ui.timer(
+                0.1,
+                lambda sg=scene_group, t=target_world, p=list(points_to_render):
+                    _render_reachability_dots(sg, t, p),
+                once=True,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reachability render defer-timer failed: %s", e)
+        return
+
     radius = float(settings.get("reachability_dot_radius_m"))
     if radius <= 0.0:
         radius = 0.003
