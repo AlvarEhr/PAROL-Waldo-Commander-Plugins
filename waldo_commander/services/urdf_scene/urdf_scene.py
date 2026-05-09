@@ -412,7 +412,7 @@ class UrdfScene(
                 self.scene.set_orbit_enabled(False)
             self._tcp_ball_dragging = True
             # Suspend joint controls during TCP ball manipulation in editing mode
-            if self._appearance_mode == RobotAppearanceMode.EDITING:
+            if self._appearance_mode in (RobotAppearanceMode.EDITING, RobotAppearanceMode.PREVIEW):
                 if not self._joint_controls_suspended:
                     self._disable_joint_transform_controls()
                     self._joint_controls_suspended = True
@@ -1387,7 +1387,7 @@ class UrdfScene(
             to prevent live updates from overwriting user manipulations.
         """
         # Don't update robot joints during editing mode - user is manipulating them
-        if self._appearance_mode == RobotAppearanceMode.EDITING:
+        if self._appearance_mode in (RobotAppearanceMode.EDITING, RobotAppearanceMode.PREVIEW):
             return
 
         for joint_name, q in zip(self.joint_names, val):
@@ -1654,7 +1654,7 @@ class UrdfScene(
 
     def _apply_tool_engaged_color(self, engaged: bool) -> None:
         """Apply activated color to tool meshes based on engaged state."""
-        if self._appearance_mode == RobotAppearanceMode.EDITING:
+        if self._appearance_mode in (RobotAppearanceMode.EDITING, RobotAppearanceMode.PREVIEW):
             return  # don't change colors in editing mode
         body_color, moving_color, opacity = self._get_tool_colors()
 
@@ -1674,7 +1674,7 @@ class UrdfScene(
         """Set robot appearance mode.
 
         Args:
-            mode: The appearance mode to set (LIVE, SIMULATOR, or EDITING)
+            mode: The appearance mode to set (LIVE, SIMULATOR, EDITING, or PREVIEW)
         """
         self._appearance_mode = mode
 
@@ -1683,6 +1683,7 @@ class UrdfScene(
         arm_color = {
             RobotAppearanceMode.LIVE: self.config.material,
             RobotAppearanceMode.SIMULATOR: self.config.sim_color,
+            RobotAppearanceMode.PREVIEW: self.config.preview_color,
         }.get(mode, self.config.edit_color)
 
         # Apply to arm meshes
@@ -1700,6 +1701,50 @@ class UrdfScene(
 
         logger.debug("Robot appearance mode set to %s", mode.value)
 
+    def apply_preview_pose(self, angles_rad: list[float] | np.ndarray) -> None:
+        """Pose-jump the URDF to a non-live joint configuration for
+        collision-rejected pose preview.
+
+        While in PREVIEW mode the live status broadcast → URDF apply
+        path is frozen (``set_axis_values`` short-circuits), the arm
+        renders in the configured ``preview_color`` translucent, and
+        TCP / joint transform controls are suspended. Call
+        :meth:`exit_preview` to restore live mode.
+
+        Args:
+            angles_rad: 6-vector joint angles in radians.
+        """
+        # Ensure ``angles_rad`` is a list of floats — _apply_joint_angles
+        # tolerates ndarray but the preview seed is the canonical shape.
+        try:
+            seq = list(angles_rad)
+        except TypeError:
+            return
+        previous_mode = self._appearance_mode
+        self._preview_previous_mode = previous_mode  # type: ignore[attr-defined]
+        self.set_appearance_mode(RobotAppearanceMode.PREVIEW)
+        try:
+            self._apply_joint_angles(seq)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("apply_preview_pose: _apply_joint_angles failed: %s", e)
+            # Restore mode so we don't leave the scene stuck in PREVIEW.
+            self.set_appearance_mode(previous_mode)
+            self._preview_previous_mode = None  # type: ignore[attr-defined]
+
+    def exit_preview(self) -> None:
+        """Exit PREVIEW mode and resume the live broadcast → URDF
+        apply path. Restores the appearance mode that was active before
+        :meth:`apply_preview_pose` was called.
+
+        Safe to call when not in PREVIEW (no-op).
+        """
+        if self._appearance_mode != RobotAppearanceMode.PREVIEW:
+            return
+        prev = getattr(self, "_preview_previous_mode", None)
+        target_mode = prev if prev is not None else RobotAppearanceMode.LIVE
+        self.set_appearance_mode(target_mode)
+        self._preview_previous_mode = None  # type: ignore[attr-defined]
+
     def set_simulator_appearance(self, active: bool) -> None:
         """Apply or remove simulator visual appearance (amber ghosting).
 
@@ -1707,7 +1752,7 @@ class UrdfScene(
             active: True to apply simulator appearance, False to restore default
         """
         # Don't change mode if currently in EDITING mode
-        if self._appearance_mode == RobotAppearanceMode.EDITING:
+        if self._appearance_mode in (RobotAppearanceMode.EDITING, RobotAppearanceMode.PREVIEW):
             logger.debug("Ignoring set_simulator_appearance while in EDITING mode")
             return
 
@@ -1725,6 +1770,12 @@ class UrdfScene(
                 self.config.tool_body_sim_color,
                 self.config.tool_moving_sim_color,
                 self.config.sim_opacity,
+            )
+        elif self._appearance_mode == RobotAppearanceMode.PREVIEW:
+            return (
+                self.config.preview_color,
+                self.config.preview_color,
+                self.config.preview_opacity,
             )
         else:
             return (

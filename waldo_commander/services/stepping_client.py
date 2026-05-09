@@ -12,10 +12,14 @@ Cross-platform compatible (Windows, macOS, Linux).
 import json
 import os
 import shutil
+import sys
 import tempfile
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+# One-shot warning state for the no-tool-selected fail-open path.
+_NO_TOOL_WARNED = False
 
 from .path_preview_client import MOTION_METHODS
 
@@ -153,12 +157,120 @@ class StepIO:
 _STEPPABLE_TOOL_METHODS = frozenset({"set_position", "open", "close", "calibrate"})
 
 
-# Methods whose joint-space target we can extract without running IK.
-# move_l / move_p use Cartesian targets; the subprocess doesn't have a
-# parol6 IK accessor wired up here, so we skip them. Most user programs
-# use move_j; the FCL pre-flight is best-effort, not a substitute for
-# the controller-side soft-stop / current-limit safeties.
-_PREFLIGHT_CHECKABLE_METHODS = frozenset({"move_j", "home"})
+# Methods whose joint-space target we can extract for pre-flight.
+# move_j / home land directly in joint space; move_l / move_p take
+# Cartesian targets and we run local IK (parol6.Robot.ik) to map them.
+# Cartesian moves with frame!="WRF" are skipped (TRF needs current TCP
+# composition; deferred). The FCL pre-flight is best-effort and is not
+# a substitute for the controller-side soft-stop / current-limit
+# safeties.
+_PREFLIGHT_CHECKABLE_METHODS = frozenset(
+    {"move_j", "home", "move_l", "move_p"},
+)
+
+# Cached parol6.Robot instance for local IK in the subprocess. Built
+# lazily on first Cartesian move because constructing the Robot loads
+# the URDF + initialises pinokin (~0.1-0.5s). Pure-move_j programs
+# never pay this cost.
+_LOCAL_ROBOT = None
+
+
+def _get_local_robot():  # noqa: ANN202
+    """Lazily build a parol6.Robot for local IK in the subprocess.
+
+    Returns the Robot instance on success or None when parol6 isn't
+    importable or construction fails (subprocess fails-open: skip the
+    Cartesian pre-flight rather than block the user's script).
+    """
+    global _LOCAL_ROBOT
+    if _LOCAL_ROBOT is not None:
+        return _LOCAL_ROBOT
+    try:
+        from parol6 import Robot  # noqa: PLC0415
+    except ImportError:
+        return None
+    try:
+        _LOCAL_ROBOT = Robot()
+    except Exception as e:  # noqa: BLE001
+        sys.stderr.write(
+            f"[collision pre-flight] failed to construct local "
+            f"parol6.Robot for IK: {type(e).__name__}: {e}; "
+            "skipping Cartesian collision pre-flight.\n",
+        )
+        sys.stderr.flush()
+        _LOCAL_ROBOT = None
+    return _LOCAL_ROBOT
+
+
+def _ik_cartesian_to_joints_deg(
+    pose_mm_deg: list[float],
+    seed_deg: list[float],
+) -> list[float] | None:
+    """Solve IK for a Cartesian pose, returning joint angles in degrees.
+
+    Args:
+        pose_mm_deg: 6-vector ``[x, y, z, rx, ry, rz]`` in mm + deg
+            (parol6's standard external-API convention).
+        seed_deg: Current joint angles in degrees, used as the IK seed.
+
+    Returns:
+        Joint angles in degrees if IK converged AND FK-verified to
+        within 1 mm / 1° of the requested pose; None otherwise.
+        FK-verify is necessary because parol6.Robot.ik's ``success``
+        flag is unreliable on near-singular configurations (per the
+        existing hover.py precedent).
+    """
+    import numpy as np  # noqa: PLC0415
+    from scipy.spatial.transform import Rotation as _R  # noqa: PLC0415
+
+    robot = _get_local_robot()
+    if robot is None:
+        return None
+
+    pose = np.asarray(pose_mm_deg, dtype=np.float64)
+    if pose.shape != (6,):
+        return None
+    pose_m_rad = np.array(
+        [
+            pose[0] / 1000.0,
+            pose[1] / 1000.0,
+            pose[2] / 1000.0,
+            np.radians(pose[3]),
+            np.radians(pose[4]),
+            np.radians(pose[5]),
+        ],
+        dtype=np.float64,
+    )
+    seed = np.radians(np.asarray(seed_deg, dtype=np.float64))
+
+    try:
+        result = robot.ik(pose_m_rad, seed)
+    except Exception:  # noqa: BLE001
+        return None
+
+    q = getattr(result, "q", None)
+    if q is None:
+        return None
+    q_arr = np.asarray(q, dtype=np.float64)
+    if q_arr.shape != (6,):
+        return None
+
+    # FK-verify: parol6.Robot.ik reports success=False on poses that
+    # actually converged within tolerance.
+    fk_pose = np.zeros(6, dtype=np.float64)
+    try:
+        robot.fk(q_arr, fk_pose)
+    except Exception:  # noqa: BLE001
+        return None
+    pos_err = float(np.linalg.norm(fk_pose[:3] - pose_m_rad[:3]))
+    R_target = _R.from_euler("XYZ", pose_m_rad[3:]).as_matrix()
+    R_actual = _R.from_euler("XYZ", fk_pose[3:]).as_matrix()
+    rot_err_rad = float(
+        np.arccos(np.clip((np.trace(R_target.T @ R_actual) - 1) / 2, -1, 1)),
+    )
+    if pos_err > 0.001 or rot_err_rad > np.radians(1.0):
+        return None
+    return np.degrees(q_arr).tolist()
 
 
 class CollisionPreFlightError(RuntimeError):
@@ -226,32 +338,113 @@ def _maybe_check_collision(
             target_q_deg = list(target)
         except TypeError:
             return
-    else:
+    elif method_name == "home":
         try:
             from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
         except ImportError:
             return
         target_q_deg = list(HOME_ANGLES_DEG)
-
-    try:
-        current = wrapped_client.angles()
-        if current is None:
+    elif method_name in ("move_l", "move_p"):
+        # Cartesian moves: only WRF is supported by the local-IK path.
+        # TRF (tool-relative) would require composing the current TCP
+        # offset, which adds plumbing for a less-common case. Skip
+        # silently; the controller still runs the move.
+        if kwargs.get("frame", "WRF") != "WRF":
             return
-        current_q_deg = list(current)[:6]
-    except Exception:  # noqa: BLE001
+        # Source the Cartesian target.
+        if method_name == "move_l":
+            pose = kwargs.get("pose")
+            if pose is None and args:
+                pose = args[0]
+            if pose is None:
+                return
+            try:
+                pose_list = list(pose)
+            except TypeError:
+                return
+        else:
+            waypoints = kwargs.get("waypoints")
+            if waypoints is None and args:
+                waypoints = args[0]
+            if not waypoints:
+                return
+            try:
+                pose_list = list(waypoints[-1])
+            except (TypeError, IndexError):
+                return
+        # Need a current-joints snapshot for the IK seed (also serves
+        # as q_from for the trajectory check below).
+        try:
+            current = wrapped_client.angles()
+            if current is None:
+                return
+            current_q_deg = list(current)[:6]
+        except (OSError, RuntimeError, ValueError):
+            return
+        target_q_deg = _ik_cartesian_to_joints_deg(
+            pose_list, current_q_deg,
+        )
+        if target_q_deg is None:
+            # IK failed or didn't FK-verify. Don't block the move on
+            # IK quality; the controller-side IK is the source of
+            # truth and will fail the move if truly unreachable.
+            return
+    else:
         return
+
+    # For move_l / move_p the angles() snapshot was already taken
+    # above as the IK seed. For move_j / home, take it here.
+    if method_name in ("move_j", "home"):
+        try:
+            current = wrapped_client.angles()
+            if current is None:
+                return
+            current_q_deg = list(current)[:6]
+        except (OSError, RuntimeError, ValueError) as e:
+            # Controller is unreachable / non-responsive / malformed
+            # response. Fail-open so the user's script isn't stranded
+            # by a transient network glitch.
+            sys.stderr.write(
+                f"[collision pre-flight] angles() unavailable ({type(e).__name__}: {e}); "
+                "skipping check for this move.\n",
+            )
+            sys.stderr.flush()
+            return
 
     try:
         tool_key = getattr(wrapped_client.tool, "key", None) or "NONE"
-    except Exception:  # noqa: BLE001
+    except (RuntimeError, AttributeError):
+        # parol6 RobotClient.tool raises RuntimeError when no tool is
+        # bound. Treat the same as no-tool.
         tool_key = "NONE"
     tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
+
+    # No-tool detection: a manager built with an empty body_paths +
+    # empty jaw_paths and gripper_only=True contains only the FLOOR
+    # primitive — there's no movable object to collide it with, so
+    # every check would falsely report safe. Surface this as a
+    # one-shot stderr warning and skip the check (rather than running
+    # an expensive but useless FCL pass). Users can correct by
+    # selecting a tool in the GUI before running the program.
+    body_paths = tuple(tool_meshes["BODY"])
+    jaw_paths = tuple(tool_meshes["JAW"])
+    if tool_key == "NONE" or (not body_paths and not jaw_paths):
+        global _NO_TOOL_WARNED
+        if not _NO_TOOL_WARNED:
+            sys.stderr.write(
+                "[collision pre-flight] no gripper tool selected "
+                f"(tool_key={tool_key!r}); skipping checks for this run. "
+                "Select a tool in the GUI to enable collision pre-flight.\n",
+            )
+            sys.stderr.flush()
+            _NO_TOOL_WARNED = True
+        return
 
     config = CollisionEnvironmentConfig(
         gripper_only=True,
         tool_key=tool_key,
-        body_mesh_paths=tuple(tool_meshes["BODY"]),
-        jaw_mesh_paths=tuple(tool_meshes["JAW"]),
+        body_mesh_paths=body_paths,
+        jaw_mesh_paths=jaw_paths,
         tablet_T_board2base=None,
         tablet_dimensions_m=None,
         floor_enabled=True,

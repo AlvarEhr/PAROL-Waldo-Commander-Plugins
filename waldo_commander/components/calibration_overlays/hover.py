@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 import numpy as np
@@ -212,11 +213,12 @@ def _drive_hover_pose_thread(
         # safe=True without checking). The check uses the live joint
         # broadcast as q_from so the swept trajectory is valid.
         try:
-            from nicegui import ui as _ui  # noqa: PLC0415
-
             from waldo_commander.state import robot_state  # noqa: PLC0415
 
             from .collision import validate_joint_trajectory  # noqa: PLC0415
+            from .preview_dialog import (  # noqa: PLC0415
+                show_collision_dialog_threadsafe,
+            )
 
             current_q_deg = list(robot_state.angles.deg[:6])
             check = validate_joint_trajectory(current_q_deg, list(angles_deg))
@@ -226,19 +228,65 @@ def _drive_hover_pose_thread(
                     f"Hover ({ref_label}): aborted, would collide ({reason})."
                 )
                 _post_status(msg)
-                # Surface a toast too: status-line updates are easy
-                # to miss when the user's attention is on the 3D
-                # scene area.
-                loop = _state.get("main_loop")
-                if loop is not None:
-                    try:
-                        loop.call_soon_threadsafe(
-                            lambda m=msg: _ui.notify(
-                                m, color="warning", position="top",
-                            ),
-                        )
-                    except RuntimeError:
-                        pass
+                # Clear is_hovering NOW so the 'Send anyway' callback's
+                # fresh dispatch thread can re-acquire the busy slot.
+                _state["is_hovering"] = False
+
+                hover_angles = list(angles_deg)
+                hover_label = ref_label
+                hover_lx_m = board_local_x_m
+                hover_ly_m = board_local_y_m
+                hover_so_m = standoff_m
+
+                def _send_anyway() -> None:
+                    if _state.get("is_hovering"):
+                        return
+                    _state["is_hovering"] = True
+                    _state["stop_requested"] = False
+
+                    def _thread() -> None:
+                        from .panel import _post_status as _ps  # noqa: PLC0415
+                        try:
+                            from parol6 import RobotClient as _RC  # noqa: PLC0415
+
+                            c = _RC(host="127.0.0.1", port=5001)
+                            _state["client"] = c
+                            _ps(
+                                f"Hover ({hover_label}): moving to "
+                                f"({hover_lx_m * 1000:.0f}, {hover_ly_m * 1000:.0f}) mm "
+                                f"@ standoff {hover_so_m * 1000:.0f} mm (override)",
+                            )
+                            rc2 = c.move_j(
+                                angles=hover_angles, speed=0.3, accel=0.5,
+                                wait=True, timeout=20.0,
+                            )
+                            if rc2 < 0:
+                                _ps(f"Hover ({hover_label}): move halted.")
+                            else:
+                                _ps(
+                                    f"Hover OK ({hover_label}, override): "
+                                    f"({hover_lx_m * 1000:.0f}, {hover_ly_m * 1000:.0f}) mm "
+                                    f"@ {hover_so_m * 1000:.0f} mm — measure now.",
+                                )
+                        except Exception as e:  # noqa: BLE001
+                            try:
+                                _ps(f"Hover override failed: {e}")
+                            except Exception:  # noqa: BLE001
+                                logger.exception("hover-override thread crashed")
+                        finally:
+                            _state["is_hovering"] = False
+                            _state["stop_requested"] = False
+
+                    threading.Thread(
+                        target=_thread, daemon=True,
+                        name="hover-send-anyway",
+                    ).start()
+
+                show_collision_dialog_threadsafe(
+                    message=msg,
+                    target_q_deg=hover_angles,
+                    on_send_anyway=_send_anyway,
+                )
                 return
         except Exception as e:  # noqa: BLE001
             logger.debug("hover trajectory pre-check skipped (%s)", e)

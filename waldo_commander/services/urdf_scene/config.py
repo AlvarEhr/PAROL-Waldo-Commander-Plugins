@@ -21,11 +21,14 @@ class RobotAppearanceMode(Enum):
     LIVE: Normal robot view showing real-time joint angles from robot_state
     SIMULATOR: Amber/ghost appearance, still shows real-time angles
     EDITING: Grey semi-transparent appearance for target editing, shows editing angles
+    PREVIEW: Red semi-transparent appearance for collision-rejected pose preview;
+        shows non-live joint angles, live broadcast frozen until exit_preview()
     """
 
     LIVE = "live"
     SIMULATOR = "simulator"
     EDITING = "editing"
+    PREVIEW = "preview"
 
 
 @dataclass
@@ -95,6 +98,12 @@ class UrdfSceneConfig:
 
     edit_opacity: float = 0.4
     """Opacity for robot in editing mode."""
+
+    preview_color: str = "#cc3333"
+    """Color for robot in preview mode (red, signals rejected pose)."""
+
+    preview_opacity: float = 0.55
+    """Opacity for robot in preview mode."""
 
     tool_body_material: str = SceneColors.TOOL_BODY_HEX
     """Color for tool body meshes in live mode."""

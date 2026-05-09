@@ -93,16 +93,51 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
     _state["stop_requested"] = False
     _close_popup()
 
-    def _worker() -> None:
-        # Lazy import: avoids panel<->pose_popup import cycle and keeps
-        # parol6 out of the package-load path.
-        from nicegui import ui as _ui  # noqa: PLC0415
+    def _spawn_dispatch(angles_deg: list[float]) -> None:
+        """Spawn a fresh daemon thread to dispatch the move. Used by the
+        normal safe path AND by the dialog's 'Send anyway' button (which
+        runs on the main loop and needs an off-loop thread for the
+        synchronous parol6 client).
+        """
+        if _state.get("is_going_to_pose"):
+            return
+        _state["is_going_to_pose"] = True
+        _state["stop_requested"] = False
 
+        def _dispatch_thread() -> None:
+            from .panel import _post_status as _ps  # noqa: PLC0415
+            try:
+                from parol6 import RobotClient  # noqa: PLC0415
+
+                client = RobotClient(host="127.0.0.1", port=5001)
+                _state["client"] = client
+                _ps(f"Driving to reachable pose #{dot_idx}...")
+                rc = client.move_j(
+                    angles=list(angles_deg), speed=0.3, accel=0.5,
+                    wait=True, timeout=20.0,
+                )
+                if rc < 0:
+                    _ps(f"Move halted at pose #{dot_idx}.")
+                else:
+                    _ps(f"At reachable pose #{dot_idx}.")
+            except Exception as e:  # noqa: BLE001
+                try:
+                    _ps(f"Move failed: {e}")
+                except Exception:  # noqa: BLE001
+                    logger.exception("go-to-pose dispatch crashed")
+            finally:
+                _state["is_going_to_pose"] = False
+                _state["stop_requested"] = False
+
+        threading.Thread(
+            target=_dispatch_thread, daemon=True,
+            name=f"go-to-pose-dispatch-{dot_idx}",
+        ).start()
+
+    def _worker() -> None:
         from .panel import _post_status  # noqa: PLC0415
 
         try:
-            from parol6 import RobotClient  # noqa: PLC0415
-
             angles_rad = np.asarray(candidate.joint_angles_rad, dtype=np.float64)
             angles_deg = np.degrees(angles_rad).tolist()
 
@@ -113,6 +148,9 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
                 from waldo_commander.state import robot_state  # noqa: PLC0415
 
                 from .collision import validate_joint_trajectory  # noqa: PLC0415
+                from .preview_dialog import (  # noqa: PLC0415
+                    show_collision_dialog_threadsafe,
+                )
 
                 current_q_deg = list(robot_state.angles.deg[:6])
                 check = validate_joint_trajectory(
@@ -124,22 +162,23 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
                         f"Pose #{dot_idx}: aborted, would collide ({reason})."
                     )
                     _post_status(msg)
-                    # Surface a toast too: a status-line update alone
-                    # is easy to miss when the user's mouse is in the
-                    # 3D scene area.
-                    loop = _state.get("main_loop")
-                    if loop is not None:
-                        try:
-                            loop.call_soon_threadsafe(
-                                lambda m=msg: _ui.notify(
-                                    m, color="warning", position="top",
-                                ),
-                            )
-                        except RuntimeError:
-                            pass
+                    # Clear the busy flag NOW so the dialog's
+                    # 'Send anyway' callback can re-acquire it.
+                    _state["is_going_to_pose"] = False
+                    show_collision_dialog_threadsafe(
+                        message=msg,
+                        target_q_deg=list(angles_deg),
+                        on_send_anyway=lambda a=list(angles_deg): _spawn_dispatch(a),
+                    )
                     return
             except Exception as e:  # noqa: BLE001
                 logger.debug("go-to-pose pre-check skipped (%s)", e)
+
+            # Safe path — dispatch directly. This worker thread already
+            # holds the busy flag (set by the caller when it scheduled
+            # _worker). We don't want _spawn_dispatch's busy-flag
+            # acquisition to block, so just dispatch inline here.
+            from parol6 import RobotClient  # noqa: PLC0415
 
             client = RobotClient(host="127.0.0.1", port=5001)
             _state["client"] = client
@@ -158,8 +197,11 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("go-to-pose worker crashed")
         finally:
-            # Clear the busy flag so the next click can dispatch.
-            _state["is_going_to_pose"] = False
+            # Clear the busy flag so the next click can dispatch (only
+            # if the safe path took it through to dispatch — the
+            # collision-blocked path already cleared it above).
+            if _state.get("is_going_to_pose"):
+                _state["is_going_to_pose"] = False
             _state["stop_requested"] = False
 
     threading.Thread(

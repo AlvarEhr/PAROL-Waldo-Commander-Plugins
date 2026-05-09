@@ -753,6 +753,16 @@ def _build_full_panel(close_callback: Callable[[], None] | None = None) -> None:
 
     with ui.row().classes("w-full items-center"):
         ui.label("Calibration").classes("text-lg font-medium")
+        # Live-pose collision indicator: 2 Hz background tick in
+        # overlays.py updates the text + color + tooltip based on the
+        # current robot configuration. Gripper-only check (~7x faster
+        # than full); never blocks a move, just a visual signal.
+        live_pose_chip = (
+            ui.chip("?", color="grey")
+            .props("dense outline size=xs")
+            .tooltip("Live pose collision check (initialising)")
+        )
+        _state["live_pose_label"] = live_pose_chip
         ui.space()
         ui.button(
             icon="power_settings_new", on_click=_on_disable_features,
@@ -796,6 +806,51 @@ def _build_full_panel(close_callback: Callable[[], None] | None = None) -> None:
                 "Localise Board", on_click=_on_localise, color="secondary",
             ).props("size=sm")
             ui.button("STOP", on_click=_on_stop, color="negative").props("size=sm")
+
+        with ui.row().classes("gap-1 q-mt-xs"):
+            def _on_check_current_pose() -> None:
+                """Single-shot collision check on the live joint
+                configuration. Useful as a debug tool: tells the user
+                whether the current pose is currently safe per the
+                gripper-vs-environment manager.
+                """
+                try:
+                    from waldo_commander.state import (  # noqa: PLC0415
+                        robot_state,
+                    )
+
+                    from .collision import (  # noqa: PLC0415
+                        validate_joint_trajectory,
+                    )
+                    cur = list(robot_state.angles.deg[:6])
+                    result = validate_joint_trajectory(
+                        cur, cur, gripper_only=False,
+                    )
+                    if not result.get("manager_ready", False):
+                        _post_status(
+                            f"Pose check: {result.get('reason', 'unavailable')}.",
+                        )
+                        return
+                    if result.get("safe", True):
+                        _post_status(
+                            "Pose check: current pose is collision-free.",
+                        )
+                    else:
+                        pair = result.get("colliding_pair")
+                        reason = result.get("reason", "collision")
+                        if pair is not None:
+                            _post_status(
+                                f"Pose check: end_safe={result.get('end_safe')}, "
+                                f"reason={reason}, pair={pair[0]} <-> {pair[1]}.",
+                            )
+                        else:
+                            _post_status(f"Pose check: {reason}.")
+                except (ImportError, AttributeError, RuntimeError) as e:
+                    _post_status(f"Pose check failed: {e}")
+
+            ui.button(
+                "Check current pose", on_click=_on_check_current_pose,
+            ).props("size=sm flat color=info")
 
         ui.separator().classes("q-my-sm")
 

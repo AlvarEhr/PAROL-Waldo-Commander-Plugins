@@ -27,6 +27,46 @@ from waldo_commander.components.settings import SettingsContent
 
 logger = logging.getLogger(__name__)
 
+
+def _collision_pre_check(target_q_deg: list[float], context: str) -> bool:
+    """Inline pre-flight check on a discrete-target move dispatched from
+    the bottom-left control panel (Home, joint limits, go-to-angle).
+
+    Returns True to proceed, False to abort. On collision posts a
+    top-of-page warning toast. Skipped when calibration_overlays is
+    hard-off (env var WALDO_CALIBRATION_ENABLED=0; package not
+    importable) or the master mesh-collision toggle is off (the
+    underlying validator returns ``manager_ready=False``).
+
+    The check runs synchronously on the main loop. FCL queries are
+    fast (~50ms total); not enough to noticeably block UI.
+    """
+    try:
+        from waldo_commander.components.calibration_overlays.collision import (  # noqa: PLC0415
+            validate_joint_trajectory,
+        )
+    except ImportError:
+        return True
+    try:
+        current = list(robot_state.angles.deg[:6])
+        result = validate_joint_trajectory(
+            current, list(target_q_deg), gripper_only=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("control collision pre-check skipped: %s", e)
+        return True
+    if not result.get("manager_ready", False):
+        return True
+    if result.get("safe", True):
+        return True
+    reason = result.get("reason", "collision")
+    ui.notify(
+        f"{context}: would collide ({reason}). Aborted.",
+        color="warning", position="top",
+    )
+    return False
+
+
 # Module-level constants (avoid recreation every frame)
 _AXIS_ORDER = (
     "X+",
@@ -1321,6 +1361,9 @@ class ControlPanel:
             pose[joint_index] = tgt
             spd = _norm_speed()
 
+            if not _collision_pre_check(pose, f"Go-to J{joint_index + 1}={tgt:.1f}"):
+                return
+
             await self.client.move_j(pose, speed=spd)
         except Exception as e:
             logger.error("Go to joint angle failed: %s", e)
@@ -1341,6 +1384,11 @@ class ControlPanel:
             target = angles[: self._n_joints]
             target[joint_index] = float(lo if which == "min" else hi)
             spd = _norm_speed()
+
+            if not _collision_pre_check(
+                target, f"J{joint_index + 1} {'min' if which == 'min' else 'max'}",
+            ):
+                return
 
             await self.client.move_j(target, speed=spd)
         except Exception as e:
@@ -1414,6 +1462,15 @@ class ControlPanel:
 
         if not self._movement_allowed():
             return
+
+        # Pre-flight check on the home target.
+        try:
+            from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
+
+            if not _collision_pre_check(list(HOME_ANGLES_DEG), "Home"):
+                return
+        except ImportError:
+            pass  # parol6 not importable; fall through and let home() try
 
         try:
             _ = await self.client.home()

@@ -34,6 +34,67 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 
+def _live_pose_indicator_tick() -> None:
+    """2 Hz background poll that updates the live-pose collision-status
+    indicator chip in the calibration panel header.
+
+    Reads ``robot_state.angles.deg``, runs a single-config gripper-only
+    collision check against the floor + active-tool meshes (no full
+    arm-vs-arm; ~7x faster), and updates ``_state["live_pose_status"]``
+    with one of:
+
+    * ``"ok"`` — current pose is collision-free.
+    * ``"collide:<reason>"`` — current pose collides; reason includes
+      the colliding pair when available.
+    * ``"unavailable"`` — master toggle off, parol6 not importable, no
+      tool selected, etc.
+
+    The indicator chip in panel.py reads this slot and updates its
+    color / tooltip on each tick.
+    """
+    label = _state.get("live_pose_label")
+    if label is None:
+        return  # panel hasn't built yet
+    try:
+        from waldo_commander.state import robot_state  # noqa: PLC0415
+
+        from .collision import validate_joint_trajectory  # noqa: PLC0415
+
+        cur = list(robot_state.angles.deg[:6])
+    except (ImportError, AttributeError):
+        return
+    try:
+        result = validate_joint_trajectory(
+            cur, cur, gripper_only=True, n_samples=0,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("live pose tick failed: %s", e)
+        return
+    if not result.get("manager_ready", False):
+        text = "?"
+        color = "grey"
+        tooltip = result.get("reason", "collision check unavailable")
+    elif result.get("safe", True):
+        text = "OK"
+        color = "positive"
+        tooltip = "Live pose is collision-free."
+    else:
+        reason = result.get("reason", "collision")
+        pair = result.get("colliding_pair")
+        text = "X"
+        color = "negative"
+        if pair is not None:
+            tooltip = f"Live pose collides: {pair[0]} <-> {pair[1]} ({reason})"
+        else:
+            tooltip = f"Live pose collides ({reason})"
+    try:
+        label.text = text
+        label.props(f"color={color}")
+        label.tooltip(tooltip)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("live pose label update failed: %s", e)
+
+
 # ---------------------------------------------------------------------------
 # Scene-overlay builders
 # ---------------------------------------------------------------------------
@@ -224,6 +285,7 @@ def add_overlays(urdf_scene: Any) -> None:
     _state["calib_timers"] = [
         ui.timer(0.25, _post_calibration_tick, active=True),
         ui.timer(1.0 / _FOOTPRINT_TICK_HZ, _raycast_footprint_tick, active=True),
+        ui.timer(0.5, _live_pose_indicator_tick, active=True),
     ]
 
     # Click-on-dot popup: page-level fixed-position container + a

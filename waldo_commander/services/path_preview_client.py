@@ -9,9 +9,19 @@ import inspect
 import linecache
 import logging
 import re
+from collections import OrderedDict
 from typing import Any
 
 import numpy as np
+
+# Edit-time collision-check result cache. Keyed by
+# ``(q_from_quantized, q_to_quantized, config_cache_key)`` so repeated
+# editor passes over the same program reuse FCL queries from prior
+# debounce ticks. ~5-10x speedup on common edit loops where the user
+# changes a single line and the rest of the program replays unchanged.
+_EDIT_TIME_PRECHECK_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
+_EDIT_TIME_PRECHECK_CACHE_MAX = 256
+_EDIT_TIME_QUANTIZE_DECIMALS = 4  # ~0.006 deg precision in quantized key
 
 from waldoctl import DryRunResult
 
@@ -109,12 +119,18 @@ class PathPreviewClient:
         self.accumulated_errors: list[str] = []
 
         init_deg: list[float] | None = None
+        init_rad: list[float] | None = None
         if initial_joints is not None:
-            init_deg = np.degrees(np.asarray(initial_joints, dtype=np.float64)).tolist()
+            init_arr = np.asarray(initial_joints, dtype=np.float64)
+            init_deg = np.degrees(init_arr).tolist()
+            init_rad = init_arr.tolist()
 
         self._client = dry_run_client_cls(initial_joints_deg=init_deg)
         self._tool_proxy = _ToolCollectionProxy(self)
-        self.last_joints_rad: list[float] | None = None
+        # Seed last_joints_rad from the live robot pose so the FIRST
+        # move's edit-time collision check has a valid q_from. Without
+        # this, the first move in every program is silently skipped.
+        self.last_joints_rad: list[float] | None = init_rad
         self._blend_move_type: str = ""
         self._pending_sleep: float = 0.0
         self._last_move_non_blocking: bool = False
@@ -314,9 +330,10 @@ class PathPreviewClient:
                 _ng_app.storage.general.get("mesh_collision_check_enabled", True),
             ):
                 return
-        except Exception:  # noqa: BLE001
-            # No NiceGUI context (unlikely here, but tests run headless) —
-            # treat as on so a CI dry-run still surfaces collisions.
+        except (ImportError, AttributeError, RuntimeError):
+            # NiceGUI not importable / no app context / storage not
+            # initialized (CI / headless smoke tests). Treat as on so
+            # a dry-run still surfaces collisions.
             pass
 
         try:
@@ -337,7 +354,7 @@ class PathPreviewClient:
             from waldo_commander.state import robot_state  # noqa: PLC0415
 
             tool_key = getattr(robot_state, "tool_key", None) or "NONE"
-        except Exception:  # noqa: BLE001
+        except (ImportError, AttributeError):
             tool_key = "NONE"
 
         tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
@@ -352,16 +369,38 @@ class PathPreviewClient:
             safety_margin_m=0.008,
         )
         end_joints_rad = list(result.end_joints_rad.tolist())
-        try:
-            check = validate_joint_trajectory_core(
-                prev_joints_rad, end_joints_rad,
-                config=config,
-                n_samples=6,
-                degrees=False,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("preview collision check skipped: %s", e)
-            return
+
+        # LRU cache lookup keyed by quantized (q_from, q_to, config).
+        # CollisionEnvironmentConfig is a frozen hashable dataclass so
+        # it serves as part of the key directly. q vectors quantized to
+        # ~0.006 deg precision so jitter from the controller's discrete
+        # joint state doesn't blow the cache.
+        q_from_key = tuple(
+            round(v, _EDIT_TIME_QUANTIZE_DECIMALS) for v in prev_joints_rad
+        )
+        q_to_key = tuple(
+            round(v, _EDIT_TIME_QUANTIZE_DECIMALS) for v in end_joints_rad
+        )
+        cache_key = (q_from_key, q_to_key, config)
+        cached = _EDIT_TIME_PRECHECK_CACHE.get(cache_key)
+        if cached is not None:
+            _EDIT_TIME_PRECHECK_CACHE.move_to_end(cache_key)
+            check = cached
+        else:
+            try:
+                check = validate_joint_trajectory_core(
+                    prev_joints_rad, end_joints_rad,
+                    config=config,
+                    n_samples=6,
+                    degrees=False,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("preview collision check skipped: %s", e)
+                return
+            _EDIT_TIME_PRECHECK_CACHE[cache_key] = check
+            _EDIT_TIME_PRECHECK_CACHE.move_to_end(cache_key)
+            while len(_EDIT_TIME_PRECHECK_CACHE) > _EDIT_TIME_PRECHECK_CACHE_MAX:
+                _EDIT_TIME_PRECHECK_CACHE.popitem(last=False)
 
         if not check.get("safe", True):
             line_no = self._get_caller_line_number()
