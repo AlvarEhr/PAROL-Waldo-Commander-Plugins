@@ -180,6 +180,7 @@ def _teardown_overlays() -> None:
         "hemisphere_group", "near_cone_group",
         "hemisphere_wireframe_group", "reachability_group",
         "detection_overlay_group",
+        "footprint_group",
     ):
         grp = _state.get(key)
         if grp is not None:
@@ -378,8 +379,16 @@ def apply_calibration_state() -> None:
         # the cache check in ``_footprint_inputs_changed`` may keep
         # the OLD tool's lines visible until the robot moves enough
         # for the joint-angle epsilon check to trip. Deleting the
-        # tracked objects here removes them visually immediately;
-        # the next tick redraws against the new mount.
+        # whole sub-group (rather than each line individually) forces
+        # the browser to drop every line at once — same pattern
+        # ``update_frustum`` uses for the near-cone.
+        old_footprint_group = _state.get("footprint_group")
+        if old_footprint_group is not None:
+            try:
+                old_footprint_group.delete()
+            except Exception:  # noqa: BLE001
+                pass
+            _state["footprint_group"] = None
         for obj in _state.get("footprint_objects", []) or []:
             try:
                 obj.delete()

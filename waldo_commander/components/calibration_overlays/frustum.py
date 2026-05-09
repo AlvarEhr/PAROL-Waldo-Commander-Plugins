@@ -299,11 +299,38 @@ def _footprint_inputs_changed(
     return False
 
 
+def _delete_footprint_group() -> None:
+    """Drop the dynamic-overlay sub-group AND the per-object handles
+    so a re-render leaves no orphan lines/polylines in the three.js
+    scene. Wrapping the per-tick lines in a parent group + deleting
+    the whole group (rather than each child line individually) forces
+    the browser to drop every line at once — the same pattern
+    ``update_frustum`` uses for the near-cone, fixing the same
+    websocket-batching artefact (browsers sometimes don't drop
+    individually-deleted lines until the next scene-tree diff).
+    """
+    grp = _state.get("footprint_group")
+    if grp is not None:
+        try:
+            grp.delete()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["footprint_group"] = None
+    # Belt-and-braces: also delete each tracked line in case the
+    # group reference was stale and didn't actually carry them.
+    for obj in _state.get("footprint_objects", []) or []:
+        try:
+            obj.delete()
+        except Exception:  # noqa: BLE001
+            pass
+    _state["footprint_objects"] = []
+
+
 def _raycast_footprint_tick() -> None:
     """Update the dynamic ray-projected footprint at ``_FOOTPRINT_TICK_HZ``.
 
     Projects rays from the camera apex through the far frustum corners and
-    draws the resulting polygon (and centerline) in the world scene. Three
+    draws the resulting polygon (and centerline) in the world scene. Four
     early-exit paths keep the asyncio loop unburdened — see the module
     comment above this function.
     """
@@ -315,13 +342,28 @@ def _raycast_footprint_tick() -> None:
         if not show_footprint and not show_centerline:
             # Tear down any stale objects from a previous-frame state
             # change so they don't linger when both flags are off.
-            stale = _state.pop("footprint_objects", None)
-            if stale:
-                for obj in stale:
-                    try:
-                        obj.delete()
-                    except Exception:  # noqa: BLE001
-                        pass
+            if _state.get("footprint_objects") or _state.get("footprint_group"):
+                _delete_footprint_group()
+                _state["footprint_last_q"] = None
+                _state["footprint_last_mount"] = None
+            return
+
+        # Early exit (1.5): if the controller hasn't broadcast joint
+        # state yet, ``robot_state.angles`` is the dataclass default
+        # (zeros). Drawing a frustum + raycast hits at the zero pose
+        # leaves a stale overlay floating at coordinates that don't
+        # match where the URDF lands once the broadcast catches up.
+        # Skip until ``robot_state.connected`` flips True.
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+        except ImportError:
+            return
+        if not getattr(robot_state, "connected", False):
+            # If we already drew something during a brief disconnected
+            # window (rare; possible if connected flickered), tear it
+            # down so the user doesn't see a frozen overlay.
+            if _state.get("footprint_objects") or _state.get("footprint_group"):
+                _delete_footprint_group()
                 _state["footprint_last_q"] = None
                 _state["footprint_last_mount"] = None
             return
@@ -352,7 +394,7 @@ def _raycast_footprint_tick() -> None:
         _, _, meshes = pair
 
         try:
-            from waldo_commander.state import robot_state, ui_state  # noqa: PLC0415
+            from waldo_commander.state import ui_state  # noqa: PLC0415
             from parol6_vision.sim.robot_kinematics import link_poses  # noqa: PLC0415
 
             n_joints = 6
@@ -381,28 +423,33 @@ def _raycast_footprint_tick() -> None:
                 _FRUSTUM_FAR_DEPTH_M or 1.5,
             )
 
+            # Drop the previous tick's group (and its child lines) in
+            # ONE scene-tree diff so the browser drops every line at
+            # once rather than retaining stragglers.
+            _delete_footprint_group()
+
             objects = []
-            # Parent everything to scene_root (world frame) so the footprint
-            # stays fixed to the hit surface instead of sticking to the
-            # camera locally. Delete-and-recreate inside one ``with``
-            # context so the websocket diff is one batched message.
             with scene_root:
-                for obj in _state.get("footprint_objects", []):
-                    try:
-                        obj.delete()
-                    except Exception:  # noqa: BLE001
-                        pass
-                if show_footprint:
-                    perimeter_points = [list(p) for p in hits_world]
-                    perimeter_points.append(list(hits_world[0]))  # close loop
-                    objects.append(
-                        ui.scene.polyline(perimeter_points).material("#ff00ff")
-                    )
-                if show_centerline:
-                    objects.append(
-                        ui.scene.line(list(cam_world), list(center_hit_world))
-                        .material("#ffff00")
-                    )
+                # New per-tick container: every line/polyline lives
+                # inside this sub-group so the next tick's
+                # ``_delete_footprint_group`` cleanly tears down the
+                # whole bundle.
+                footprint_group = (
+                    ui.scene.group().with_name("calib:footprint_group")
+                )
+                _state["footprint_group"] = footprint_group
+                with footprint_group:
+                    if show_footprint:
+                        perimeter_points = [list(p) for p in hits_world]
+                        perimeter_points.append(list(hits_world[0]))  # close loop
+                        objects.append(
+                            ui.scene.polyline(perimeter_points).material("#ff00ff")
+                        )
+                    if show_centerline:
+                        objects.append(
+                            ui.scene.line(list(cam_world), list(center_hit_world))
+                            .material("#ffff00")
+                        )
             _state["footprint_objects"] = objects
             # Cache the inputs we just rendered so the next tick can
             # short-circuit if nothing's changed.
