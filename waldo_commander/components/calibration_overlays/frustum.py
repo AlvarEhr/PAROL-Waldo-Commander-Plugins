@@ -455,6 +455,19 @@ def _raycast_footprint_tick() -> None:
                             .material("#ffff00")
                         )
             _state["footprint_objects"] = objects
+            # Force the scene element to enqueue a client-side update
+            # so the new line/polyline objects render immediately. The
+            # parent `with` context normally schedules this, but on
+            # the very first tick after broadcast (no prior user
+            # interaction to kick the flush) the new geometry was
+            # waiting for the next event before appearing — visible
+            # symptom: the centerline + footprint didn't show until
+            # the user clicked anything. Update on the scene_root is
+            # cheap and idempotent on subsequent ticks.
+            try:
+                scene_root.update()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("scene_root.update() failed: %s", e)
             # Cache the inputs we just rendered so the next tick can
             # short-circuit if nothing's changed.
             _state["footprint_last_q"] = q.copy()
