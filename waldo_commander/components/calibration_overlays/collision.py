@@ -244,6 +244,10 @@ def validate_joint_trajectory(
             "interior_safe": True,
             "manager_ready": False,
             "reason": "mesh collision check disabled in Settings",
+            "colliding_pair": None,
+            "colliding_q": None,
+            "start_pair": None,
+            "start_q": None,
         }
 
     config = _config_from_settings(
@@ -258,6 +262,10 @@ def validate_joint_trajectory(
             "interior_safe": True,
             "manager_ready": False,
             "reason": "collision-manager unavailable",
+            "colliding_pair": None,
+            "colliding_q": None,
+            "start_pair": None,
+            "start_q": None,
         }
 
     return validate_joint_trajectory_core(

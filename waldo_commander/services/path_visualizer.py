@@ -110,6 +110,7 @@ def _run_simulation_isolated(
     backend_package: str = "parol6",
     dry_run_client_cls: type | None = None,
     tool_meta_registry: dict[str, dict] | None = None,
+    gui_active_tool_key: str = "",
 ) -> dict[str, Any]:
     """
     Run dry-run simulation in isolated subprocess.
@@ -137,6 +138,24 @@ def _run_simulation_isolated(
         - error: Error message if simulation failed, else None
         - total_steps: Number of segments generated
     """
+    # Forward the GUI's active tool key into the subprocess env BEFORE
+    # PathPreviewClient runs the collision pre-check. The cpu_bound
+    # worker inherits env at process-pool fork time, so if the user
+    # changed tools after the pool was warmed, the env var here is
+    # stale; the explicit set below from the parent's call-time
+    # storage value wins. ``_check_segment_collision`` reads via
+    # ``os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "")`` and falls
+    # back to ``_active_gui_tool_key()`` (which is unreliable in this
+    # subprocess since ``app.storage.general`` is a stale on-disk
+    # snapshot, not the live GUI session).
+    import os as _os  # noqa: PLC0415
+    if gui_active_tool_key:
+        _os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = gui_active_tool_key
+    elif "WALDO_GUI_ACTIVE_TOOL_KEY" in _os.environ:
+        # Stale value from a prior run inherited via the pool — clear
+        # so the fallback chain takes over.
+        del _os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"]
+
     # Local collectors (not shared with main process)
     local_segments: list[dict] = []
     local_targets: list[dict] = []
@@ -475,6 +494,25 @@ class PathVisualizer:
                 except (KeyError, AttributeError):
                     pass
 
+            # Read the GUI's selected tool BEFORE entering the
+            # cpu_bound context. ``app.storage.general`` is request-
+            # context-bound here (this coroutine runs on the asyncio
+            # loop in the NiceGUI process), and the resolved key is
+            # forwarded into the subprocess so its
+            # ``_check_segment_collision`` resolves custom-tool keys
+            # correctly. Inside the cpu_bound worker, storage is a
+            # stale on-disk snapshot — this forward is the only
+            # reliable path.
+            gui_active_tool_key = ""
+            try:
+                from nicegui import app as _ng_app  # noqa: PLC0415
+
+                gui_active_tool_key = str(
+                    _ng_app.storage.general.get("selected_tool", "") or "",
+                )
+            except (ImportError, RuntimeError, AttributeError):
+                gui_active_tool_key = ""
+
             try:
                 # Run simulation in subprocess via NiceGUI's cpu_bound
                 result = await asyncio.wait_for(
@@ -486,6 +524,7 @@ class PathVisualizer:
                         backend_pkg,
                         dr_cls,
                         tool_meta_registry or None,
+                        gui_active_tool_key,
                     ),
                     timeout=SIMULATION_TIMEOUT_S
                     + 2.0,  # Extra buffer for process overhead
@@ -509,6 +548,7 @@ class PathVisualizer:
                         backend_pkg,
                         dr_cls,
                         tool_meta_registry or None,
+                        gui_active_tool_key,
                     )
                 except Exception as e2:
                     logger.error("Sync simulation also failed: %s", e2)

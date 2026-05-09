@@ -136,7 +136,7 @@ def _calibration_thread() -> None:
             """
 
             _MOTION_METHODS: frozenset[str] = frozenset({
-                "move_j", "move_l", "move_p", "home",
+                "move_j", "move_l", "move_p", "move_c", "move_s", "home",
             })
 
             def __init__(self, inner: Any) -> None:

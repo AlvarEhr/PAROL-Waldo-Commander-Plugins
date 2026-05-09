@@ -207,7 +207,9 @@ def show_collision_dialog(
                 logger.warning("on_send_anyway raised: %s", e)
 
         with ui.row().classes("w-full justify-end gap-2 mt-2"):
-            ui.button("Cancel", on_click=_do_cancel).props("flat")
+            cancel_button = ui.button("Cancel", on_click=_do_cancel).props(
+                "flat autofocus",
+            )
             preview_button = ui.button(
                 "Preview in sim", on_click=_do_preview,
             ).props("flat color=info")
@@ -222,6 +224,27 @@ def show_collision_dialog(
             ui.button(
                 "Exit preview", on_click=_do_exit_preview,
             ).props("flat color=info")
+
+        # Keyboard accessibility: Escape cancels (Quasar persistent
+        # dialogs ignore Escape by default), Enter confirms Cancel
+        # (the autofocused button). The keyboard listener is scoped
+        # to the dialog's lifetime via the cancel handler that closes
+        # it, so it doesn't leak across dialogs.
+        def _handle_keydown(e: Any) -> None:
+            key = getattr(e, "key", None) or getattr(e, "args", {}).get("key", "")
+            if key == "Escape":
+                _do_cancel()
+
+        try:
+            ui.keyboard(on_key=_handle_keydown).bind_visibility_from(
+                dialog, "value",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # ui.keyboard requires a UI context; if the dialog is being
+            # built from a non-page context (e.g. a teardown race), we
+            # accept the lack of Escape support — Cancel button still
+            # works.
+            logger.debug("preview_dialog: keyboard hook failed: %s", exc)
 
     _active_dialog = dialog
     dialog.open()

@@ -103,6 +103,24 @@ async def run_script(
     except Exception:  # noqa: BLE001
         env["WALDO_MESH_COLLISION_ENABLED"] = "1"
 
+    # Forward the GUI's active tool key. The controller's broadcast
+    # only carries BUILT-IN keys (custom tools route motor commands
+    # through their proxy_tool_key), so the subprocess's
+    # _maybe_check_collision can't resolve a custom tool's actual
+    # mesh paths from ``client.tool.key`` alone — it'd silently load
+    # the proxy tool's meshes instead. Reading from
+    # ``app.storage.general["selected_tool"]`` here picks up the
+    # canonical key (built-in or custom:<name>) for the subprocess
+    # to use as a tool_key override.
+    try:
+        from nicegui import app as _ng_app  # noqa: PLC0415
+
+        env["WALDO_GUI_ACTIVE_TOOL_KEY"] = str(
+            _ng_app.storage.general.get("selected_tool", "") or "",
+        )
+    except Exception:  # noqa: BLE001
+        env["WALDO_GUI_ACTIVE_TOOL_KEY"] = ""
+
     # Determine which script to run
     if session_id:
         # Use bootstrap script to inject stepping wrapper

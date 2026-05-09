@@ -355,12 +355,43 @@ class PathPreviewClient:
         if mesh_dir is None:
             return
 
-        try:
-            from waldo_commander.state import robot_state  # noqa: PLC0415
+        # Prefer the GUI's selected tool over robot_state.tool_key:
+        # the controller broadcast only carries BUILT-IN keys (custom
+        # tools with proxy_tool_key set route motor commands through
+        # a built-in like VACUUM or SSG-48), so reading
+        # robot_state.tool_key would silently load the WRONG gripper
+        # meshes for any custom tool.
+        #
+        # Resolution order:
+        # 1. ``WALDO_GUI_ACTIVE_TOOL_KEY`` env var. Path-preview
+        #    runs inside ``run.cpu_bound`` (a process-pool worker)
+        #    where ``app.storage.general`` is a stale on-disk
+        #    snapshot, NOT the live GUI session. The parent's
+        #    ``_run_simulation_isolated`` forwards the resolved key
+        #    via env var before each invocation; this is the only
+        #    reliable path inside the worker.
+        # 2. ``_active_gui_tool_key()``. Only correct in the
+        #    in-process fallback (when cpu_bound failed and we ran
+        #    sync). Reads ``app.storage.general``.
+        # 3. ``robot_state.tool_key`` last-ditch fallback.
+        import os  # noqa: PLC0415
+        tool_key: str | None = os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "").strip() or None
+        if not tool_key:
+            try:
+                from waldo_commander.components.calibration_overlays.custom_tools import (  # noqa: PLC0415
+                    _active_gui_tool_key,
+                )
 
-            tool_key = getattr(robot_state, "tool_key", None) or "NONE"
-        except (ImportError, AttributeError):
-            tool_key = "NONE"
+                tool_key = _active_gui_tool_key()
+            except (ImportError, RuntimeError):
+                tool_key = None
+        if not tool_key:
+            try:
+                from waldo_commander.state import robot_state  # noqa: PLC0415
+
+                tool_key = getattr(robot_state, "tool_key", None) or "NONE"
+            except (ImportError, AttributeError):
+                tool_key = "NONE"
 
         tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
         config = CollisionEnvironmentConfig(

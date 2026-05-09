@@ -408,8 +408,21 @@ def _maybe_check_collision(
             # controller validate.
             return
 
-        # Build the list of Cartesian waypoints. move_l takes a single
-        # pose; move_p / move_c / move_s take a list.
+        # Build the list of Cartesian waypoints. Each move method
+        # takes a different signature:
+        #
+        # * ``move_l(pose, *, frame=...)`` — single pose.
+        # * ``move_c(via, end, *, frame=...)`` — TWO separate positional
+        #   args (NOT a single waypoints list), via point and end point.
+        # * ``move_p(waypoints, *, frame=...)`` — list of poses.
+        # * ``move_s(waypoints, *, frame=...)`` — list of poses.
+        #
+        # NOTE: move_c interpolates an arc through (current, via, end);
+        # move_s interpolates a smooth spline through ``waypoints``.
+        # We endpoint-IK and joint-space interpolate between sampled
+        # waypoints, so a curve passing through obstacles BETWEEN
+        # waypoints isn't caught — known limitation, document at the
+        # call site.
         poses_cartesian: list[list[float]] = []
         if method_name == "move_l":
             pose = kwargs.get("pose")
@@ -419,6 +432,19 @@ def _maybe_check_collision(
                 return
             try:
                 poses_cartesian = [list(pose)]
+            except TypeError:
+                return
+        elif method_name == "move_c":
+            via = kwargs.get("via")
+            end = kwargs.get("end")
+            if via is None and len(args) >= 1:
+                via = args[0]
+            if end is None and len(args) >= 2:
+                end = args[1]
+            if via is None or end is None:
+                return
+            try:
+                poses_cartesian = [list(via), list(end)]
             except TypeError:
                 return
         else:
@@ -507,12 +533,21 @@ def _maybe_check_collision(
             sys.stderr.flush()
             return
 
-    try:
-        tool_key = getattr(wrapped_client.tool, "key", None) or "NONE"
-    except (RuntimeError, AttributeError):
-        # parol6 RobotClient.tool raises RuntimeError when no tool is
-        # bound. Treat the same as no-tool.
-        tool_key = "NONE"
+    # Tool-key resolution: the controller broadcast carries only
+    # BUILT-IN keys (custom tools with proxy_tool_key set route motor
+    # commands through a built-in like VACUUM or SSG-48). For program
+    # subprocesses the GUI's selected key is forwarded via the
+    # ``WALDO_GUI_ACTIVE_TOOL_KEY`` env var (set by ``script_runner``);
+    # prefer that over ``wrapped_client.tool.key`` when present so
+    # custom tools resolve to the correct meshes.
+    tool_key = os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "").strip()
+    if not tool_key:
+        try:
+            tool_key = getattr(wrapped_client.tool, "key", None) or "NONE"
+        except (RuntimeError, AttributeError):
+            # parol6 RobotClient.tool raises RuntimeError when no
+            # tool is bound. Treat the same as no-tool.
+            tool_key = "NONE"
     tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
 
     # No-tool detection: a manager built with an empty body_paths +

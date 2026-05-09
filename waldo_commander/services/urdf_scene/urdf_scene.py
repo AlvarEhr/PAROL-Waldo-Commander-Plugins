@@ -261,6 +261,13 @@ class UrdfScene(
 
         # Robot appearance mode (unified state machine)
         self._appearance_mode: RobotAppearanceMode = RobotAppearanceMode.LIVE
+        # PREVIEW mode tracks the prior mode so ``exit_preview`` can
+        # restore it (e.g. dot-click → PREVIEW → exit_preview should
+        # return to LIVE, not always LIVE if the user was in EDITING
+        # before entering preview). Initialised to None here so static
+        # analyzers see the slot exists; idempotent ``apply_preview_pose``
+        # only writes when transitioning from non-PREVIEW.
+        self._preview_previous_mode: RobotAppearanceMode | None = None
 
         # Editing mode state
         n = len(self.joint_names)
