@@ -82,8 +82,15 @@ def _localise_board_thread() -> None:
             if check.get("safe", True):
                 return True
             reason = check.get("reason", "unknown")
+            pair = check.get("colliding_pair")
+            pair_str = (
+                f", {pair[0]} <-> {pair[1]}"
+                if isinstance(pair, tuple) and len(pair) == 2
+                else ""
+            )
             msg = (
-                f"Localise: {context}: aborted, would collide ({reason})."
+                f"Localise: {context}: aborted, would collide "
+                f"({reason}{pair_str})."
             )
             _post_status(msg)
             loop = _state.get("main_loop")

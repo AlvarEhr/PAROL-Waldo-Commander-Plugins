@@ -137,6 +137,15 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
     def _worker() -> None:
         from .panel import _post_status  # noqa: PLC0415
 
+        # Per-thread ownership token. The caller set
+        # ``_state["is_going_to_pose"] = True`` before spawning this
+        # worker; the worker initially "owns" the flag. If the
+        # collision-blocked path releases ownership (so the dialog's
+        # `Send anyway` can re-acquire), the worker's `finally` must
+        # NOT clear the flag — otherwise it races with the new
+        # dispatch thread that just set it back to True.
+        worker_holds_flag = True
+
         try:
             angles_rad = np.asarray(candidate.joint_angles_rad, dtype=np.float64)
             angles_deg = np.degrees(angles_rad).tolist()
@@ -158,23 +167,51 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
                 )
                 if not check.get("safe", True):
                     reason = check.get("reason", "collision")
+                    pair = check.get("colliding_pair")
+                    pair_str = (
+                        f", {pair[0]} <-> {pair[1]}"
+                        if isinstance(pair, tuple) and len(pair) == 2
+                        else ""
+                    )
                     msg = (
-                        f"Pose #{dot_idx}: aborted, would collide ({reason})."
+                        f"Pose #{dot_idx}: aborted, would collide "
+                        f"({reason}{pair_str})."
                     )
                     _post_status(msg)
-                    # Clear the busy flag NOW so the dialog's
-                    # 'Send anyway' callback can re-acquire it.
+                    # Release ownership BEFORE scheduling the dialog so
+                    # the dialog's `Send anyway` callback can
+                    # re-acquire. Worker's `finally` won't touch the
+                    # flag below (token tracks ownership separately).
+                    worker_holds_flag = False
                     _state["is_going_to_pose"] = False
-                    show_collision_dialog_threadsafe(
+                    # Clear the stale client handle so STOP between
+                    # dialog open and Send anyway is a clean no-op.
+                    _state["client"] = None
+                    scheduled = show_collision_dialog_threadsafe(
                         message=msg,
                         target_q_deg=list(angles_deg),
                         on_send_anyway=lambda a=list(angles_deg): _spawn_dispatch(a),
                     )
+                    if not scheduled:
+                        # No main loop available (rare; likely
+                        # teardown in progress). Surface a fallback
+                        # toast via best-effort scheduling.
+                        loop = _state.get("main_loop")
+                        if loop is not None:
+                            from nicegui import ui as _ui  # noqa: PLC0415
+                            try:
+                                loop.call_soon_threadsafe(
+                                    lambda m=msg: _ui.notify(
+                                        m, color="warning", position="top",
+                                    ),
+                                )
+                            except RuntimeError:
+                                pass
                     return
             except Exception as e:  # noqa: BLE001
                 logger.debug("go-to-pose pre-check skipped (%s)", e)
 
-            # Safe path — dispatch directly. This worker thread already
+            # Safe path - dispatch directly. This worker thread already
             # holds the busy flag (set by the caller when it scheduled
             # _worker). We don't want _spawn_dispatch's busy-flag
             # acquisition to block, so just dispatch inline here.
@@ -197,10 +234,12 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("go-to-pose worker crashed")
         finally:
-            # Clear the busy flag so the next click can dispatch (only
-            # if the safe path took it through to dispatch — the
-            # collision-blocked path already cleared it above).
-            if _state.get("is_going_to_pose"):
+            # Only clear the flag if THIS worker still owns it. The
+            # collision-blocked path already released ownership above
+            # (worker_holds_flag = False); a later `_spawn_dispatch`
+            # may have re-acquired the flag and set it True - we MUST
+            # NOT clobber it.
+            if worker_holds_flag:
                 _state["is_going_to_pose"] = False
             _state["stop_requested"] = False
 

@@ -35,10 +35,30 @@ from .state import _state
 logger = logging.getLogger(__name__)
 
 
-# Module-level handle to the active preview state so multiple sequential
-# dispatches don't pile up overlapping previews. Only one preview can be
-# active at a time; subsequent rejections wait for the current to exit.
+# Module-level state: at most one active preview AND at most one open
+# collision dialog at a time. A second collision-rejection while a
+# preview is active replaces the old preview rather than stacking; a
+# second rejection while a dialog is open closes the old dialog and
+# replaces it. This avoids the stranding-and-stacking failure modes
+# where a stale dialog dismisses a different preview's state.
 _active_preview: dict[str, Any] | None = None
+_active_dialog: Any | None = None
+
+
+def reset_preview_state() -> None:
+    """Forcefully exit any active preview AND close any open dialog.
+
+    Called from `_teardown_overlays` so a feature on/off cycle never
+    leaves the URDF scene stranded in PREVIEW.
+    """
+    global _active_preview, _active_dialog
+    _exit_active_preview()
+    if _active_dialog is not None:
+        try:
+            _active_dialog.close()
+        except (RuntimeError, AttributeError):
+            pass
+        _active_dialog = None
 
 
 def _exit_active_preview() -> None:
@@ -63,9 +83,16 @@ def _enter_preview(target_q_deg: list[float]) -> bool:
     """Pose-jump the URDF scene to ``target_q_deg`` for preview.
 
     Returns True on success, False if the scene isn't available or the
-    apply call fails.
+    apply call fails. Idempotent: a second `_enter_preview` while a
+    preview is already active first exits the old one so the
+    `_preview_previous_mode` slot on the scene doesn't get clobbered
+    with PREVIEW (which would break exit).
     """
     global _active_preview
+    if _active_preview is not None:
+        # Already in a preview — exit cleanly first so the previous-mode
+        # slot is restored to LIVE before we re-enter.
+        _exit_active_preview()
     try:
         from waldo_commander.state import ui_state  # noqa: PLC0415
     except ImportError:
@@ -95,8 +122,24 @@ def show_collision_dialog(
     Must be called from within a NiceGUI request context (i.e. from
     the main asyncio loop). For worker-thread callers use
     :func:`show_collision_dialog_threadsafe`.
+
+    Serialises with any prior open dialog: a second invocation while
+    one is already showing closes the old one first so the user is
+    never staring at two stacked persistent modals.
     """
+    global _active_dialog
     from nicegui import ui  # noqa: PLC0415
+
+    # Close any prior dialog to avoid stacking persistent modals.
+    if _active_dialog is not None:
+        try:
+            _active_dialog.close()
+        except (RuntimeError, AttributeError):
+            pass
+        _active_dialog = None
+    # Also exit any prior preview before opening the new dialog so the
+    # scene mode is clean on entry.
+    _exit_active_preview()
 
     dialog = ui.dialog().props("persistent")
     with dialog, ui.card().classes("min-w-[28rem]"):
@@ -111,9 +154,21 @@ def show_collision_dialog(
         preview_panel = ui.row().classes("w-full justify-end gap-2")
         preview_panel.set_visibility(False)
 
+        # Captured here so handlers can disable Preview after first click.
+        preview_button: Any = None
+
+        def _close_dialog() -> None:
+            global _active_dialog
+            try:
+                dialog.close()
+            except (RuntimeError, AttributeError):
+                pass
+            if _active_dialog is dialog:
+                _active_dialog = None
+
         def _do_cancel() -> None:
             _exit_active_preview()
-            dialog.close()
+            _close_dialog()
             if on_cancel is not None:
                 try:
                     on_cancel()
@@ -129,14 +184,23 @@ def show_collision_dialog(
                 )
                 return
             preview_panel.set_visibility(True)
+            # Disable the Preview button after first click so a fast
+            # re-click can't re-enter and confuse the previous-mode
+            # slot tracking on the scene.
+            if preview_button is not None:
+                preview_button.disable()
 
         def _do_exit_preview() -> None:
             _exit_active_preview()
             preview_panel.set_visibility(False)
+            if preview_button is not None:
+                preview_button.enable()
 
         def _do_send_anyway() -> None:
+            # Auto-exit any active preview before dispatch so the scene
+            # snaps back to LIVE before the actual move begins.
             _exit_active_preview()
-            dialog.close()
+            _close_dialog()
             try:
                 on_send_anyway()
             except Exception as e:  # noqa: BLE001
@@ -144,19 +208,22 @@ def show_collision_dialog(
 
         with ui.row().classes("w-full justify-end gap-2 mt-2"):
             ui.button("Cancel", on_click=_do_cancel).props("flat")
-            ui.button("Preview in sim", on_click=_do_preview).props("flat color=info")
+            preview_button = ui.button(
+                "Preview in sim", on_click=_do_preview,
+            ).props("flat color=info")
             ui.button(
                 "Send anyway", on_click=_do_send_anyway,
             ).props("color=negative").classes("text-white")
 
         with preview_panel:
-            ui.label("Preview mode active — robot frozen, scene shows rejected pose.").classes(
+            ui.label("Preview mode active - robot frozen, scene shows rejected pose.").classes(
                 "text-caption text-info self-center",
             )
             ui.button(
                 "Exit preview", on_click=_do_exit_preview,
             ).props("flat color=info")
 
+    _active_dialog = dialog
     dialog.open()
 
 

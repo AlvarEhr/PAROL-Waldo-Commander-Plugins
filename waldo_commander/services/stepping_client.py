@@ -158,15 +158,28 @@ _STEPPABLE_TOOL_METHODS = frozenset({"set_position", "open", "close", "calibrate
 
 
 # Methods whose joint-space target we can extract for pre-flight.
-# move_j / home land directly in joint space; move_l / move_p take
-# Cartesian targets and we run local IK (parol6.Robot.ik) to map them.
-# Cartesian moves with frame!="WRF" are skipped (TRF needs current TCP
-# composition; deferred). The FCL pre-flight is best-effort and is not
-# a substitute for the controller-side soft-stop / current-limit
-# safeties.
+# move_j / home land directly in joint space; move_l / move_p / move_c /
+# move_s take Cartesian targets and we run local IK (parol6.Robot.ik)
+# to map them. Cartesian moves with frame!="WRF" are skipped (TRF
+# needs current TCP composition; deferred). The FCL pre-flight is
+# best-effort and is not a substitute for the controller-side soft-
+# stop / current-limit safeties.
 _PREFLIGHT_CHECKABLE_METHODS = frozenset(
-    {"move_j", "home", "move_l", "move_p"},
+    {"move_j", "home", "move_l", "move_p", "move_c", "move_s"},
 )
+_CARTESIAN_METHODS = frozenset({"move_l", "move_p", "move_c", "move_s"})
+
+# Joint-delta sanity threshold: when the local IK result wanders more
+# than this from the seed (current pose), it likely landed in a
+# different kinematic branch than the controller's continuity-seeded
+# IK will pick. We reject the IK result and fall through unchecked
+# (the controller IK is the source of truth and will reject if truly
+# unreachable). 90 deg per joint is permissive enough for typical
+# Cartesian moves while catching the obvious elbow-flip / wrist-flip
+# failures.
+import numpy as _np  # noqa: E402, PLC0415
+
+_IK_MAX_JOINT_DELTA_RAD: float = float(_np.deg2rad(90.0))
 
 # Cached parol6.Robot instance for local IK in the subprocess. Built
 # lazily on first Cartesian move because constructing the Robot loads
@@ -215,10 +228,18 @@ def _ik_cartesian_to_joints_deg(
 
     Returns:
         Joint angles in degrees if IK converged AND FK-verified to
-        within 1 mm / 1° of the requested pose; None otherwise.
+        within 1 mm / 1 deg of the requested pose AND the joint
+        configuration didn't wander more than
+        ``_IK_MAX_JOINT_DELTA_RAD`` from the seed (which would
+        indicate a wrong-branch solution unlikely to match the
+        controller's continuity-seeded IK). None otherwise.
+
         FK-verify is necessary because parol6.Robot.ik's ``success``
         flag is unreliable on near-singular configurations (per the
-        existing hover.py precedent).
+        existing hover.py precedent). The joint-delta sanity check
+        catches elbow-flip / wrist-flip cases where FK matches but
+        the joint trajectory the controller will execute is different
+        from the one we'd validate.
     """
     import numpy as np  # noqa: PLC0415
     from scipy.spatial.transform import Rotation as _R  # noqa: PLC0415
@@ -270,6 +291,19 @@ def _ik_cartesian_to_joints_deg(
     )
     if pos_err > 0.001 or rot_err_rad > np.radians(1.0):
         return None
+
+    # Joint-delta sanity. parol6's controller-side IK is continuity-
+    # seeded (picks the branch closest to the current joints); a local
+    # IK seeded with the same current_q should agree on the branch and
+    # produce a small joint delta. A large delta indicates we picked a
+    # different branch (elbow-up vs elbow-down, wrist-flip) that FK-
+    # verifies but won't match the controller's actual execution. The
+    # safer behavior is to skip the pre-flight than to validate a
+    # trajectory the robot won't take.
+    joint_delta = float(np.max(np.abs(q_arr - seed)))
+    if joint_delta > _IK_MAX_JOINT_DELTA_RAD:
+        return None
+
     return np.degrees(q_arr).tolist()
 
 
@@ -328,6 +362,13 @@ def _maybe_check_collision(
     if mesh_dir is None:
         return
 
+    # Resolve target joint configs. For Cartesian methods the target
+    # is a list (one per waypoint); the trajectory check then runs
+    # current -> wp1 -> wp2 ... -> wpN segment-by-segment so middle
+    # waypoints can't slip through unchecked. For joint-space methods
+    # there's a single target.
+    target_q_deg_list: list[list[float]] = []
+
     if method_name == "move_j":
         target = kwargs.get("angles")
         if target is None and args:
@@ -335,7 +376,7 @@ def _maybe_check_collision(
         if target is None:
             return
         try:
-            target_q_deg = list(target)
+            target_q_deg_list = [list(target)]
         except TypeError:
             return
     elif method_name == "home":
@@ -343,15 +384,33 @@ def _maybe_check_collision(
             from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
         except ImportError:
             return
-        target_q_deg = list(HOME_ANGLES_DEG)
-    elif method_name in ("move_l", "move_p"):
-        # Cartesian moves: only WRF is supported by the local-IK path.
-        # TRF (tool-relative) would require composing the current TCP
-        # offset, which adds plumbing for a less-common case. Skip
-        # silently; the controller still runs the move.
-        if kwargs.get("frame", "WRF") != "WRF":
+        target_q_deg_list = [list(HOME_ANGLES_DEG)]
+    elif method_name in _CARTESIAN_METHODS:
+        # Cartesian moves: matches parol6's controller-side semantics.
+        # - move_l: respects ``rel`` arg. ``rel=False`` (default)
+        #   treats pose as absolute world target regardless of frame
+        #   (matches cartesian_commands._compute_target_pose).
+        #   ``rel=True + frame=TRF`` post-multiplies a delta on the
+        #   current TCP. ``rel=True + frame=WRF`` pre-multiplies a
+        #   delta on the initial pose; we don't plumb that and skip.
+        # - move_p / move_c / move_s: no rel flag in the client API.
+        #   TRF means "all waypoints relative to START TCP" (matches
+        #   curved_commands._transform_waypoints_trf_to_wrf using
+        #   the same start tool_pose for every waypoint).
+        # Unknown frames fall through silently (controller IK is the
+        # source of truth).
+        frame = kwargs.get("frame", "WRF")
+        if frame not in ("WRF", "TRF"):
             return
-        # Source the Cartesian target.
+        rel = bool(kwargs.get("rel", False))
+        if method_name == "move_l" and rel and frame == "WRF":
+            # delta @ initial_pose semantics not plumbed; let the
+            # controller validate.
+            return
+
+        # Build the list of Cartesian waypoints. move_l takes a single
+        # pose; move_p / move_c / move_s take a list.
+        poses_cartesian: list[list[float]] = []
         if method_name == "move_l":
             pose = kwargs.get("pose")
             if pose is None and args:
@@ -359,7 +418,7 @@ def _maybe_check_collision(
             if pose is None:
                 return
             try:
-                pose_list = list(pose)
+                poses_cartesian = [list(pose)]
             except TypeError:
                 return
         else:
@@ -369,11 +428,11 @@ def _maybe_check_collision(
             if not waypoints:
                 return
             try:
-                pose_list = list(waypoints[-1])
-            except (TypeError, IndexError):
+                poses_cartesian = [list(wp) for wp in waypoints]
+            except TypeError:
                 return
-        # Need a current-joints snapshot for the IK seed (also serves
-        # as q_from for the trajectory check below).
+        # Need the live joints snapshot for the start-TCP compose AND
+        # the seed for the first IK.
         try:
             current = wrapped_client.angles()
             if current is None:
@@ -381,18 +440,55 @@ def _maybe_check_collision(
             current_q_deg = list(current)[:6]
         except (OSError, RuntimeError, ValueError):
             return
-        target_q_deg = _ik_cartesian_to_joints_deg(
-            pose_list, current_q_deg,
+        # TRF needs the active tool's TCP transform. We pull it
+        # lazily here so WRF programs don't pay the lookup cost.
+        # The "TRF means compose" decision is per-method:
+        # - move_l: only when rel=True (rel=False uses pose verbatim
+        #   as world).
+        # - move_p / move_c / move_s: always (no rel flag).
+        compose_trf = frame == "TRF" and (
+            method_name != "move_l" or rel
         )
-        if target_q_deg is None:
-            # IK failed or didn't FK-verify. Don't block the move on
-            # IK quality; the controller-side IK is the source of
-            # truth and will fail the move if truly unreachable.
-            return
+        tcp_origin: tuple[float, float, float] | None = None
+        tcp_rpy: tuple[float, float, float] | None = None
+        if compose_trf:
+            try:
+                tool = wrapped_client.tool
+                tcp_origin = tuple(tool.tcp_origin)
+                tcp_rpy = tuple(tool.tcp_rpy)
+            except (RuntimeError, AttributeError):
+                return  # no tool bound; can't compose TRF -> skip
+            try:
+                from parol6_vision.runtime.safe_motion import (  # noqa: PLC0415
+                    trf_to_world_pose_mm_deg,
+                )
+            except ImportError:
+                return
+        # Seed for IK is the current-or-prior solution; the TRF
+        # compose itself always uses ``current_q_deg`` (start TCP)
+        # so all waypoints share the same world-frame transform.
+        seed_for_ik = current_q_deg
+        for pose_list in poses_cartesian:
+            if compose_trf:
+                world_pose = trf_to_world_pose_mm_deg(
+                    pose_list, current_q_deg, tcp_origin, tcp_rpy,
+                )
+                if world_pose is None:
+                    return
+                wp_q_deg = _ik_cartesian_to_joints_deg(world_pose, seed_for_ik)
+            else:
+                # WRF, OR move_l with TRF + rel=False (pose verbatim).
+                wp_q_deg = _ik_cartesian_to_joints_deg(pose_list, seed_for_ik)
+            if wp_q_deg is None:
+                # Cannot validate this segment; skip the whole check
+                # rather than checking only the prefix.
+                return
+            target_q_deg_list.append(wp_q_deg)
+            seed_for_ik = wp_q_deg
     else:
         return
 
-    # For move_l / move_p the angles() snapshot was already taken
+    # For Cartesian paths the angles() snapshot was already taken
     # above as the IK seed. For move_j / home, take it here.
     if method_name in ("move_j", "home"):
         try:
@@ -450,16 +546,28 @@ def _maybe_check_collision(
         floor_enabled=True,
         safety_margin_m=0.008,
     )
-    result = validate_joint_trajectory_core(
-        current_q_deg, target_q_deg, config=config,
-    )
-    if not result.get("safe", True):
-        reason = result.get("reason", "collision")
-        raise CollisionPreFlightError(
-            f"{method_name}() pre-flight aborted, would collide "
-            f"({reason}). q_from={current_q_deg}, q_to={target_q_deg}. "
-            f"Flip 'Mesh collision check' off in Settings to override."
+    # Walk the segment list: current -> waypoint[0] -> waypoint[1]
+    # -> ... -> waypoint[-1]. Each segment runs the same FCL check.
+    # First failure raises; subsequent waypoints aren't validated
+    # (the user's script will abort here).
+    seg_from = current_q_deg
+    for seg_idx, seg_to in enumerate(target_q_deg_list):
+        result = validate_joint_trajectory_core(
+            seg_from, seg_to, config=config,
         )
+        if not result.get("safe", True):
+            reason = result.get("reason", "collision")
+            seg_label = (
+                f"{method_name}()"
+                if len(target_q_deg_list) == 1
+                else f"{method_name}() segment {seg_idx + 1}/{len(target_q_deg_list)}"
+            )
+            raise CollisionPreFlightError(
+                f"{seg_label} pre-flight aborted, would collide "
+                f"({reason}). q_from={seg_from}, q_to={seg_to}. "
+                "Flip 'Mesh collision check' off in Settings to override."
+            )
+        seg_from = seg_to
 
 
 class _SteppingToolProxy:

@@ -113,6 +113,15 @@ def _drive_hover_pose_thread(
     """
     # Lazy import to break panel<->hover cycle.
     from .panel import _post_status  # noqa: PLC0415
+
+    # Per-thread ownership token mirrors _state["is_hovering"]. The
+    # caller already set is_hovering=True before spawning this thread.
+    # If the collision-blocked path releases ownership so the dialog's
+    # "Send anyway" callback can re-acquire, the worker's `finally`
+    # below MUST NOT clobber the flag - otherwise it races with the
+    # new dispatch thread that just set it back to True.
+    worker_holds_flag = True
+
     try:
         from parol6 import Robot, RobotClient  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
@@ -224,13 +233,26 @@ def _drive_hover_pose_thread(
             check = validate_joint_trajectory(current_q_deg, list(angles_deg))
             if not check.get("safe", True):
                 reason = check.get("reason", "collision")
+                pair = check.get("colliding_pair")
+                pair_str = (
+                    f", {pair[0]} <-> {pair[1]}"
+                    if isinstance(pair, tuple) and len(pair) == 2
+                    else ""
+                )
                 msg = (
-                    f"Hover ({ref_label}): aborted, would collide ({reason})."
+                    f"Hover ({ref_label}): aborted, would collide "
+                    f"({reason}{pair_str})."
                 )
                 _post_status(msg)
-                # Clear is_hovering NOW so the 'Send anyway' callback's
-                # fresh dispatch thread can re-acquire the busy slot.
+                # Release ownership BEFORE scheduling the dialog so the
+                # dialog's `Send anyway` callback can re-acquire the
+                # busy flag. Worker's `finally` (below) tracks
+                # ownership via worker_holds_flag and won't clobber.
+                worker_holds_flag = False
                 _state["is_hovering"] = False
+                # Clear the stale client handle so STOP between dialog
+                # open and Send anyway is a clean no-op.
+                _state["client"] = None
 
                 hover_angles = list(angles_deg)
                 hover_label = ref_label
@@ -266,7 +288,7 @@ def _drive_hover_pose_thread(
                                 _ps(
                                     f"Hover OK ({hover_label}, override): "
                                     f"({hover_lx_m * 1000:.0f}, {hover_ly_m * 1000:.0f}) mm "
-                                    f"@ {hover_so_m * 1000:.0f} mm — measure now.",
+                                    f"@ {hover_so_m * 1000:.0f} mm - measure now.",
                                 )
                         except Exception as e:  # noqa: BLE001
                             try:
@@ -314,5 +336,11 @@ def _drive_hover_pose_thread(
             logger.exception("hover thread crashed")
             _post_status(f"Hover ERROR: {e}")
     finally:
-        _state["is_hovering"] = False
+        # Only clear is_hovering if THIS worker still owns it. The
+        # collision-blocked path releases ownership before scheduling
+        # the dialog (worker_holds_flag = False); a subsequent
+        # `Send anyway` may have re-acquired the flag - we MUST NOT
+        # clobber it.
+        if worker_holds_flag:
+            _state["is_hovering"] = False
         _state["stop_requested"] = False

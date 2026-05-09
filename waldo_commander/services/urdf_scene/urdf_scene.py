@@ -1711,37 +1711,53 @@ class UrdfScene(
         TCP / joint transform controls are suspended. Call
         :meth:`exit_preview` to restore live mode.
 
+        Idempotent: calling twice in succession (without an intervening
+        :meth:`exit_preview`) preserves the original `previous_mode`
+        rather than overwriting it with PREVIEW (which would strand the
+        scene because ``exit_preview`` would restore PREVIEW->PREVIEW).
+
         Args:
             angles_rad: 6-vector joint angles in radians.
         """
-        # Ensure ``angles_rad`` is a list of floats — _apply_joint_angles
+        # Ensure ``angles_rad`` is a list of floats - _apply_joint_angles
         # tolerates ndarray but the preview seed is the canonical shape.
         try:
             seq = list(angles_rad)
         except TypeError:
             return
         previous_mode = self._appearance_mode
-        self._preview_previous_mode = previous_mode  # type: ignore[attr-defined]
+        # Only update the previous-mode slot if we're transitioning INTO
+        # PREVIEW from a different mode. A re-entry while already in
+        # PREVIEW preserves the original slot value so exit goes back
+        # to LIVE/SIMULATOR/EDITING correctly.
+        if previous_mode != RobotAppearanceMode.PREVIEW:
+            self._preview_previous_mode = previous_mode  # type: ignore[attr-defined]
         self.set_appearance_mode(RobotAppearanceMode.PREVIEW)
         try:
             self._apply_joint_angles(seq)
         except Exception as e:  # noqa: BLE001
             logger.warning("apply_preview_pose: _apply_joint_angles failed: %s", e)
             # Restore mode so we don't leave the scene stuck in PREVIEW.
-            self.set_appearance_mode(previous_mode)
+            restore = getattr(self, "_preview_previous_mode", None) or RobotAppearanceMode.LIVE
+            self.set_appearance_mode(restore)
             self._preview_previous_mode = None  # type: ignore[attr-defined]
 
     def exit_preview(self) -> None:
-        """Exit PREVIEW mode and resume the live broadcast → URDF
+        """Exit PREVIEW mode and resume the live broadcast -> URDF
         apply path. Restores the appearance mode that was active before
         :meth:`apply_preview_pose` was called.
 
-        Safe to call when not in PREVIEW (no-op).
+        Safe to call when not in PREVIEW (no-op). Defensively coerces
+        to LIVE if the previous-mode slot is None or accidentally
+        PREVIEW (which would otherwise leave the scene stranded).
         """
         if self._appearance_mode != RobotAppearanceMode.PREVIEW:
             return
         prev = getattr(self, "_preview_previous_mode", None)
-        target_mode = prev if prev is not None else RobotAppearanceMode.LIVE
+        if prev is None or prev == RobotAppearanceMode.PREVIEW:
+            target_mode = RobotAppearanceMode.LIVE
+        else:
+            target_mode = prev
         self.set_appearance_mode(target_mode)
         self._preview_previous_mode = None  # type: ignore[attr-defined]
 

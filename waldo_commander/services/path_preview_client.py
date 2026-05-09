@@ -15,13 +15,18 @@ from typing import Any
 import numpy as np
 
 # Edit-time collision-check result cache. Keyed by
-# ``(q_from_quantized, q_to_quantized, config_cache_key)`` so repeated
-# editor passes over the same program reuse FCL queries from prior
-# debounce ticks. ~5-10x speedup on common edit loops where the user
-# changes a single line and the rest of the program replays unchanged.
+# ``(q_from_quantized_rad, q_to_quantized_rad, config)`` where
+# ``config`` is the (frozen) :class:`CollisionEnvironmentConfig`. The
+# joint vectors are quantized to ``_EDIT_TIME_QUANTIZE_DECIMALS``
+# decimals in RADIANS — 4 decimals is ~0.006 deg precision, enough
+# to absorb broadcast jitter without merging meaningfully different
+# moves. Eviction is LRU (``move_to_end`` on hit;
+# ``popitem(last=False)`` removes the least-recently-used). ~5-10x
+# speedup on common edit loops where the user changes one line and
+# the rest of the program replays unchanged.
 _EDIT_TIME_PRECHECK_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
 _EDIT_TIME_PRECHECK_CACHE_MAX = 256
-_EDIT_TIME_QUANTIZE_DECIMALS = 4  # ~0.006 deg precision in quantized key
+_EDIT_TIME_QUANTIZE_DECIMALS = 4
 
 from waldoctl import DryRunResult
 

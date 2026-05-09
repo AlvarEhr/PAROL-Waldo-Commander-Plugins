@@ -251,6 +251,18 @@ def _teardown_overlays() -> None:
     # it's the URDF scene root, used elsewhere.
     _state["current_mount"] = None
     _state["overlays_built"] = False
+    # Live-pose chip handle: clear so the 0.5 s indicator tick (if it
+    # somehow fires before its `ui.timer` cancellation completes) is a
+    # clean no-op rather than poking a deleted Quasar element.
+    _state["live_pose_label"] = None
+    # Force-exit any active preview + close any open dialog so a
+    # feature-off cycle never strands the URDF in PREVIEW.
+    try:
+        from .preview_dialog import reset_preview_state  # noqa: PLC0415
+
+        reset_preview_state()
+    except (ImportError, AttributeError):
+        pass
 
 
 def _ensure_features_loaded() -> None:
