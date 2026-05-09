@@ -1293,7 +1293,22 @@ def _localise_board_thread() -> None:
         #   - reachable_candidates were generated against the OLD centre, so
         #     their joint configs no longer aim at the new board location.
         # Both rebuild on next use.
+        #
+        # Bump ``reach_generation`` AT THE SAME TIME as zeroing the
+        # candidates list. The renderer pairs gen↔candidates atomically
+        # (see _render_reachability_dots), and the click handler checks
+        # gen first then dereferences candidates by index — without the
+        # bump here, a click on an existing sphere (still tagged with
+        # the OLD gen, which still equals current_gen) followed by an
+        # already-completed candidates-zero write would index past
+        # ``[]`` and silently dismiss the popup. Bumping the gen here
+        # invalidates the on-screen sphere names so the click handler
+        # sees a stale-gen mismatch (correct) instead of a wrong-list
+        # dereference.
         _state["trajectory_collision_mgr_pair"] = None
+        _state["reach_generation"] = (
+            int(_state.get("reach_generation", 0)) + 1
+        )
         _state["reachable_candidates"] = []
 
         # Stamp the successful-localise time so the Run button knows the

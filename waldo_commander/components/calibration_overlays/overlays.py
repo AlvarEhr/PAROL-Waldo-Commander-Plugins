@@ -203,13 +203,54 @@ def add_overlays(urdf_scene: Any) -> None:
     # the user-reported "centerline + footprint don't appear until
     # I press anything" symptom (later events incidentally trigger
     # re-sends that arrive after init has flipped is_initialized).
-    _state["scene_initialized"] = False
+    #
+    # On a feature-toggle cycle (off→on) ``add_overlays`` runs again
+    # against the SAME UrdfScene/Three.js scene. NiceGUI's 'init'
+    # event only fires ONCE per scene construction, so re-attaching
+    # the listener doesn't re-trigger the callback. If we
+    # unconditionally reset ``scene_initialized`` to False, the
+    # gate gets stuck and every reachability render defers
+    # indefinitely.
+    #
+    # Track init state via a weakref to the scene object plus
+    # NiceGUI's stable element id: if the prior weakref is dead OR
+    # points to an element with a different id than the current
+    # scene, this is a NEW scene (page reload, etc.) and we reset
+    # the flag. Pure ``id()`` comparison would silently break here
+    # because CPython reuses memory addresses; ``weakref.ref`` makes
+    # gc-induced reuse explicit (the ref returns None on dead).
+    import weakref  # noqa: PLC0415
+    prior_ref = _state.get("scene_init_weakref")
+    prior_nice_id = _state.get("scene_init_nice_id")
+    current_scene = urdf_scene.scene
+    current_nice_id = getattr(current_scene, "id", None)
+    prior_scene = prior_ref() if prior_ref is not None else None
+    is_same_scene = (
+        prior_scene is current_scene
+        and prior_nice_id == current_nice_id
+        and current_nice_id is not None
+    )
+    if not is_same_scene:
+        _state["scene_initialized"] = False
+        try:
+            _state["scene_init_weakref"] = weakref.ref(current_scene)
+        except TypeError:
+            # Some NiceGUI element types reject weakref. Fall back
+            # to direct strong reference comparison; not ideal
+            # (keeps the prior scene alive longer) but at least
+            # detects obvious changes.
+            _state["scene_init_weakref"] = lambda s=current_scene: s
+        _state["scene_init_nice_id"] = current_nice_id
+    # else: same scene — keep the prior True flag alive so the
+    # defer-gate isn't reset to False post-init.
     try:
         urdf_scene.scene.on("init", _mark_scene_initialized)
     except Exception as e:  # noqa: BLE001
         logger.debug("scene init hook failed: %s", e)
         # Fall back to optimistic-true so the gate doesn't break
-        # cases where the hook can't attach.
+        # cases where the hook can't attach. Set the weakref AFTER
+        # the failure so a retry on the same scene won't keep
+        # trying to register the same dead handler.
         _state["scene_initialized"] = True
 
     # Cache mount + paths for the worker thread.

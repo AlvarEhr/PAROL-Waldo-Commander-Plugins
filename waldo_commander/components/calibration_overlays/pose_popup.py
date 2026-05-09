@@ -387,13 +387,24 @@ def register_click_handler(scene: Any) -> None:
         # radius change. Without this guard, the click handler can
         # dispatch the WRONG candidate when re-render races with the
         # click event.
+        #
+        # IMPORTANT: when the raycaster delivers multiple dot hits
+        # (e.g. two sphere groups stacked at the same position from a
+        # defer-race that the renderer's idempotency fix should now
+        # prevent — but cheap defence in depth), we iterate ALL of
+        # them looking for a valid-gen match before bailing. The old
+        # behaviour of returning on first stale-gen hit could
+        # silently swallow a click on a CURRENT sphere just because
+        # an orphan from a prior gen happened to be in the hit list.
         dot_idx: int | None = None
-        gen_ok = False
+        had_dot_hit = False
+        had_stale_dot_hit = False
         current_gen = int(_state.get("reach_generation", 0))
         for hit in hits:
             name = getattr(hit, "object_name", "") or ""
             if not name.startswith("calib:reach_dot_"):
                 continue
+            had_dot_hit = True
             tail = name[len("calib:reach_dot_"):]
             parts = tail.split("_")
             if len(parts) != 2:
@@ -404,20 +415,39 @@ def register_click_handler(scene: Any) -> None:
             except ValueError:
                 continue
             if gen != current_gen:
-                # Stale sphere from a prior generation. Drop the click
-                # rather than risking a wrong-pose dispatch.
-                _close_popup()
-                return
+                had_stale_dot_hit = True
+                continue
             dot_idx = idx
-            gen_ok = True
             break
         if dot_idx is None:
+            if had_stale_dot_hit and not had_dot_hit:
+                # Defensive: should be unreachable since had_stale_dot_hit
+                # implies had_dot_hit was set. Kept as an explicit branch
+                # so future edits don't accidentally drop the close.
+                _close_popup()
+                return
+            if had_dot_hit:
+                # All dot hits were stale (orphan-group race). Don't
+                # close any open popup — the user may have an active
+                # popup from an earlier valid click and the stale hit
+                # shouldn't dismiss it.
+                logger.debug(
+                    "reach-dot click: only stale-gen hits "
+                    "(current_gen=%d); skipping",
+                    current_gen,
+                )
+                return
             # Click landed elsewhere; dismiss any open popup so the
             # user can clear it by clicking off.
             _close_popup()
             return
         candidates = _state.get("reachable_candidates") or []
-        if not gen_ok or dot_idx >= len(candidates):
+        if dot_idx >= len(candidates):
+            logger.debug(
+                "reach-dot click: dot_idx=%d but only %d candidates "
+                "(stale render?)",
+                dot_idx, len(candidates),
+            )
             _close_popup()
             return
         cand = candidates[dot_idx]

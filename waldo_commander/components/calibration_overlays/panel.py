@@ -222,6 +222,17 @@ def _teardown_overlays() -> None:
     _state["reachable_candidates"] = []
     _state["reachable_points_world"] = None
     _state["reachable_target_world"] = None
+    # Cancel any pending deferred reachability render scheduled while
+    # waiting for the scene 'init' event so it doesn't fire against
+    # a torn-down scene.
+    pending_timer = _state.get("reachability_pending_timer")
+    if pending_timer is not None:
+        try:
+            pending_timer.cancel()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reachability pending-timer cancel failed: %s", e)
+        _state["reachability_pending_timer"] = None
+    _state["reachability_pending_payload"] = None
     # Tear down the click-on-dot popup container + remove the scene
     # click handler so they don't survive into the next add_overlays
     # call (which re-creates both fresh).
@@ -409,6 +420,25 @@ def apply_calibration_state() -> None:
         except Exception as e:  # noqa: BLE001
             logger.debug(
                 "apply_calibration_state: reachability refresh failed: %s", e,
+            )
+        # Defensive re-registration of the click handler. The handler
+        # itself is a closure over module-level ``_state`` so it
+        # survives in-place across teardown / refresh cycles, but
+        # ``register_click_handler`` is idempotent (removes any prior
+        # registration first) so re-attaching here is cheap and
+        # ensures a tool-change path that somehow lost the handler
+        # gets it back. Same pattern as the reachability refresh
+        # above.
+        try:
+            from . import pose_popup  # noqa: PLC0415
+
+            scene_ref = getattr(scene, "scene", None)
+            if scene_ref is not None:
+                pose_popup.register_click_handler(scene_ref)
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "apply_calibration_state: click handler re-register failed: %s",
+                e,
             )
     elif not should_render and overlays_built:
         _teardown_overlays()

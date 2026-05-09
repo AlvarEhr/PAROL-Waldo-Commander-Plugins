@@ -193,6 +193,7 @@ def _render_reachability_dots(
     scene_group: Any,
     target_world: NDArray[np.float64],
     points_to_render: list[NDArray[np.float64]],
+    visible_candidates: list[Any] | None = None,
 ) -> None:
     """Create the green-sphere sub-group inside ``scene_group``. Scene
     mutation only; must run on the asyncio loop (NiceGUI scene is not
@@ -200,9 +201,18 @@ def _render_reachability_dots(
 
     ``scene_group`` is already translated to ``target_world``, so each
     sphere's local position is ``cam_pos - target_world``. Each sphere
-    is tagged with ``calib:reach_dot_<i>`` so the panel-level click
-    handler can identify which candidate the user clicked on (looked
-    up by index against ``_state['reachable_candidates']``).
+    is tagged with ``calib:reach_dot_<gen>_<i>`` so the panel-level
+    click handler can identify which candidate the user clicked on
+    (looked up by index against ``_state['reachable_candidates']``).
+
+    ``visible_candidates`` (when supplied) is written into
+    ``_state['reachable_candidates']`` ATOMICALLY with the generation
+    bump and the sphere creation. Worker callers should pass it
+    through; without that, the worker's separate write of
+    ``reachable_candidates`` race-windows past the gen bump leave
+    spheres tagged with the OLD gen but the candidates list pointing
+    at the NEW set, and a click landing in that window would dispatch
+    a candidate that doesn't correspond to the dot the user clicked.
     """
     if scene_group is None:
         return
@@ -211,16 +221,25 @@ def _render_reachability_dots(
     # otherwise the create RPCs are silently dropped (scene.js:416).
     # Re-schedule via a 0.1s timer; the same check on the next firing
     # will succeed once init has landed.
+    #
+    # Single-slot defer: multiple pre-init renders all collapse onto
+    # the SAME pending payload, so when init lands we don't get N
+    # cascading renders each bumping the gen counter and creating
+    # stacked sphere groups (the now-fixed cause of "dots render but
+    # aren't clickable"). The latest payload wins.
     if not _state.get("scene_initialized", False):
-        try:
-            ui.timer(
-                0.1,
-                lambda sg=scene_group, t=target_world, p=list(points_to_render):
-                    _render_reachability_dots(sg, t, p),
-                once=True,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.debug("reachability render defer-timer failed: %s", e)
+        _state["reachability_pending_payload"] = (
+            scene_group, target_world, list(points_to_render),
+            list(visible_candidates) if visible_candidates is not None else None,
+        )
+        if _state.get("reachability_pending_timer") is None:
+            try:
+                _state["reachability_pending_timer"] = ui.timer(
+                    0.1, _flush_pending_render, once=True,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.debug("reachability render defer-timer failed: %s", e)
+                _state["reachability_pending_timer"] = None
         return
 
     radius = float(settings.get("reachability_dot_radius_m"))
@@ -230,12 +249,31 @@ def _render_reachability_dots(
     # re-render with the new size without re-running the IK sweep.
     _state["reachable_points_world"] = list(points_to_render)
     _state["reachable_target_world"] = target_world
-    # Bump the sweep generation. Sphere names embed this so the click
-    # handler can detect a stale click (user clicked a sphere from a
-    # prior generation that has since been redrawn at a different
-    # index) and ignore it instead of dispatching the wrong candidate.
+    # Idempotent: drop any prior reach_group (whether previous render or
+    # an orphan from a defer-race where multiple renders queued past the
+    # init gate). Without this, stacked sphere groups from different
+    # generations end up at identical world positions; the raycaster
+    # picks the older one first, the click handler sees a stale-gen
+    # mismatch, and dismisses the click. See Docs/STATE.md "Open bugs"
+    # entry for the post-9af9e5d "dots render but aren't clickable"
+    # symptom.
+    old_reach_group = _state.get("reachability_group")
+    if old_reach_group is not None:
+        try:
+            old_reach_group.delete()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("reachability prior group cleanup failed: %s", e)
+        _state["reachability_group"] = None
+    # Bump generation + write candidates list ATOMICALLY (single
+    # main-thread block, no await / yield). Sphere names embed the
+    # gen so the click handler can detect a stale click (user clicked
+    # a sphere from a prior generation) and ignore it. Visible-
+    # candidates write is paired with the gen bump so the indices
+    # always reference the SAME list as the spheres were tagged from.
     generation = int(_state.get("reach_generation", 0)) + 1
     _state["reach_generation"] = generation
+    if visible_candidates is not None:
+        _state["reachable_candidates"] = list(visible_candidates)
     try:
         with scene_group:
             reach_group = (
@@ -261,6 +299,28 @@ def _render_reachability_dots(
     # Refresh the settings-panel info label ("X / Y non-overlapping")
     # so the user sees the post-render counts. Best-effort.
     _notify_reachability_info_changed()
+
+
+def _flush_pending_render() -> None:
+    """Defer-timer callback: re-attempt the pending render.
+
+    Reads the latest payload from ``_state["reachability_pending_payload"]``
+    and either renders (if scene_initialized has flipped) or re-arms
+    the timer for another 0.1s. Single pending payload + single
+    pending timer keep the gen counter from cascading — late-arriving
+    renders always overwrite the prior payload.
+    """
+    _state["reachability_pending_timer"] = None
+    payload = _state.get("reachability_pending_payload")
+    if payload is None:
+        return
+    # Don't drop the payload here — _render_reachability_dots will
+    # re-arm + re-store it if init still hasn't landed.
+    _state["reachability_pending_payload"] = None
+    scene_group, target_world, points_to_render, visible_candidates = payload
+    _render_reachability_dots(
+        scene_group, target_world, points_to_render, visible_candidates,
+    )
 
 
 def re_render_reachability_dots() -> None:
@@ -291,7 +351,9 @@ def re_render_reachability_dots() -> None:
     visible_points, visible_candidates = _select_visible_dots(
         all_points, all_candidates or [], radius, n_target,
     )
-    _state["reachable_candidates"] = visible_candidates
+    # Don't pre-write reachable_candidates here either — pass through
+    # to _render_reachability_dots where the gen bump pairs with the
+    # candidates write atomically.
     old = _state.get("reachability_group")
     if old is not None:
         try:
@@ -299,7 +361,7 @@ def re_render_reachability_dots() -> None:
         except Exception:  # noqa: BLE001
             pass
         _state["reachability_group"] = None
-    _render_reachability_dots(grp, target, visible_points)
+    _render_reachability_dots(grp, target, visible_points, visible_candidates)
 
 
 def refresh_reachability_for_active_tool() -> None:
@@ -443,12 +505,19 @@ def _start_reachability_compute_async(
         # Cache the FULL reachable set so a dot-radius change can
         # re-run the non-overlap selection without re-running IK.
         # The board-localise sweep also reuses the full candidate set.
+        # These two slots are write-once-per-sweep (no race with the
+        # click handler, which only reads ``reachable_candidates``),
+        # so worker-thread writes are safe.
         _state["reachable_points_all"] = all_points
         _state["reachable_candidates_all"] = all_candidates
         visible_points, visible_candidates = _select_visible_dots(
             all_points, all_candidates, radius, n_target,
         )
-        _state["reachable_candidates"] = visible_candidates
+        # NOTE: ``reachable_candidates`` is intentionally NOT written
+        # here — it must be set ATOMICALLY with the gen bump and
+        # sphere creation inside _render_reachability_dots, or the
+        # click handler can dereference candidates from one sweep
+        # against spheres tagged with the prior sweep's gen.
         logger.info(
             "reachability dots: %d reachable, %d drawn (target %d, %.1f mm radius)",
             len(all_points), len(visible_points), n_target, radius * 1000.0,
@@ -458,7 +527,7 @@ def _start_reachability_compute_async(
         try:
             loop.call_soon_threadsafe(
                 _render_reachability_dots,
-                scene_group, target_world, visible_points,
+                scene_group, target_world, visible_points, visible_candidates,
             )
         except RuntimeError as e:
             logger.info(
