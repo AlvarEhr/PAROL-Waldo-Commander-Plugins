@@ -348,20 +348,24 @@ def _raycast_footprint_tick() -> None:
                 _state["footprint_last_mount"] = None
             return
 
-        # Early exit (1.5): if the controller hasn't broadcast joint
-        # state yet, ``robot_state.angles`` is the dataclass default
-        # (zeros). Drawing a frustum + raycast hits at the zero pose
-        # leaves a stale overlay floating at coordinates that don't
-        # match where the URDF lands once the broadcast catches up.
-        # Skip until ``robot_state.connected`` flips True.
+        # Early exit (1.5): if the status consumer hasn't received a
+        # broadcast yet, ``robot_state.angles`` is the dataclass
+        # default (zeros). Drawing a frustum + raycast hits at the
+        # zero pose leaves a stale overlay floating at coordinates
+        # that don't match where the URDF lands once the broadcast
+        # catches up. ``last_update_ts`` is set by the status consumer
+        # on every broadcast (main.py); 0.0 means we haven't received
+        # one yet. NOTE: ``robot_state.connected`` reflects the
+        # hardware-ping status, NOT broadcast receipt — it stays False
+        # in fake-serial / sim mode, so it's NOT a usable gate here.
         try:
             from waldo_commander.state import robot_state  # noqa: PLC0415
         except ImportError:
             return
-        if not getattr(robot_state, "connected", False):
-            # If we already drew something during a brief disconnected
-            # window (rare; possible if connected flickered), tear it
-            # down so the user doesn't see a frozen overlay.
+        if float(getattr(robot_state, "last_update_ts", 0.0)) <= 0.0:
+            # If we already drew something during a startup window
+            # before the first broadcast, tear it down so the user
+            # doesn't see a frozen overlay.
             if _state.get("footprint_objects") or _state.get("footprint_group"):
                 _delete_footprint_group()
                 _state["footprint_last_q"] = None
