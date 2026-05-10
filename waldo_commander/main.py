@@ -362,6 +362,41 @@ async def initialize_urdf_scene() -> None:
         vk = ng_app.storage.general.get(f"tool_variant_{stored_tool}")
         ui_state.active_robot.set_active_tool(stored_tool, variant_key=vk)
         ui_state.urdf_scene.apply_tool(stored_tool, variant_key=vk)
+        # Sync the controller's active tool too. For built-in tools
+        # ``client.select_tool(stored_tool)`` is direct; for custom
+        # tools we route through ``proxy_tool_key`` (the controller
+        # doesn't know ``custom:`` keys). Without this, the GUI
+        # presents the stored tool's mesh + IK while the controller
+        # silently keeps whatever tool it had at last shutdown — the
+        # parol6.PAROL6_ROBOT log shows ``Applied tool 'MSG'`` even
+        # when the GUI shows a custom gripper, and motor commands run
+        # with the wrong TCP transform.
+        try:
+            controller_tool = stored_tool
+            if isinstance(stored_tool, str) and stored_tool.startswith(
+                "custom:",
+            ):
+                from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
+                    custom_tools as _ct,
+                )
+
+                cfg = _ct.load_config(stored_tool[len("custom:"):])
+                if cfg is not None and cfg.proxy_tool_key:
+                    controller_tool = str(cfg.proxy_tool_key)
+                else:
+                    controller_tool = ""
+            if controller_tool:
+                try:
+                    await client.select_tool(
+                        controller_tool, variant_key=vk or "",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "startup tool sync (%s -> controller %s) failed: %s",
+                        stored_tool, controller_tool, exc,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("startup tool sync skipped: %s", exc)
     else:
         # Invalidate FK cache even without tool change (gizmo sync needs fresh FK)
         ui_state.urdf_scene.invalidate_fk_cache()

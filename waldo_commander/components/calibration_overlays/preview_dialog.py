@@ -263,19 +263,52 @@ def show_collision_dialog_threadsafe(
     Returns True if the schedule was queued, False if the main loop
     isn't available (no preview / dialog will appear; caller should
     fall back to a status-line update).
+
+    The lambda enters the captured NiceGUI client's content slot
+    (``with client:``) before calling :func:`show_collision_dialog`.
+    Without that, ``ui.dialog()`` raises
+    ``"The current slot cannot be determined because the slot stack
+    for this task is empty."`` — every worker-thread collision
+    rejection floods the log with that traceback. The client is
+    captured during ``add_overlays`` from the request context.
     """
     loop = _state.get("main_loop")
     if loop is None:
         return False
+
+    def _scheduled() -> None:
+        client = _state.get("nicegui_client")
+        try:
+            if client is not None:
+                with client:
+                    show_collision_dialog(
+                        message=message,
+                        target_q_deg=list(target_q_deg),
+                        on_send_anyway=on_send_anyway,
+                        on_cancel=on_cancel,
+                    )
+            else:
+                # No client captured — fall through and hope the
+                # current slot stack happens to be valid (the
+                # dialog will fail loudly if not, which surfaces
+                # the missing capture).
+                show_collision_dialog(
+                    message=message,
+                    target_q_deg=list(target_q_deg),
+                    on_send_anyway=on_send_anyway,
+                    on_cancel=on_cancel,
+                )
+        except RuntimeError as e:
+            # Client likely deleted between schedule and fire (page
+            # reload / disconnect). Fall back to a logged warning;
+            # the caller already posted the rejection to the
+            # status line.
+            logger.debug(
+                "preview_dialog: scheduled show failed (%s)", e,
+            )
+
     try:
-        loop.call_soon_threadsafe(
-            lambda: show_collision_dialog(
-                message=message,
-                target_q_deg=list(target_q_deg),
-                on_send_anyway=on_send_anyway,
-                on_cancel=on_cancel,
-            ),
-        )
+        loop.call_soon_threadsafe(_scheduled)
         return True
     except RuntimeError as e:
         logger.debug("preview_dialog: schedule failed: %s", e)

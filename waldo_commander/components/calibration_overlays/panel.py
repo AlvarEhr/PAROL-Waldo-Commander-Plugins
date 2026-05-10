@@ -233,6 +233,16 @@ def _teardown_overlays() -> None:
             logger.debug("reachability pending-timer cancel failed: %s", e)
         _state["reachability_pending_timer"] = None
     _state["reachability_pending_payload"] = None
+    # Cancel the scene-init defer timer too. ``add_overlays`` may
+    # leave one pending if teardown happens within 600ms of the
+    # rebuild (rare, but matches the rest of the timer cleanup).
+    init_timer = _state.get("scene_init_defer_timer")
+    if init_timer is not None:
+        try:
+            init_timer.cancel()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("scene init defer-timer cancel failed: %s", e)
+        _state["scene_init_defer_timer"] = None
     # Tear down the click-on-dot popup container + remove the scene
     # click handler so they don't survive into the next add_overlays
     # call (which re-creates both fresh).
@@ -263,10 +273,12 @@ def _teardown_overlays() -> None:
     # it's the URDF scene root, used elsewhere.
     _state["current_mount"] = None
     _state["overlays_built"] = False
-    # Live-pose chip handle: clear so the 0.5 s indicator tick (if it
-    # somehow fires before its `ui.timer` cancellation completes) is a
-    # clean no-op rather than poking a deleted Quasar element.
+    # Live-pose chip handle + tooltip element: clear so the 0.5s
+    # indicator tick (if it somehow fires before its ``ui.timer``
+    # cancellation completes) is a clean no-op rather than poking a
+    # deleted Quasar element.
     _state["live_pose_label"] = None
+    _state["live_pose_tooltip"] = None
     # Force-exit any active preview + close any open dialog so a
     # feature-off cycle never strands the URDF in PREVIEW.
     try:
@@ -808,12 +820,26 @@ def _build_full_panel(close_callback: Callable[[], None] | None = None) -> None:
         # overlays.py updates the text + color + tooltip based on the
         # current robot configuration. Gripper-only check (~7x faster
         # than full); never blocks a move, just a visual signal.
+        #
+        # The tooltip is created ONCE here and re-used across ticks
+        # via ``_state["live_pose_tooltip"]``. Without this, each tick
+        # calling ``chip.tooltip(text)`` would APPEND a new
+        # ``QTooltip`` child to the chip — ``Element.tooltip()``
+        # constructs a fresh Tooltip element each call rather than
+        # mutating the existing one. After ~1 minute the chip has 120+
+        # stacked tooltips, every hover fires all of them
+        # simultaneously, producing the user-reported "almost
+        # infinite toasts" cascade.
         live_pose_chip = (
             ui.chip("?", color="grey")
             .props("dense outline size=xs")
-            .tooltip("Live pose collision check (initialising)")
         )
+        with live_pose_chip:
+            live_pose_tooltip = ui.tooltip(
+                "Live pose collision check (initialising)",
+            )
         _state["live_pose_label"] = live_pose_chip
+        _state["live_pose_tooltip"] = live_pose_tooltip
         ui.space()
         ui.button(
             icon="power_settings_new", on_click=_on_disable_features,

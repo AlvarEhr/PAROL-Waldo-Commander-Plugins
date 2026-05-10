@@ -29,6 +29,7 @@ def _compute_reachability_candidates(
     cold_start: Any,
     params: Any,
     max_count: int,
+    collision_config: Any = None,
 ) -> tuple[list[NDArray[np.float64]], list[Any]] | None:
     """Run the hemisphere IK sweep with the supplied pre-resolved
     ``cold_start`` mount + ``params``. Pure compute, safe to run off
@@ -40,6 +41,13 @@ def _compute_reachability_candidates(
     ``RuntimeError`` from worker threads, so doing the lookups here
     would silently fall back to globals + miss the active tool's
     calibrated values.
+
+    ``collision_config`` (built by the caller on the main thread)
+    triggers an end-pose gripper-only collision filter — candidates
+    whose target joints would clip the floor / tablet are dropped.
+    Passing ``None`` skips the filter entirely (legacy behaviour;
+    user could see "reachable" dots that ``_go_to_pose_for_candidate``
+    would block at click time).
 
     Returns ``(cam_positions_world, candidates)`` lined up
     index-for-index, or ``None`` on Robot-instantiation failure.
@@ -73,15 +81,62 @@ def _compute_reachability_candidates(
 
     # Extract camera positions; final flange-hull check (PoseGenerator's
     # workspace_xy/z bounds are rectangular; the hull is more accurate).
+    # When ``collision_config`` is supplied, ALSO drop candidates whose
+    # end pose collides with the floor / tablet — keeps the dots
+    # consistent with what the click-to-go path will accept at dispatch.
+    validate_core: Any = None
+    if collision_config is not None:
+        try:
+            from parol6_vision.calibration.collision_core import (  # noqa: PLC0415
+                validate_joint_trajectory_core,
+            )
+
+            validate_core = validate_joint_trajectory_core
+        except ImportError:
+            validate_core = None
+
     reachable_cam_world: list[NDArray[np.float64]] = []
     reachable_candidates: list[Any] = []
+    n_collision_dropped = 0
     for c in cands:
         T_cam2base = cold_start.cam_pose_for_flange_pose(np.asarray(c.flange_pose))
         cam_pos = T_cam2base[:3, 3]
         if not bool(envelope_contains(np.asarray(c.flange_pose)[:3, 3])[0]):
             continue
+        if validate_core is not None and collision_config is not None:
+            try:
+                # End-pose-only check: pass the same q for from/to with
+                # n_samples=0 so only the static configuration is
+                # tested (no interior interpolation, no live current_q
+                # dependence — the dots are POSITIONS, not paths).
+                q_target_deg = np.degrees(
+                    np.asarray(c.joint_angles_rad, dtype=np.float64),
+                ).tolist()
+                check = validate_core(
+                    q_target_deg, q_target_deg,
+                    config=collision_config,
+                    n_samples=0,
+                    degrees=True,
+                )
+                if check.get("manager_ready", False) and not check.get(
+                    "end_safe", True,
+                ):
+                    n_collision_dropped += 1
+                    continue
+            except Exception as e:  # noqa: BLE001
+                # Fail-open per candidate: if FCL hiccups, keep the
+                # dot rather than silently dropping it.
+                logger.debug(
+                    "reachability end-pose collision check failed: %s", e,
+                )
         reachable_cam_world.append(cam_pos)
         reachable_candidates.append(c)
+    if n_collision_dropped > 0:
+        logger.info(
+            "reachability sampling: %d candidates dropped by end-pose "
+            "collision filter (would clip floor/tablet at click-to-go)",
+            n_collision_dropped,
+        )
 
     logger.info(
         "reachability sampling: %d reachable (considered=%d, IK fails=%d, "
@@ -493,11 +548,39 @@ def _start_reachability_compute_async(
     if radius <= 0.0:
         radius = 0.003
 
+    # Build the collision config on the MAIN THREAD where it has
+    # request context (settings reads + ``_T_BOARD2BASE`` access).
+    # Pass through to the worker so it can filter out candidates
+    # whose end pose collides with floor / tablet — without this
+    # filter, the user can click a "reachable" dot only to have
+    # the click-to-go check (collision.validate_joint_trajectory)
+    # reject it with "collides with TABLET" or "collides with
+    # FLOOR". The dot rendered as reachable but going to it is
+    # blocked, which is the user-reported "obviously not happen"
+    # mismatch. End-pose check (q_target → q_target with n_samples=0)
+    # is fast (~few ms) per candidate and matches what
+    # ``_go_to_pose_for_candidate`` runs at click time, modulo the
+    # trajectory-interior portion that depends on the live start
+    # pose.
+    collision_config: Any = None
+    try:
+        from .collision import _config_from_settings  # noqa: PLC0415
+
+        collision_config = _config_from_settings(
+            gripper_only=True, include_tablet=True,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "reachability collision-filter config build skipped: %s", e,
+        )
+        collision_config = None
+
     loop = _state.get("main_loop")
 
     def _worker() -> None:
         result = _compute_reachability_candidates(
             target_world, cold_start, params, max_count,
+            collision_config=collision_config,
         )
         if result is None:
             return

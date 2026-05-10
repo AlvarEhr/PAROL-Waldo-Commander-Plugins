@@ -1,8 +1,10 @@
 import logging
+import logging.handlers
 import os
 import sys
 import threading
 import weakref
+from pathlib import Path
 from typing import Any
 
 from nicegui import ui, Client
@@ -139,11 +141,74 @@ def attach_ui_log(log_widget) -> None:
 
 
 def _have_console_handler(logger: logging.Logger) -> bool:
-    return any(isinstance(h, logging.StreamHandler) for h in logger.handlers)
+    return any(
+        isinstance(h, logging.StreamHandler)
+        and not isinstance(h, logging.FileHandler)
+        for h in logger.handlers
+    )
 
 
 def _have_ui_handler(logger: logging.Logger) -> bool:
     return any(isinstance(h, NiceGuiLogHandler) for h in logger.handlers)
+
+
+def _have_file_handler(logger: logging.Logger) -> bool:
+    return any(
+        isinstance(h, logging.handlers.RotatingFileHandler)
+        for h in logger.handlers
+    )
+
+
+def _resolve_log_file_path() -> Path | None:
+    """Resolve the destination path for the rotating-file log.
+
+    Order of precedence:
+
+    1. ``WALDO_LOG_FILE`` env var (explicit override).
+    2. ``WALDO_LOG_DIR`` env var (write ``waldo-commander.log`` inside).
+    3. The OneDrive-synced ``Project Files\\Waldo Logs\\`` directory if
+       it exists — keeps logs visible to the development workflow that
+       frequently inspects them across machines.
+    4. ``~/.waldo-commander/waldo-commander.log`` as the universal
+       fallback (mirrors the workspace-hull cache location).
+
+    Returns None if path resolution + parent-dir creation both fail
+    (callers treat that as "no file logging").
+    """
+    explicit = os.environ.get("WALDO_LOG_FILE")
+    if explicit:
+        try:
+            p = Path(explicit).expanduser().resolve()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            return p
+        except OSError:
+            pass
+
+    env_dir = os.environ.get("WALDO_LOG_DIR")
+    if env_dir:
+        try:
+            d = Path(env_dir).expanduser().resolve()
+            d.mkdir(parents=True, exist_ok=True)
+            return d / "waldo-commander.log"
+        except OSError:
+            pass
+
+    onedrive_logs = (
+        Path.home() / "OneDrive" / "Desktop" / "Project Files" / "Waldo Logs"
+    )
+    if onedrive_logs.parent.exists():
+        try:
+            onedrive_logs.mkdir(parents=True, exist_ok=True)
+            return onedrive_logs / "waldo-commander.log"
+        except OSError:
+            pass
+
+    fallback = Path.home() / ".waldo-commander"
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+        return fallback / "waldo-commander.log"
+    except OSError:
+        return None
 
 
 def configure_logging(
@@ -152,6 +217,7 @@ def configure_logging(
     """
     Configure root logger with:
       - ANSI-colored console handler (stderr) with timestamps and levels
+      - Rotating file handler (waldo-commander.log, 10MB x 5 backups)
       - Optional NiceGUI UI log handler (messages mirrored to web log)
     Idempotent across multiple calls.
     """
@@ -163,6 +229,35 @@ def configure_logging(
         console.setLevel(level)
         console.setFormatter(AnsiColorFormatter(colored=use_color))
         logger.addHandler(console)
+
+    if not _have_file_handler(logger):
+        log_path = _resolve_log_file_path()
+        if log_path is not None:
+            try:
+                # 10 MB per file, keep 5 backups → up to 60 MB on disk.
+                # Plain text (no ANSI colors) so the file is readable
+                # without a terminal that interprets escape codes.
+                file_handler = logging.handlers.RotatingFileHandler(
+                    str(log_path),
+                    maxBytes=10 * 1024 * 1024,
+                    backupCount=5,
+                    encoding="utf-8",
+                )
+                file_handler.setLevel(level)
+                file_handler.setFormatter(
+                    logging.Formatter(
+                        fmt="%(asctime)s %(levelname)s %(name)s: %(message)s",
+                        datefmt="%Y-%m-%d %H:%M:%S",
+                    ),
+                )
+                logger.addHandler(file_handler)
+            except OSError as exc:
+                # Don't fail startup just because the log file can't
+                # be opened (e.g. permission issue on a locked-down
+                # path). Console + UI handlers still work.
+                sys.stderr.write(
+                    f"[logging] could not open log file {log_path}: {exc}\n",
+                )
 
     if add_ui_handler and not _have_ui_handler(logger):
         ui_handler = NiceGuiLogHandler(level=level)

@@ -90,7 +90,18 @@ def _live_pose_indicator_tick() -> None:
     try:
         label.text = text
         label.props(f"color={color}")
-        label.tooltip(tooltip)
+        # Update the existing tooltip element in place (the chip's
+        # tooltip is created ONCE in panel.py and stashed in
+        # ``_state["live_pose_tooltip"]``). Calling
+        # ``label.tooltip(...)`` here used to APPEND a new tooltip
+        # element on every tick; the chip ended up with hundreds of
+        # stacked QTooltips and hovers fired them all at once.
+        tooltip_el = _state.get("live_pose_tooltip")
+        if tooltip_el is not None:
+            try:
+                tooltip_el.text = tooltip
+            except Exception as e:  # noqa: BLE001
+                logger.debug("live pose tooltip text update failed: %s", e)
     except Exception as e:  # noqa: BLE001
         logger.debug("live pose label update failed: %s", e)
 
@@ -180,6 +191,56 @@ def add_overlays(urdf_scene: Any) -> None:
     except RuntimeError:
         _state["main_loop"] = None
 
+    # Capture the NiceGUI client. Worker-thread callbacks scheduled via
+    # ``loop.call_soon_threadsafe`` run OUTSIDE any request slot, so
+    # ``ui.dialog()`` / ``ui.notify()`` etc. fail with
+    # ``"The current slot cannot be determined because the slot stack
+    # for this task is empty."``. The fix: enter the client's content
+    # slot via ``with client:`` before creating UI from a worker
+    # callback. ``preview_dialog.show_collision_dialog_threadsafe``
+    # uses this slot.
+    try:
+        from nicegui import context  # noqa: PLC0415
+
+        _state["nicegui_client"] = context.client
+    except (ImportError, RuntimeError) as e:
+        logger.debug("nicegui client capture failed: %s", e)
+        _state["nicegui_client"] = None
+
+    # Register a disconnect handler so our timers (footprint tick,
+    # post-cal tick, live-pose chip, detection poll, reachability
+    # pending defer, scene-init delay) are cancelled when the
+    # browser closes its tab. Without this, NiceGUI's ``ui.timer``
+    # keeps firing on the asyncio loop after page teardown; its
+    # ``_run_once`` enters ``self.parent_slot`` which raises
+    # ``RuntimeError: The parent slot of the element has been
+    # deleted.`` once for every tick. The error spams the log
+    # (~5 / sec for the 5 Hz footprint tick) without affecting
+    # functionality, but it's noisy and indicates orphaned tasks
+    # consuming CPU.
+    try:
+        client = _state.get("nicegui_client")
+        if client is not None:
+            from .panel import _teardown_overlays  # noqa: PLC0415
+
+            def _on_disconnect_cleanup() -> None:
+                # Best-effort cancel of every tracked timer + group
+                # so NiceGUI doesn't try to render into a dead slot.
+                # Reuses the panel's teardown logic (which already
+                # cancels calib_timers + detection_overlay_timer +
+                # reachability_pending_timer, and clears scene
+                # group handles + per-tool runtime state).
+                try:
+                    _teardown_overlays()
+                except Exception as exc:  # noqa: BLE001
+                    logger.debug(
+                        "calibration teardown on disconnect failed: %s", exc,
+                    )
+
+            client.on_disconnect(_on_disconnect_cleanup)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("disconnect-handler registration failed: %s", e)
+
     # Defer "scene is initialized" gating via a short delayed timer
     # rather than ``urdf_scene.scene.on("init", ...)``. The listener
     # path looks tempting, but ``Element.on()`` calls
@@ -212,8 +273,20 @@ def add_overlays(urdf_scene: Any) -> None:
     # extra defer-cycle on the reachability render, not a duplicate
     # arm. The timer is fire-once and cheap (no re-render ripple).
     _state["scene_initialized"] = False
+    # Cancel a stale prior init-defer timer if a previous add_overlays
+    # left one queued; otherwise it'd fire later against this rebuild's
+    # state and could clobber a True flag with True (cosmetic, but the
+    # parent slot deletion on page-tear-down also surfaces as noisy
+    # ``parent_slot deleted`` log lines).
+    old_init_timer = _state.get("scene_init_defer_timer")
+    if old_init_timer is not None:
+        try:
+            old_init_timer.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+        _state["scene_init_defer_timer"] = None
     try:
-        ui.timer(
+        _state["scene_init_defer_timer"] = ui.timer(
             0.6,
             lambda: _state.update({"scene_initialized": True}),
             once=True,
