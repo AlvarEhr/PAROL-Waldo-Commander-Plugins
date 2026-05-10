@@ -83,6 +83,35 @@ def main() -> None:
         print(f"Failed to import {backend_package}: {e}", file=sys.stderr)
         sys.exit(1)
 
+    # Register custom tools in the subprocess's parol6 ``_TOOL_REGISTRY``.
+    # The GUI process registers them at startup (main.py: register_all)
+    # but the subprocess gets a fresh registry that only contains the
+    # built-ins. Without this, ``Robot.set_active_tool("custom:foo")``
+    # raises ``ValueError: Unknown tool 'custom:foo'`` and the
+    # collision pre-flight in stepping_client._get_local_robot silently
+    # falls through — exactly the user population that needed the IK
+    # fix the most (custom tools with non-default tcp_offset_m).
+    #
+    # ``register_all`` re-bakes meshes (idempotent overwrite to
+    # parol6_mesh_dir) AND mutates ``_TOOL_REGISTRY`` AND tries to
+    # refresh ``ui_state.active_robot._tools`` — the last step
+    # defensively skips when ui_state isn't bound (subprocess case),
+    # so the call is safe here. Cost: ~0.1-0.5s per custom tool (the
+    # bake), paid once per subprocess spawn.
+    try:
+        from waldo_commander.components.calibration_overlays import (
+            custom_tools as _custom_tools,
+        )
+
+        _custom_tools.register_all()
+    except Exception as e:  # noqa: BLE001
+        print(
+            f"[stepping_bootstrap] custom-tool registration in "
+            f"subprocess failed ({type(e).__name__}: {e}); "
+            "Cartesian pre-flight on custom tools will be skipped.",
+            file=sys.stderr,
+        )
+
     # Prepare execution environment for the user script
     # Remove our bootstrap script from argv so the user script sees correct args
     sys.argv = [str(script_path)] + sys.argv[2:]

@@ -186,14 +186,19 @@ def add_overlays(urdf_scene: Any) -> None:
     stl_url, png_url = _ensure_static_mounts(merged_stl, board_png)
 
     # Capture the asyncio loop so the worker thread can post UI updates.
-    # Only clobber the existing slot when we have a real loop (or it was
-    # never set). A re-add path that runs without a running loop should
-    # NOT zero out a previously-captured valid loop ref — worker threads
-    # spawned earlier would lose their ability to schedule UI updates.
+    # Only clobber the existing slot when we have a real loop. A re-add
+    # path that runs without a running loop should NOT zero out a
+    # previously-captured valid loop ref — worker threads spawned
+    # earlier would lose their ability to schedule UI updates. (The
+    # state.py module-level seed for this key is None, so on a true
+    # first-call without a running loop the slot stays None either way.
+    # The protection here is for the multi-add re-entry path.)
     try:
         _state["main_loop"] = asyncio.get_running_loop()
     except RuntimeError:
-        _state.setdefault("main_loop", None)
+        # Preserve whatever was there. No-op when slot is None
+        # (first call); preserves a real loop on re-add.
+        pass
 
     # Capture the NiceGUI client. Worker-thread callbacks scheduled via
     # ``loop.call_soon_threadsafe`` run OUTSIDE any request slot, so

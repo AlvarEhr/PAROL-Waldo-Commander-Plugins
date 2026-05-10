@@ -13,7 +13,7 @@ from .calibration_thread import _calibration_thread
 from .hover import _drive_hover_pose_thread
 from .localise import _localise_board_thread
 from .overlays import _set_overlay_visible
-from .state import _state, current_board_config
+from .state import _state, _state_lock, current_board_config
 
 logger = logging.getLogger(__name__)
 
@@ -167,14 +167,35 @@ def _camera_gate_open() -> bool:
 def _teardown_overlays() -> None:
     """Delete every scene group + dynamic-overlay handle. Called on
     transitions out of the camera-bearing-render state (master toggle
-    flipped off, or active tool became no-camera with no override on).
+    flipped off, or active tool became no-camera with no override on),
+    AND from the on-disconnect handler registered in ``add_overlays``
+    so a browser tab-close also tears the scene down.
 
-    Per-tick scene timers (post-cal 4 Hz, footprint 5 Hz) are NOT
-    cancelled here — they self-skip when their preconditions go away
-    (no ``_state['current_mount']``). Storing handles to cancel them
-    would require changes in :mod:`overlays`; the early-exit path is
-    sufficient and matches the existing pattern.
+    Also signals worker threads (calibration / localise / hover /
+    pose-popup go-to-pose) to STOP via ``_state['stop_requested']``
+    so they release the controller socket + RealSense camera
+    promptly instead of running to natural completion. Without
+    this, a tab-close mid-calibration would leave the calibration
+    thread holding RealSense (which is exclusively claimed) for
+    the remaining sweep duration — re-opened tabs would fail to
+    initialise it.
     """
+    # Signal worker threads to STOP at their next poll point. Each
+    # worker checks ``_state.get("stop_requested")`` between move
+    # commands and at the top of its main loop, so an in-flight
+    # ``move_j(wait=True)`` blocks until the controller acks the
+    # halt — that's followed up below.
+    _state["stop_requested"] = True
+    # Dispatch a halt() to the controller so an in-flight motion
+    # aborts promptly instead of running to its planned end. The
+    # raw client is stashed in ``_state["client"]`` by the worker
+    # threads; if no thread is active, this is a no-op.
+    _client = _state.get("client")
+    if _client is not None:
+        try:
+            _client.halt()
+        except Exception as e:  # noqa: BLE001
+            logger.debug("teardown halt() raised: %s", e)
     for key in (
         "frustum_group", "board_group", "tablet_group",
         "hemisphere_group", "near_cone_group",
@@ -219,7 +240,16 @@ def _teardown_overlays() -> None:
     _state["footprint_last_mount"] = None
     # Reachability cache: drop the candidate list + cached points so a
     # stale entry can't be served to the click handler after teardown.
-    _state["reachable_candidates"] = []
+    # Bump ``reach_generation`` alongside the candidates clear under
+    # the lock so a click handler racing the teardown sees a clean
+    # "stale-gen mismatch" categorisation rather than indexing past
+    # an empty list (which bottoms out gracefully but produces
+    # confusing log noise).
+    with _state_lock:
+        _state["reach_generation"] = (
+            int(_state.get("reach_generation", 0)) + 1
+        )
+        _state["reachable_candidates"] = []
     _state["reachable_points_world"] = None
     _state["reachable_target_world"] = None
     # Cancel any pending deferred reachability render scheduled while

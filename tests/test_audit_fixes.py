@@ -184,19 +184,40 @@ class TestResolveToolParamsForIk:
         tool_key, _, _ = resolver(_FakeClient(""))
         assert tool_key == "NONE"
 
-    def test_variant_parsed_from_env(self, clean_env) -> None:
+    def test_variant_parsed_from_env_when_keys_match(self, clean_env) -> None:
+        # env_key == client_key means no mid-script change happened;
+        # the env's variant applies to this tool.
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "v1"
         resolver = self._resolver()
         _, variant, _ = resolver(_FakeClient("SSG-48"))
         assert variant == "v1"
 
+    def test_variant_dropped_when_client_disagrees(self, clean_env) -> None:
+        # Mid-script ``client.set_active_tool("VACUUM")`` changed the
+        # client's tool from the env's recorded "SSG-48". The env's
+        # variant ("ssg48_tape_jaws") belongs to SSG-48, not VACUUM,
+        # so it must NOT be carried forward — the local IK would
+        # otherwise call set_active_tool("VACUUM",
+        # variant_key="ssg48_tape_jaws") and corrupt the cache key.
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
+        os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "ssg48_tape_jaws"
+        resolver = self._resolver()
+        tool_key, variant, _ = resolver(_FakeClient("VACUUM"))
+        assert tool_key == "VACUUM"  # client wins
+        assert variant is None  # env's variant doesn't apply to VACUUM
+
     def test_empty_variant_env_yields_none(self, clean_env) -> None:
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = ""
         resolver = self._resolver()
         _, variant, _ = resolver(_FakeClient("SSG-48"))
         assert variant is None
 
-    def test_tcp_offset_parsed_from_json(self, clean_env) -> None:
+    def test_tcp_offset_parsed_from_json_when_keys_match(self, clean_env) -> None:
+        # As with variant: only carry env's tcp_offset forward when
+        # env_key == client_key (or env wins for custom:).
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
             [0.001, -0.002, 0.003],
         )
@@ -204,9 +225,36 @@ class TestResolveToolParamsForIk:
         _, _, tcp_offset = resolver(_FakeClient("SSG-48"))
         assert tcp_offset == (0.001, -0.002, 0.003)
 
+    def test_tcp_offset_dropped_when_client_disagrees(self, clean_env) -> None:
+        # Same argument as variant: env's tcp_offset is paired with
+        # env_key, must not leak into a different client_key.
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
+        os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
+            [0.001, -0.002, 0.003],
+        )
+        resolver = self._resolver()
+        _, _, tcp_offset = resolver(_FakeClient("VACUUM"))
+        assert tcp_offset is None  # env's offset doesn't apply to VACUUM
+
+    def test_custom_env_carries_its_variant_and_offset(self, clean_env) -> None:
+        # Controller broadcast carries only the proxy built-in for
+        # custom: tools, so client.tool.key is the proxy. Env is the
+        # only source of truth for ALL of (key, variant, tcp_offset).
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "custom:my_grip"
+        os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "narrow_jaws"
+        os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
+            [0.0, 0.0, -0.005],
+        )
+        resolver = self._resolver()
+        tool_key, variant, tcp_offset = resolver(_FakeClient("SSG-48"))
+        assert tool_key == "custom:my_grip"
+        assert variant == "narrow_jaws"
+        assert tcp_offset == (0.0, 0.0, -0.005)
+
     def test_malformed_tcp_offset_yields_none(self, clean_env) -> None:
         # Robustness: a corrupt env var must not crash the subprocess
         # — the pre-flight just falls through to "no tcp offset".
+        os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = "not json"
         resolver = self._resolver()
         _, _, tcp_offset = resolver(_FakeClient("SSG-48"))

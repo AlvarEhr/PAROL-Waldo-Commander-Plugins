@@ -53,30 +53,63 @@ def _resolve_tool_params_for_ik(
         # parol6 RobotClient.tool raises RuntimeError when no tool is
         # bound. Treat the same as "no client side tool".
         client_key = ""
-    if env_key.startswith("custom:"):
-        # Controller broadcast doesn't carry custom: keys; the env
-        # var is the only source of truth for these.
-        tool_key = env_key
-    elif client_key:
-        # Built-in tool: trust the client's runtime state so
-        # mid-script set_active_tool calls take effect.
-        tool_key = client_key
-    else:
-        tool_key = env_key or "NONE"
 
-    variant_key = os.environ.get("WALDO_GUI_ACTIVE_TOOL_VARIANT", "").strip() or None
-
-    tcp_offset_m: tuple[float, float, float] | None = None
+    # Read env's variant + tcp_offset early — they're paired with
+    # ``env_key`` semantically; carrying them forward to a different
+    # tool_key would silently corrupt the local IK's helper Robot
+    # cache (e.g. ``Robot.set_active_tool("VACUUM",
+    # variant_key="ssg48_tape_jaws")`` falls back to VACUUM's
+    # default variant after parol6 logs a warning, but the cache
+    # still keys the result against the wrong variant_key).
+    env_variant = (
+        os.environ.get("WALDO_GUI_ACTIVE_TOOL_VARIANT", "").strip() or None
+    )
+    env_tcp_offset_m: tuple[float, float, float] | None = None
     tcp_offset_str = os.environ.get("WALDO_GUI_ACTIVE_TCP_OFFSET_M", "").strip()
     if tcp_offset_str:
         try:
             parsed = json.loads(tcp_offset_str)
             if isinstance(parsed, list) and len(parsed) == 3:
-                tcp_offset_m = (
+                env_tcp_offset_m = (
                     float(parsed[0]), float(parsed[1]), float(parsed[2]),
                 )
         except (json.JSONDecodeError, ValueError, TypeError):
+            env_tcp_offset_m = None
+
+    if env_key.startswith("custom:"):
+        # Controller broadcast doesn't carry custom: keys; the env
+        # var is the only source of truth. Env's variant + tcp_offset
+        # belong to this tool.
+        tool_key = env_key
+        variant_key = env_variant
+        tcp_offset_m = env_tcp_offset_m
+    elif client_key:
+        # Built-in tool. Trust the client's runtime state so a
+        # mid-script set_active_tool propagates. The env's
+        # variant + tcp_offset are paired with ``env_key``; if the
+        # client's tool differs, those env values are stale and
+        # must NOT be carried forward — fall back to whatever the
+        # client exposes (variant_key best-effort; tcp_offset_m
+        # isn't on the parol6 client API so falls back to None).
+        tool_key = client_key
+        if env_key == client_key:
+            # No mid-script change happened; env values still
+            # apply to this tool.
+            variant_key = env_variant
+            tcp_offset_m = env_tcp_offset_m
+        else:
+            try:
+                variant_key = (
+                    getattr(wrapped_client.tool, "variant_key", None) or None
+                )
+            except (RuntimeError, AttributeError):
+                variant_key = None
             tcp_offset_m = None
+    else:
+        # No client side tool bound. Fall back to env or NONE.
+        tool_key = env_key or "NONE"
+        variant_key = env_variant
+        tcp_offset_m = env_tcp_offset_m
 
     return tool_key, variant_key, tcp_offset_m
 

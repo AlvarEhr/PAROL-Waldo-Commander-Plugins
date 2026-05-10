@@ -452,8 +452,16 @@ def refresh_reachability_for_active_tool() -> None:
         except Exception:  # noqa: BLE001
             pass
         _state["reachability_group"] = None
-    _state["reachable_candidates"] = []
-    _state["reachable_candidates_all"] = []
+    # Bump ``reach_generation`` alongside the candidates clear under
+    # ``_state_lock`` so a click handler racing this refresh sees
+    # current spheres tagged with the OLD gen as stale (correct)
+    # rather than indexing into the now-empty candidates list.
+    with _state_lock:
+        _state["reach_generation"] = (
+            int(_state.get("reach_generation", 0)) + 1
+        )
+        _state["reachable_candidates"] = []
+        _state["reachable_candidates_all"] = []
     _state["reachable_points_all"] = None
     _state["reachable_points_world"] = None
     # Lazy import; avoids a state.py / reachability.py import cycle.

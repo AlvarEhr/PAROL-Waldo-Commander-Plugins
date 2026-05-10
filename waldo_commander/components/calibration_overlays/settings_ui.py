@@ -248,13 +248,16 @@ def _optional_xyz_input(
 
     inputs: list[ui.number] = []
 
-    def _on_xyz_change(_e: Any = None) -> None:
-        # The xyz inputs aren't switches but they share the toggle
-        # gate; reading ``sw.value`` here is fine because the toggle
-        # event has already settled by the time the user types into
-        # an input. (The race in ``_on_switch`` is the
-        # update:model-value-fires-before-sw.value-updates one.)
-        if not bool(sw.value):
+    def _on_xyz_change(_e: Any = None, *, force_enabled: bool = False) -> None:
+        # The xyz inputs aren't switches; they fire on user-typing,
+        # at which point the toggle event has long settled and
+        # reading ``sw.value`` is safe. But ``_on_switch`` calls
+        # this function directly during the OFF->ON transition,
+        # WHILE Quasar's update:model-value is still in flight —
+        # ``sw.value`` may hold the previous (OFF) state on that
+        # call. ``force_enabled=True`` bypasses the gate when the
+        # caller already knows the switch went ON.
+        if not force_enabled and not bool(sw.value):
             return
         try:
             new_display = tuple(
@@ -272,8 +275,12 @@ def _optional_xyz_input(
         # update:model-value fires.
         new_value = bool(getattr(_e, "value", False))
         if new_value:
-            # Switch ON: read whatever's in the inputs.
-            _on_xyz_change()
+            # Switch ON: persist whatever's in the inputs as the
+            # initial override value. ``force_enabled=True`` bypasses
+            # the ``sw.value`` gate which would otherwise reject this
+            # call because Quasar hasn't yet propagated the new value
+            # to the python-side ``sw.value`` property.
+            _on_xyz_change(force_enabled=True)
             for inp in inputs:
                 inp.set_enabled(True)
         else:
