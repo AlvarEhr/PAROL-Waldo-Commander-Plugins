@@ -34,15 +34,6 @@ from .state import (
 logger = logging.getLogger(__name__)
 
 
-def _mark_scene_initialized(*_args: Any, **_kwargs: Any) -> None:
-    """Set ``_state['scene_initialized']`` when the URDF scene's
-    'init' event fires. Used as the gate for timer-driven scene
-    mutations — see the long comment in :func:`add_overlays` where
-    this is wired up.
-    """
-    _state["scene_initialized"] = True
-
-
 def _live_pose_indicator_tick() -> None:
     """2 Hz background poll that updates the live-pose collision-status
     indicator chip in the calibration panel header.
@@ -189,68 +180,48 @@ def add_overlays(urdf_scene: Any) -> None:
     except RuntimeError:
         _state["main_loop"] = None
 
-    # Hook the scene's 'init' event so timer-driven scene mutations
-    # (footprint tick, reachability dots) know whether the browser
-    # has processed init_objects yet. Without this gate,
-    # ``run_method('create', ...)`` calls fired before init are
-    # silently DROPPED by NiceGUI's three.js handler:
+    # Defer "scene is initialized" gating via a short delayed timer
+    # rather than ``urdf_scene.scene.on("init", ...)``. The listener
+    # path looks tempting, but ``Element.on()`` calls
+    # ``Element.update()`` (element.py:388), which enqueues an update
+    # message. ``add_overlays`` runs AFTER ``await client.tools()`` in
+    # ``initialize_urdf_scene``, so the outbox already flushed the
+    # scene construction message; the new listener arrives in a SECOND
+    # update. NiceGUI's frontend (nicegui.js:482-496) compares
+    # ``listener_id``s, sees a new one, fires the
+    # ``"Event listeners changed after initial definition.
+    # Re-rendering affected elements."`` warning, then DELETES the
+    # scene element and re-mounts it. Re-mount calls
+    # ``init_objects`` AGAIN on the same client-side THREE.scene
+    # (scene.js:1138-1172). Each ``create()`` call inside that loop
+    # (scene.js:414-608) does
+    # ``this.objects.set(id, mesh); parent.add(mesh)`` — ``Map.set``
+    # overwrites the dict entry, but THREE.js's ``parent.add(child)``
+    # does NOT dedupe by ``object_id``. Result: the OLD mesh stays
+    # parented to the old THREE.js group as a phantom while the NEW
+    # mesh receives subsequent broadcasts. The user sees TWO arms,
+    # one frozen at the page-open pose, one live. ``hard refresh``
+    # wipes the THREE.scene and starts clean — confirming the
+    # client-side accumulation theory.
     #
-    #   create(type, id, parent_id, ...args) {
-    #     if (!this.is_initialized) return;  // scene.js:416
-    #
-    # The result is invisible objects (server-side they exist in
-    # ``scene.objects`` but the 3JS scene never sees them), causing
-    # the user-reported "centerline + footprint don't appear until
-    # I press anything" symptom (later events incidentally trigger
-    # re-sends that arrive after init has flipped is_initialized).
-    #
-    # On a feature-toggle cycle (off→on) ``add_overlays`` runs again
-    # against the SAME UrdfScene/Three.js scene. NiceGUI's 'init'
-    # event only fires ONCE per scene construction, so re-attaching
-    # the listener doesn't re-trigger the callback. If we
-    # unconditionally reset ``scene_initialized`` to False, the
-    # gate gets stuck and every reachability render defers
-    # indefinitely.
-    #
-    # Track init state via a weakref to the scene object plus
-    # NiceGUI's stable element id: if the prior weakref is dead OR
-    # points to an element with a different id than the current
-    # scene, this is a NEW scene (page reload, etc.) and we reset
-    # the flag. Pure ``id()`` comparison would silently break here
-    # because CPython reuses memory addresses; ``weakref.ref`` makes
-    # gc-induced reuse explicit (the ref returns None on dead).
-    import weakref  # noqa: PLC0415
-    prior_ref = _state.get("scene_init_weakref")
-    prior_nice_id = _state.get("scene_init_nice_id")
-    current_scene = urdf_scene.scene
-    current_nice_id = getattr(current_scene, "id", None)
-    prior_scene = prior_ref() if prior_ref is not None else None
-    is_same_scene = (
-        prior_scene is current_scene
-        and prior_nice_id == current_nice_id
-        and current_nice_id is not None
-    )
-    if not is_same_scene:
-        _state["scene_initialized"] = False
-        try:
-            _state["scene_init_weakref"] = weakref.ref(current_scene)
-        except TypeError:
-            # Some NiceGUI element types reject weakref. Fall back
-            # to direct strong reference comparison; not ideal
-            # (keeps the prior scene alive longer) but at least
-            # detects obvious changes.
-            _state["scene_init_weakref"] = lambda s=current_scene: s
-        _state["scene_init_nice_id"] = current_nice_id
-    # else: same scene — keep the prior True flag alive so the
-    # defer-gate isn't reset to False post-init.
+    # The delayed-timer alternative achieves the same gate (footprint
+    # tick + reachability defer waiting for the browser to be ready)
+    # without going through ``Element.on()``. 600ms is comfortably
+    # past first-mount + ``init_objects`` for any reasonable machine;
+    # even if it lands fractionally early, the worst case is one
+    # extra defer-cycle on the reachability render, not a duplicate
+    # arm. The timer is fire-once and cheap (no re-render ripple).
+    _state["scene_initialized"] = False
     try:
-        urdf_scene.scene.on("init", _mark_scene_initialized)
+        ui.timer(
+            0.6,
+            lambda: _state.update({"scene_initialized": True}),
+            once=True,
+        )
     except Exception as e:  # noqa: BLE001
-        logger.debug("scene init hook failed: %s", e)
-        # Fall back to optimistic-true so the gate doesn't break
-        # cases where the hook can't attach. Set the weakref AFTER
-        # the failure so a retry on the same scene won't keep
-        # trying to register the same dead handler.
+        logger.debug("scene init defer-timer failed: %s", e)
+        # Fall back to optimistic-true so timer-driven creates
+        # aren't stuck behind a permanently-False gate.
         _state["scene_initialized"] = True
 
     # Cache mount + paths for the worker thread.
