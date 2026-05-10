@@ -259,26 +259,38 @@ across 12 ship-blocker findings, ~25 yellow-priority items, and
 | 4 — Robustness | `4113ea3` | cache poisoning, exception cleanup, platform gating | +66 / -22 |
 | 5 — Input hardening | `af050a0` | path traversal, STL size cap, partial-jaw warning | +94 / -1 |
 | 6 — Dead-code | `e9de29f` | #12 hijack docs cleanup | +53 / -18 |
-| 7 — Cleanup + tests | `b88e690` | cosmetic + `tests/test_audit_fixes.py` | +355 / -12 |
+| 7 — Cleanup + tests | `b88e690` | cosmetic + `tests/test_audit_fixes.py` (34 cases) | +355 / -12 |
+| 8 — 2nd bug-hunt | `e1ee0bd` | regression in #1 (subprocess registry), incomplete #2 (sw.value race), variant/tcp_offset desync, partial lock coverage, main_loop semantic, deferred #7 was wrong | +201 / -41 |
 
-Two ship-blocker findings deferred with explicit reasoning:
+After Batch 7 landed, ran a second multi-agent bug-hunt over all
+the fix commits to catch regressions and anything the first audit
+missed. Found 6 issues — 2 ship-blocker regressions in my own fixes
+(custom-tool IK broken in subprocess; sw.value race fix incomplete),
+3 warnings, and 1 case where my deferral reasoning for #7 was
+wrong on review (`_teardown_overlays` cancels timers but doesn't
+set `stop_requested=True`, so worker threads don't actually
+release the controller socket on tab-close). Batch 8 addresses all
+six. Test suite grew to 37 cases.
 
-* **#7 — daemon-thread lifecycle.** All four worker threads
-  (calibration / localise / hover / halt-in-thread) are spawned
-  `daemon=True` with no handle / Event / join. This is intentional —
-  daemon threads die at process exit, no risk of zombie processes.
-  Commit `dde50b4` already added an `on_disconnect →
-  _teardown_overlays` path that cancels the per-tick UI timers on
-  browser-tab-close, which is the realistic mid-session leak vector.
-  A more rigorous lifecycle (handle registry, Event-based cancel,
-  join-on-teardown) is a larger architectural change worth its own
-  batch if it surfaces as an actual problem.
+One ship-blocker finding remains deferred with explicit reasoning:
+
 * **#9 — `_T_BOARD2BASE[:] = new_T` torn-read.** The author's
   comment in `localise.py` explicitly accepts the race ("the GIL
   doesn't make it formally atomic but in practice no Python statement
   interleaves between the two halves of a 4×4 copy"). The contention
   window is tiny (single write per board-localise vs frustum tick at
   5 Hz reading), and the worst case is a one-frame visual glitch.
+  The second bug-hunt verified — NumPy in-place slice-assign lowers
+  to ``PyArray_CopyInto`` which holds the GIL throughout, and reader-
+  side ``_T_BOARD2BASE @ vec`` operations also hold the GIL through
+  their C calls.
+
+(Originally deferred #7 — daemon-thread lifecycle — but the second
+bug-hunt found my reasoning was wrong: `_teardown_overlays` does NOT
+set `stop_requested=True`, so the on_disconnect path didn't actually
+stop worker threads on tab-close. Batch 8 fixed it: teardown now sets
+`stop_requested = True` AND dispatches `client.halt()` so an in-flight
+motion aborts promptly.)
 
 The remaining yellow / minor items not addressed are:
 
