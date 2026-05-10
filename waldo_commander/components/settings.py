@@ -1,6 +1,7 @@
 """Settings component for serial port, theme, and visualization preferences."""
 
 import logging
+import sys
 from collections.abc import Callable
 from contextlib import contextmanager
 
@@ -565,12 +566,18 @@ class SettingsContent:
                 self._cam_select.options = new_options
                 self._cam_select.update()
 
-        # Auto-refresh disabled — on Windows, ``cv2.VideoCapture(i)`` actually
-        # opens each camera device for a moment, which causes user-visible
-        # flicker on USB cameras (especially Intel RealSense). The user can
-        # click the Settings panel to trigger a one-shot refresh instead.
+        # Windows: auto-refresh disabled because ``cv2.VideoCapture(i)``
+        # actually opens each camera device for a moment, which causes
+        # user-visible flicker on USB cameras (especially Intel RealSense).
+        # The user can click the Settings panel to trigger a one-shot
+        # refresh instead.
+        # Linux / macOS: V4L2 / AVFoundation enumeration is non-intrusive
+        # (queries the kernel device list without opening), so the auto-
+        # refresh runs as before — preserves the "plug a camera in
+        # mid-session and see it appear in the dropdown" behaviour for
+        # those platforms.
         self._cam_refresh_timer = ui.timer(
-            10.0, _refresh_camera_devices, active=False
+            10.0, _refresh_camera_devices, active=sys.platform != "win32",
         )
 
         if stored_cam is not None and stored_cam != -1:

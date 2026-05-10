@@ -393,18 +393,33 @@ class PathPreviewClient:
             except (ImportError, AttributeError):
                 tool_key = "NONE"
 
-        tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
-        config = CollisionEnvironmentConfig(
-            gripper_only=True,
-            tool_key=tool_key,
-            body_mesh_paths=tuple(tool_meshes["BODY"]),
-            jaw_mesh_paths=tuple(tool_meshes["JAW"]),
-            tablet_T_board2base=None,
-            tablet_dimensions_m=None,
-            floor_enabled=True,
-            safety_margin_m=0.008,
-        )
-        end_joints_rad = list(result.end_joints_rad.tolist())
+        # Wrap mesh resolution + config build in a defensive
+        # try/except so a future contract change in parol6_vision
+        # (e.g. ``resolve_tool_meshes_from_registry`` returning a
+        # dict without "BODY" / "JAW" roles, or
+        # ``CollisionEnvironmentConfig`` adding required fields)
+        # can't propagate up into ``_collect_from_result`` and skip
+        # segment collection for the whole script. Without this,
+        # the user would see "no segment recorded" with no
+        # indication that the pre-check itself broke.
+        try:
+            tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
+            config = CollisionEnvironmentConfig(
+                gripper_only=True,
+                tool_key=tool_key,
+                body_mesh_paths=tuple(tool_meshes["BODY"]),
+                jaw_mesh_paths=tuple(tool_meshes["JAW"]),
+                tablet_T_board2base=None,
+                tablet_dimensions_m=None,
+                floor_enabled=True,
+                safety_margin_m=0.008,
+            )
+            end_joints_rad = list(result.end_joints_rad.tolist())
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "preview collision pre-check setup skipped: %s", e,
+            )
+            return
 
         # LRU cache lookup keyed by quantized (q_from, q_to, config).
         # CollisionEnvironmentConfig is a frozen hashable dataclass so
@@ -433,10 +448,22 @@ class PathPreviewClient:
             except Exception as e:  # noqa: BLE001
                 logger.debug("preview collision check skipped: %s", e)
                 return
-            _EDIT_TIME_PRECHECK_CACHE[cache_key] = check
-            _EDIT_TIME_PRECHECK_CACHE.move_to_end(cache_key)
-            while len(_EDIT_TIME_PRECHECK_CACHE) > _EDIT_TIME_PRECHECK_CACHE_MAX:
-                _EDIT_TIME_PRECHECK_CACHE.popitem(last=False)
+            # Only cache when the collision manager was actually
+            # ready. ``manager_ready=False`` means python-fcl or the
+            # mesh files were unavailable on this call (e.g. a
+            # transient mount issue, or first-call before the lazy
+            # FCL build settled), and the result is a fail-open
+            # ``safe=True`` placeholder. Caching that placeholder
+            # would mask any real collision on the same (q_from,
+            # q_to, config) for the rest of the session, since the
+            # cache is hit before re-running the check. Skipping
+            # the write lets a subsequent call try the build again
+            # and catch real collisions.
+            if check.get("manager_ready", True):
+                _EDIT_TIME_PRECHECK_CACHE[cache_key] = check
+                _EDIT_TIME_PRECHECK_CACHE.move_to_end(cache_key)
+                while len(_EDIT_TIME_PRECHECK_CACHE) > _EDIT_TIME_PRECHECK_CACHE_MAX:
+                    _EDIT_TIME_PRECHECK_CACHE.popitem(last=False)
 
         if not check.get("safe", True):
             line_no = self._get_caller_line_number()

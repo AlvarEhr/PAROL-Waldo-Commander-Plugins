@@ -358,6 +358,12 @@ def _render_reachability_dots(
         # rebuild will populate the group.
         if "parent slot" not in str(e):
             logger.warning("reachability render failed: %s", e)
+        # Clear the partially-built group ref so the next render
+        # cycle's idempotent cleanup doesn't try to .delete() a
+        # half-populated handle (the delete itself is wrapped in
+        # try/except, but the resulting log noise is confusing —
+        # better to start clean).
+        _state["reachability_group"] = None
     # Refresh the settings-panel info label ("X / Y non-overlapping")
     # so the user sees the post-render counts. Best-effort.
     _notify_reachability_info_changed()
