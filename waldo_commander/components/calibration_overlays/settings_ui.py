@@ -197,7 +197,12 @@ def _switch_input(key: str, label: str) -> ui.switch:
     sw = ui.switch(label, value=bool(settings.get(key))).props("dense")
 
     def _on_change(_e: Any = None) -> None:
-        _on_setting_change(key, bool(sw.value))
+        # Read from the event payload, not ``sw.value``. Per the
+        # comment in panel.py:484, ``sw.value`` may still hold the
+        # PREVIOUS state when ``update:model-value`` fires on the
+        # underlying Quasar component, so we'd persist the wrong
+        # value on the first toggle.
+        _on_setting_change(key, bool(getattr(_e, "value", False)))
 
     sw.on("update:model-value", _on_change)
     return sw
@@ -244,6 +249,11 @@ def _optional_xyz_input(
     inputs: list[ui.number] = []
 
     def _on_xyz_change(_e: Any = None) -> None:
+        # The xyz inputs aren't switches but they share the toggle
+        # gate; reading ``sw.value`` here is fine because the toggle
+        # event has already settled by the time the user types into
+        # an input. (The race in ``_on_switch`` is the
+        # update:model-value-fires-before-sw.value-updates one.)
         if not bool(sw.value):
             return
         try:
@@ -257,7 +267,11 @@ def _optional_xyz_input(
         _on_setting_change(key, new_storage)
 
     def _on_switch(_e: Any = None) -> None:
-        if bool(sw.value):
+        # Read from the event payload — see _switch_input for the
+        # rationale. ``sw.value`` may hold the previous state when
+        # update:model-value fires.
+        new_value = bool(getattr(_e, "value", False))
+        if new_value:
             # Switch ON: read whatever's in the inputs.
             _on_xyz_change()
             for inp in inputs:

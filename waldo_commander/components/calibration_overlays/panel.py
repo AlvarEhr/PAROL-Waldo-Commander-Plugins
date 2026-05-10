@@ -522,11 +522,26 @@ def _build_no_camera_placeholder(close_callback: Callable[[], None] | None) -> N
     override, and (c) the custom-tools UI so the user can flag an
     existing custom tool as ``has_camera`` from here.
     """
+    # Prefer the GUI's logical tool key (custom: prefix preserved) over
+    # the controller's broadcast key. ``robot_state.tool_key`` reflects
+    # what the controller broadcasts, which is only ever a BUILT-IN
+    # name — for a custom tool with ``proxy_tool_key="SSG-48"`` it
+    # would say "SSG-48" while the GUI is presenting
+    # ``custom:my_gripper``. Same coverage gap that e6e6ad5 fixed
+    # elsewhere; this surface was missed.
     try:
-        from waldo_commander.state import robot_state  # noqa: PLC0415
-        active_key = getattr(robot_state, "tool_key", None) or "NONE"
+        from .custom_tools import _active_gui_tool_key  # noqa: PLC0415
+        active_key = _active_gui_tool_key() or "NONE"
     except Exception:  # noqa: BLE001
-        active_key = "(unknown)"
+        # _active_gui_tool_key reads app.storage.general which raises
+        # outside a request context. Fall back to the controller's
+        # broadcast key — the placeholder is informational, not
+        # safety-critical.
+        try:
+            from waldo_commander.state import robot_state  # noqa: PLC0415
+            active_key = getattr(robot_state, "tool_key", None) or "NONE"
+        except Exception:  # noqa: BLE001
+            active_key = "(unknown)"
 
     with ui.row().classes("w-full items-center"):
         ui.label("Calibration").classes("text-lg font-medium")

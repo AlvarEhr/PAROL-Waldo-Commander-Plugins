@@ -525,8 +525,21 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                     ui.notify("Upload a body STL first", color="warning")
                     return
                 # Bake first — registry mutation should be in place
-                # before the local apply queries meshes.
-                custom_tools.register_one(cfg)
+                # before the local apply queries meshes. ``register_one``
+                # returns False when the bake itself fails (corrupt STL,
+                # trimesh import error, etc.); without checking the
+                # return, we'd fall through to ``select_as_active`` and
+                # parol6's apply_tool would fail because the canonical
+                # mesh entries don't exist in the registry. Surface the
+                # bake failure to the user and bail.
+                if not custom_tools.register_one(cfg):
+                    ui.notify(
+                        f"Bake failed for custom:{cfg.name}; check the "
+                        "logs for the failing mesh, fix the source STL, "
+                        "and try again.",
+                        color="warning", position="top",
+                    )
+                    return
                 ok = await custom_tools.select_as_active(
                     cfg.name, proxy_tool_key=str(cfg.proxy_tool_key or ""),
                 )
