@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
@@ -56,6 +57,61 @@ from numpy.typing import NDArray
 from scipy.spatial.transform import Rotation as SciRot
 
 logger = logging.getLogger(__name__)
+
+
+# Defense-in-depth: validate ``name`` / ``variant_key`` so user-supplied
+# strings can't escape ``CUSTOM_TOOLS_ROOT`` or ``parol6_mesh_dir``.
+# pathlib's ``/`` operator resets when the right side is absolute, and
+# ``..`` traversal is not blocked by Path semantics — both would let a
+# crafted name escape the intended folder. Today the only callers are
+# UI handlers that already alphanumeric+underscore-validate their
+# inputs, but enforcing the constraint at the data-layer boundary
+# means a future caller can't accidentally regress.
+_VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _validate_safe_name(value: str, kind: str = "name") -> None:
+    """Reject names that could escape the tool / mesh folders.
+
+    Allowed: non-empty strings made of ASCII alphanumerics + underscore.
+    Anything else (path separators, ``..``, dots, spaces, unicode)
+    raises ``ValueError``.
+    """
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"empty / non-string {kind}: {value!r}")
+    if not _VALID_NAME_RE.match(value):
+        raise ValueError(
+            f"invalid {kind}: {value!r}; must match [A-Za-z0-9_]+ "
+            "(no path separators, dots, spaces, or unicode)"
+        )
+
+
+# STL load size cap. trimesh.load happily ingests arbitrarily large
+# meshes; a 5 GB STL would OOM the server before parsing even
+# completes. 200 MB is comfortably above any realistic CAD-exported
+# end-effector (typical gripper STLs are 1–20 MB) but small enough
+# to keep memory bounded on shared hardware.
+_STL_MAX_SIZE_MB: int = 200
+
+
+def _stl_size_check(stl_path: Path) -> bool:
+    """Return True iff ``stl_path`` exists and is within the size cap.
+    Logs a warning (not an exception) on rejection so the calling
+    bake / load path can fail-soft without crashing the page.
+    """
+    try:
+        size_bytes = stl_path.stat().st_size
+    except OSError as e:
+        logger.warning("STL stat failed for %s: %s", stl_path, e)
+        return False
+    size_mb = size_bytes / (1024 * 1024)
+    if size_mb > _STL_MAX_SIZE_MB:
+        logger.warning(
+            "STL %s exceeds size cap (%.1f MB > %d MB); rejecting load",
+            stl_path, size_mb, _STL_MAX_SIZE_MB,
+        )
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +542,7 @@ def import_stl(name: str, role: str, src: Path) -> None:
     canonical name. ``role`` is one of ``"body"``, ``"jaw_left"``,
     ``"jaw_right"``.
     """
+    _validate_safe_name(name, "tool name")
     folder = CUSTOM_TOOLS_ROOT / name
     folder.mkdir(parents=True, exist_ok=True)
     dst_name = {
@@ -502,6 +559,8 @@ def import_variant_stl(name: str, variant_key: str, side: str, src: Path) -> Non
     """Copy a user-provided STL into the tool's folder as a variant
     jaw mesh. ``side`` is ``"left"`` or ``"right"``.
     """
+    _validate_safe_name(name, "tool name")
+    _validate_safe_name(variant_key, "variant key")
     if side not in ("left", "right"):
         raise ValueError(f"side must be 'left' or 'right', got {side!r}")
     folder = CUSTOM_TOOLS_ROOT / name
@@ -516,7 +575,9 @@ def import_variant_stl(name: str, variant_key: str, side: str, src: Path) -> Non
 
 
 def _load_trimesh(stl_path: Path) -> Any | None:
-    """Best-effort load with trimesh; None on failure."""
+    """Best-effort load with trimesh; None on failure or size-cap reject."""
+    if not _stl_size_check(stl_path):
+        return None
     try:
         import trimesh  # noqa: PLC0415
 
@@ -829,6 +890,13 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
     for role, src_path in bake_jobs:
         if not src_path.exists():
             continue
+        # Defensive size cap to prevent OOM on a huge user-supplied
+        # STL — see ``_stl_size_check``. Skipping a too-large mesh
+        # mirrors the missing-file branch above (continue, role
+        # absent from the returned dict, register_one notices and
+        # downgrades).
+        if not _stl_size_check(src_path):
+            continue
         try:
             mesh = trimesh.load(str(src_path), force="mesh")
             mesh.apply_transform(T)
@@ -854,6 +922,31 @@ def register_one(cfg: CustomToolConfig) -> bool:
     baked = bake_one(cfg)
     if not baked or "body" not in baked:
         return False
+
+    # Detect partial-jaw failures: the user uploaded both jaws but
+    # one (or both) failed to bake (corrupt STL, size-cap reject,
+    # trimesh import error, etc.). Without this check, the tool
+    # silently registers as ``has_jaws=False``, which the gripper
+    # dropdown shows as "no jaws" — confusing if the user thought
+    # their jaws should be there. Surfaces a structured warning so
+    # the log file makes the cause obvious.
+    cfg_has_left = cfg.jaw_left_path.exists()
+    cfg_has_right = cfg.jaw_right_path.exists()
+    baked_has_left = "jaw_left" in baked
+    baked_has_right = "jaw_right" in baked
+    if (cfg_has_left and not baked_has_left) or (
+        cfg_has_right and not baked_has_right
+    ):
+        logger.warning(
+            "custom_tools: tool %r baked with PARTIAL jaws — "
+            "uploaded jaws exist on disk but bake failed "
+            "(left: uploaded=%s baked=%s; right: uploaded=%s baked=%s); "
+            "tool will register WITHOUT jaws. Check earlier log lines "
+            "for the per-mesh ``bake ... failed`` message.",
+            cfg.name,
+            cfg_has_left, baked_has_left,
+            cfg_has_right, baked_has_right,
+        )
     try:
         from parol6 import tools as parol6_tools  # noqa: PLC0415
     except ImportError:
