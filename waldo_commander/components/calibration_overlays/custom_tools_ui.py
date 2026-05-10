@@ -128,7 +128,13 @@ def _build_intrinsics_override(
         v = getattr(cfg, attr)
         if v is not None:
             return float(v)
-        return float(settings.get(fallback_key))
+        # Read the GLOBAL setting (runtime override or shipped default),
+        # not ``settings.get()`` — that one returns the ACTIVE tool's
+        # per-tool override first, which is wrong here: when the user
+        # opens this editor for a non-active tool, the seed would
+        # show the currently-active tool's intrinsics instead of the
+        # global default. Misleading UX.
+        return float(settings.get_global(fallback_key))
 
     fx = _seed_value("intr_fx", "intr_fx")
     fy = _seed_value("intr_fy", "intr_fy")
@@ -227,15 +233,20 @@ def _build_cam_mount_override(
         f"display: {'block' if has_override else 'none'};",
     )
 
+    # Same global-vs-active-tool concern as _build_intrinsics_override
+    # — when this editor opens for a NON-active tool, ``settings.get``
+    # returns the currently-active tool's per-tool override, which
+    # silently leaks the wrong cam-mount values into the seed.
+    # ``settings.get_global`` skips the active-tool override layer.
     seed_translate = (
         cfg.cam_mount_translate_mm
         if cfg.cam_mount_translate_mm is not None
-        else tuple(settings.get("cam_mount_translate_mm"))
+        else tuple(settings.get_global("cam_mount_translate_mm"))
     )
     seed_tilt = (
         cfg.cam_mount_tilt_deg
         if cfg.cam_mount_tilt_deg is not None
-        else tuple(settings.get("cam_mount_tilt_deg"))
+        else tuple(settings.get_global("cam_mount_tilt_deg"))
     )
 
     translate_inputs: list[ui.number] = []
@@ -410,7 +421,12 @@ def _build_variant_card(
 
             def _on_delete_variant(v=variant) -> None:
                 cfg.variants = [x for x in cfg.variants if x.key != v.key]
-                # Best-effort delete the on-disk variant STLs too.
+                # Best-effort delete the on-disk variant STLs too —
+                # both the user-uploaded source under ``CUSTOM_TOOLS_ROOT``
+                # and the baked transformed copy in parol6's mesh dir.
+                # Without the baked-copy unlink, deleting a variant left
+                # an orphan ``custom_<name>_variant_<key>_jaw_<side>.stl``
+                # in parol6's mesh dir for the lifetime of the install.
                 for side in ("left", "right"):
                     p = cfg.variant_jaw_path(v.key, side)
                     try:
@@ -420,6 +436,21 @@ def _build_variant_card(
                         logger.debug(
                             "couldn't delete variant STL %s: %s", p, e,
                         )
+                # Sweep baked variant copies out of parol6's mesh dir.
+                mesh_dir = custom_tools._parol6_mesh_dir()
+                if mesh_dir is not None:
+                    for side in ("left", "right"):
+                        baked = mesh_dir / custom_tools._baked_filename(
+                            cfg.name, f"variant_{v.key}_jaw_{side}",
+                        )
+                        try:
+                            if baked.exists():
+                                baked.unlink()
+                        except OSError as e:
+                            logger.debug(
+                                "couldn't delete baked variant %s: %s",
+                                baked, e,
+                            )
                 custom_tools.save_config(cfg)
                 ui.notify(f"Deleted variant {v.key}", color="info")
                 refresh()

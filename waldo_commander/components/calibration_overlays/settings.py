@@ -190,6 +190,23 @@ def get(key: str) -> Any:
     return DEFAULTS[key]
 
 
+def get_global(key: str) -> Any:
+    """Like :func:`get` but skips Layer 1 (the active-tool override)
+    so the returned value reflects the GLOBAL setting (runtime
+    override or shipped default).
+
+    Use this when seeding an editor for a NON-active tool's per-tool
+    override panel — the seed should come from the global, not from
+    whatever the currently-active tool happens to override the
+    global with.
+    """
+    if key not in DEFAULTS:
+        raise KeyError(f"Unknown calibration setting: {key}")
+    if key in _runtime:
+        return _coerce(key, _runtime[key])
+    return DEFAULTS[key]
+
+
 def set_value(key: str, value: Any, *, persist: bool = True) -> None:
     """Update ``key``'s runtime value. Persists to ``app.storage.user`` by
     default; pass ``persist=False`` to update transiently (e.g. when applying
@@ -203,18 +220,41 @@ def set_value(key: str, value: Any, *, persist: bool = True) -> None:
 
 
 def reset_to_defaults() -> None:
-    """Drop every runtime override and clear persisted values from storage."""
+    """Drop every runtime override and clear persisted values from storage.
+
+    Clears BOTH the global ``calib_setting_*`` keys (runtime overrides
+    set via the global Calibration settings panel) AND the per-tool
+    ``calib_tool_*`` keys (camera intrinsics / cold-start mount
+    overrides for each tool). Without the per-tool sweep, a "Reset to
+    defaults" button left orphaned per-tool overrides — confusing if
+    the user expected a clean slate.
+    """
     _runtime.clear()
     try:
         from nicegui import app  # noqa: PLC0415
         store = app.storage.user
         # Snapshot keys before mutating; storage mutates via __setitem__.
-        prefix_keys = [k for k in list(store.keys()) if k.startswith(_STORAGE_PREFIX)]
-        for k in prefix_keys:
+        keys_to_drop = [
+            k for k in list(store.keys())
+            if isinstance(k, str) and (
+                k.startswith(_STORAGE_PREFIX)
+                or k.startswith("calib_tool_")
+            )
+        ]
+        for k in keys_to_drop:
             del store[k]
         store[_ACTIVE_PRESET_KEY] = None
     except Exception as e:  # noqa: BLE001
         logger.debug("settings.reset_to_defaults: storage unavailable (%s)", e)
+    # Drop the per-tool runtime cache so worker threads don't keep
+    # serving stale overrides until the next prime.
+    try:
+        from . import custom_tools  # noqa: PLC0415
+        custom_tools._per_tool_runtime_cache.clear()
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "settings.reset_to_defaults: per-tool cache clear failed (%s)", e,
+        )
 
 
 def __getattr__(name: str) -> Any:

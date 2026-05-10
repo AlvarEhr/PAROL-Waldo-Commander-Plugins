@@ -428,10 +428,33 @@ def delete_tool(name: str) -> None:
     """Remove a custom tool's folder + config + STLs from disk, then
     unregister it from parol6's tool registry so it disappears from
     the gripper dropdown without a page reload.
+
+    Also deletes the baked mesh copies from parol6's mesh dir AND
+    clears any per-tool overrides stored in ``app.storage.user``.
+    Without the override clear, re-creating a tool with the same
+    name later would silently inherit the previous tool's
+    intrinsics + cold-start mount — confusing if the user thought
+    "delete + recreate" gave them a clean slate.
     """
     folder = CUSTOM_TOOLS_ROOT / name
     if folder.exists():
         shutil.rmtree(folder)
+    # Sweep baked mesh copies (body + jaws + per-variant jaws) out
+    # of parol6's mesh dir. Without this, an STL named after a
+    # deleted tool stays on disk forever — small per-tool, but it
+    # accumulates over the lifetime of a workshop's tool inventory.
+    mesh_dir = _parol6_mesh_dir()
+    if mesh_dir is not None:
+        try:
+            for stl in mesh_dir.glob(f"custom_{name}_*.stl"):
+                try:
+                    stl.unlink()
+                except OSError as e:
+                    logger.debug(
+                        "delete_tool: couldn't unlink baked %s: %s", stl, e,
+                    )
+        except OSError as e:
+            logger.debug("delete_tool: glob on mesh_dir failed (%s)", e)
     # Best-effort unregister from parol6's registry. The registry
     # mutation API is intentionally minimal in parol6 — we pop the
     # key directly. If the dict shape changes upstream, this fails
@@ -445,6 +468,15 @@ def delete_tool(name: str) -> None:
             del registry[key]
     except Exception as e:  # noqa: BLE001
         logger.debug("custom_tools: delete_tool registry unregister failed: %s", e)
+    # Clear any persisted per-tool overrides for the deleted tool so
+    # a tool created with the same name later starts from globals
+    # rather than inheriting stale intrinsics / mount values.
+    try:
+        clear_per_tool_overrides(key)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "custom_tools: delete_tool clear_per_tool_overrides failed: %s", e,
+        )
     _refresh_active_robot_tools()
     _notify_tool_registry_changed()
 
