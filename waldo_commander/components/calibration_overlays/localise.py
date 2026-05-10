@@ -76,8 +76,11 @@ def _localise_board_thread() -> None:
             from nicegui import ui as _ui  # noqa: PLC0415
 
             current_q_deg = list(robot_state.angles.deg[:6])
+            # gripper_only=True: target_q_deg is a post-IK joint
+            # config (PoseGenerator candidate or fixed scan pose).
+            # Arm self-collision is the IK solver's job (d609024).
             check = validate_joint_trajectory(
-                current_q_deg, list(target_q_deg),
+                current_q_deg, list(target_q_deg), gripper_only=True,
             )
             if check.get("safe", True):
                 return True

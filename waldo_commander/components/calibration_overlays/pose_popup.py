@@ -162,8 +162,12 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
                 )
 
                 current_q_deg = list(robot_state.angles.deg[:6])
+                # gripper_only=True: angles_deg is a post-IK joint
+                # config from PoseGenerator's IK pass on the
+                # reachability candidate. Arm self-collision is the
+                # IK solver's job (d609024).
                 check = validate_joint_trajectory(
-                    current_q_deg, list(angles_deg),
+                    current_q_deg, list(angles_deg), gripper_only=True,
                 )
                 if not check.get("safe", True):
                     reason = check.get("reason", "collision")

@@ -20,6 +20,65 @@ from typing import Any, Callable
 
 # One-shot warning state for the no-tool-selected fail-open path.
 _NO_TOOL_WARNED = False
+# One-shot warning state for the blended-motion bypass path. Emitted
+# the first time a blended Cartesian / joint motion is intercepted so
+# users know the FCL pre-flight is skipped on those.
+_BLENDED_BYPASS_WARNED = False
+
+
+def _resolve_tool_params_for_ik(
+    wrapped_client: Any,
+) -> tuple[str, str | None, tuple[float, float, float] | None]:
+    """Resolve ``(tool_key, variant_key, tcp_offset_m)`` for the
+    subprocess's local IK + collision-check.
+
+    ``tool_key`` resolution prefers the GUI's forwarded env var when
+    it carries a ``custom:`` key (the controller broadcast carries
+    only the proxy ``built-in`` so ``wrapped_client.tool.key`` would
+    return e.g. ``"VACUUM"`` even when the GUI is presenting
+    ``custom:my_gripper``). For built-in tools we prefer
+    ``wrapped_client.tool.key`` so a script that calls
+    ``client.set_active_tool(...)`` mid-execution updates the IK
+    config. This is a heuristic — a script switching FROM a custom
+    tool TO a built-in mid-execution will keep the stale custom: key
+    until process restart, but that's an uncommon flow.
+
+    ``variant_key`` and ``tcp_offset_m`` are read from companion env
+    vars set by ``script_runner``. Empty / unset means "no override".
+    """
+    env_key = os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "").strip()
+    try:
+        client_key = getattr(wrapped_client.tool, "key", None) or ""
+    except (RuntimeError, AttributeError):
+        # parol6 RobotClient.tool raises RuntimeError when no tool is
+        # bound. Treat the same as "no client side tool".
+        client_key = ""
+    if env_key.startswith("custom:"):
+        # Controller broadcast doesn't carry custom: keys; the env
+        # var is the only source of truth for these.
+        tool_key = env_key
+    elif client_key:
+        # Built-in tool: trust the client's runtime state so
+        # mid-script set_active_tool calls take effect.
+        tool_key = client_key
+    else:
+        tool_key = env_key or "NONE"
+
+    variant_key = os.environ.get("WALDO_GUI_ACTIVE_TOOL_VARIANT", "").strip() or None
+
+    tcp_offset_m: tuple[float, float, float] | None = None
+    tcp_offset_str = os.environ.get("WALDO_GUI_ACTIVE_TCP_OFFSET_M", "").strip()
+    if tcp_offset_str:
+        try:
+            parsed = json.loads(tcp_offset_str)
+            if isinstance(parsed, list) and len(parsed) == 3:
+                tcp_offset_m = (
+                    float(parsed[0]), float(parsed[1]), float(parsed[2]),
+                )
+        except (json.JSONDecodeError, ValueError, TypeError):
+            tcp_offset_m = None
+
+    return tool_key, variant_key, tcp_offset_m
 
 from .path_preview_client import MOTION_METHODS
 
@@ -181,50 +240,105 @@ import numpy as _np  # noqa: E402, PLC0415
 
 _IK_MAX_JOINT_DELTA_RAD: float = float(_np.deg2rad(90.0))
 
-# Cached parol6.Robot instance for local IK in the subprocess. Built
-# lazily on first Cartesian move because constructing the Robot loads
-# the URDF + initialises pinokin (~0.1-0.5s). Pure-move_j programs
+# Cached parol6.Robot instances for local IK in the subprocess. Each
+# distinct (tool_key, variant_key, tcp_offset_m) combination gets its
+# own Robot built lazily — constructing the Robot loads the URDF +
+# initialises pinokin (~0.1-0.5s) and applies set_active_tool so its
+# IK targets TCP poses (matching the controller). Pure-move_j programs
 # never pay this cost.
-_LOCAL_ROBOT = None
+_LOCAL_ROBOT_CACHE: dict[
+    tuple[str, str | None, tuple[float, float, float] | None],
+    Any,
+] = {}
 
 
-def _get_local_robot():  # noqa: ANN202
-    """Lazily build a parol6.Robot for local IK in the subprocess.
+def _get_local_robot(
+    tool_key: str = "NONE",
+    variant_key: str | None = None,
+    tcp_offset_m: tuple[float, float, float] | None = None,
+):  # noqa: ANN202
+    """Lazily build a parol6.Robot for local IK, configured with the
+    same tool transform the controller has applied.
+
+    Without ``set_active_tool``, ``Robot.ik`` solves "joints such that
+    flange = pose"; the controller (with its tool transform applied)
+    solves "joints such that TCP = pose". For Cartesian moves with
+    frame="WRF" (and rel=False), the user's pose is interpreted as TCP
+    by the controller — pre-flight that runs flange-frame IK would
+    validate a different joint trajectory than the controller will
+    execute, off by the tool's TCP offset. Passing the tool config
+    here keeps both ends consistent.
+
+    Cached process-wide by ``(tool_key, variant_key, tcp_offset_m)``.
 
     Returns the Robot instance on success or None when parol6 isn't
     importable or construction fails (subprocess fails-open: skip the
     Cartesian pre-flight rather than block the user's script).
     """
-    global _LOCAL_ROBOT
-    if _LOCAL_ROBOT is not None:
-        return _LOCAL_ROBOT
+    cache_key = (tool_key, variant_key, tcp_offset_m)
+    cached = _LOCAL_ROBOT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
     try:
         from parol6 import Robot  # noqa: PLC0415
     except ImportError:
         return None
     try:
-        _LOCAL_ROBOT = Robot()
+        robot = Robot()
+        # Apply the same tool transform the controller has so local
+        # IK targets TCP poses, not flange poses. set_active_tool
+        # internally clears the transform when key=="NONE" or the
+        # resolved transform reduces to identity.
+        if tool_key:
+            robot.set_active_tool(
+                tool_key,
+                tcp_offset_m=tcp_offset_m,
+                variant_key=variant_key,
+            )
     except Exception as e:  # noqa: BLE001
         sys.stderr.write(
             f"[collision pre-flight] failed to construct local "
-            f"parol6.Robot for IK: {type(e).__name__}: {e}; "
+            f"parol6.Robot for IK (tool_key={tool_key!r}, "
+            f"variant_key={variant_key!r}, tcp_offset_m={tcp_offset_m!r}): "
+            f"{type(e).__name__}: {e}; "
             "skipping Cartesian collision pre-flight.\n",
         )
         sys.stderr.flush()
-        _LOCAL_ROBOT = None
-    return _LOCAL_ROBOT
+        return None
+    _LOCAL_ROBOT_CACHE[cache_key] = robot
+    return robot
 
 
 def _ik_cartesian_to_joints_deg(
     pose_mm_deg: list[float],
     seed_deg: list[float],
+    tool_key: str = "NONE",
+    variant_key: str | None = None,
+    tcp_offset_m: tuple[float, float, float] | None = None,
 ) -> list[float] | None:
     """Solve IK for a Cartesian pose, returning joint angles in degrees.
 
+    The pose is interpreted in the same frame as the helper Robot's
+    IK convention: when ``tool_key`` resolves to a real tool,
+    ``Robot.set_active_tool`` is applied and ``ik()`` solves "joints
+    such that TCP = pose" (matching the controller). When
+    ``tool_key="NONE"`` the helper Robot has no tool transform and
+    ``ik()`` solves for flange.
+
     Args:
         pose_mm_deg: 6-vector ``[x, y, z, rx, ry, rz]`` in mm + deg
-            (parol6's standard external-API convention).
+            (parol6's standard external-API convention). For absolute
+            WRF / TCP-targeted moves this is a TCP pose; for the
+            ``trf_to_world_pose_mm_deg`` output it's already a TCP
+            pose composed from the live tool transform.
         seed_deg: Current joint angles in degrees, used as the IK seed.
+        tool_key: forwarded to ``_get_local_robot`` — must match what
+            the controller has applied so the IK frame agrees.
+        variant_key: variant of the active tool, forwarded to
+            ``_get_local_robot``.
+        tcp_offset_m: user TCP offset (m) the controller has composed
+            on top of the tool's base TCP. Forwarded so cache key
+            matches and the helper Robot's TCP includes it.
 
     Returns:
         Joint angles in degrees if IK converged AND FK-verified to
@@ -244,7 +358,11 @@ def _ik_cartesian_to_joints_deg(
     import numpy as np  # noqa: PLC0415
     from scipy.spatial.transform import Rotation as _R  # noqa: PLC0415
 
-    robot = _get_local_robot()
+    robot = _get_local_robot(
+        tool_key=tool_key,
+        variant_key=variant_key,
+        tcp_offset_m=tcp_offset_m,
+    )
     if robot is None:
         return None
 
@@ -361,6 +479,16 @@ def _maybe_check_collision(
     mesh_dir = parol6_mesh_dir()
     if mesh_dir is None:
         return
+
+    # Resolve the tool configuration ONCE for both the local IK
+    # (apply set_active_tool so kinematics target TCP poses, matching
+    # the controller) and the FCL mesh lookup below. Without
+    # set_active_tool the local Robot would interpret WRF Cartesian
+    # poses as flange-frame while the controller treats them as TCP-
+    # frame, validating a different joint trajectory than executes.
+    ik_tool_key, ik_variant_key, ik_tcp_offset_m = (
+        _resolve_tool_params_for_ik(wrapped_client)
+    )
 
     # Resolve target joint configs. For Cartesian methods the target
     # is a list (one per waypoint); the trajectory check then runs
@@ -498,13 +626,28 @@ def _maybe_check_collision(
             if compose_trf:
                 world_pose = trf_to_world_pose_mm_deg(
                     pose_list, current_q_deg, tcp_origin, tcp_rpy,
+                    tool_key=ik_tool_key,
+                    variant_key=ik_variant_key,
+                    tcp_offset_m_for_ik=ik_tcp_offset_m,
                 )
                 if world_pose is None:
                     return
-                wp_q_deg = _ik_cartesian_to_joints_deg(world_pose, seed_for_ik)
+                wp_q_deg = _ik_cartesian_to_joints_deg(
+                    world_pose, seed_for_ik,
+                    tool_key=ik_tool_key,
+                    variant_key=ik_variant_key,
+                    tcp_offset_m=ik_tcp_offset_m,
+                )
             else:
-                # WRF, OR move_l with TRF + rel=False (pose verbatim).
-                wp_q_deg = _ik_cartesian_to_joints_deg(pose_list, seed_for_ik)
+                # WRF, OR move_l with TRF + rel=False (pose verbatim
+                # as TCP-in-world). Either way, the helper Robot has
+                # set_active_tool applied so its IK targets TCP.
+                wp_q_deg = _ik_cartesian_to_joints_deg(
+                    pose_list, seed_for_ik,
+                    tool_key=ik_tool_key,
+                    variant_key=ik_variant_key,
+                    tcp_offset_m=ik_tcp_offset_m,
+                )
             if wp_q_deg is None:
                 # Cannot validate this segment; skip the whole check
                 # rather than checking only the prefix.
@@ -533,21 +676,13 @@ def _maybe_check_collision(
             sys.stderr.flush()
             return
 
-    # Tool-key resolution: the controller broadcast carries only
-    # BUILT-IN keys (custom tools with proxy_tool_key set route motor
-    # commands through a built-in like VACUUM or SSG-48). For program
-    # subprocesses the GUI's selected key is forwarded via the
-    # ``WALDO_GUI_ACTIVE_TOOL_KEY`` env var (set by ``script_runner``);
-    # prefer that over ``wrapped_client.tool.key`` when present so
-    # custom tools resolve to the correct meshes.
-    tool_key = os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "").strip()
-    if not tool_key:
-        try:
-            tool_key = getattr(wrapped_client.tool, "key", None) or "NONE"
-        except (RuntimeError, AttributeError):
-            # parol6 RobotClient.tool raises RuntimeError when no
-            # tool is bound. Treat the same as no-tool.
-            tool_key = "NONE"
+    # Reuse the tool-key resolved up top for both the IK transform
+    # and the FCL mesh lookup. The heuristic in
+    # ``_resolve_tool_params_for_ik`` prefers env-var ``custom:``
+    # keys (controller broadcast can't carry them) and otherwise
+    # trusts the client's runtime tool state so mid-script tool
+    # changes propagate.
+    tool_key = ik_tool_key
     tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
 
     # No-tool detection: a manager built with an empty body_paths +
@@ -715,7 +850,35 @@ class SteppingClientWrapper:
 
             if is_blended:
                 # Blended command — emit start event on first blend command,
-                # then execute without waiting or stepping
+                # then execute without waiting or stepping.
+                #
+                # NOTE: blended motions BYPASS the FCL pre-flight check
+                # below. The controller's blended trajectory is
+                # interpolated server-side between waypoints; we don't
+                # have the swept curve locally, so we can't validate
+                # it the way we validate non-blended endpoints. The
+                # next non-blended endpoint (or blend-group flush) is
+                # still validated. Emit a one-shot stderr breadcrumb
+                # the first time a blended motion is intercepted so
+                # users running with ``WALDO_MESH_COLLISION_ENABLED=1``
+                # know the gap exists.
+                global _BLENDED_BYPASS_WARNED
+                if (
+                    not _BLENDED_BYPASS_WARNED
+                    and name in _PREFLIGHT_CHECKABLE_METHODS
+                    and os.environ.get("WALDO_MESH_COLLISION_ENABLED", "1") == "1"
+                ):
+                    sys.stderr.write(
+                        f"[collision pre-flight] blended motion (r>0 on "
+                        f"{name}()) bypasses the FCL pre-flight. The "
+                        "controller's blended trajectory interpolates "
+                        "between waypoints server-side, so a fresh check "
+                        "isn't run for the blended segment. The next "
+                        "non-blended endpoint will be validated. "
+                        "(One-shot warning per subprocess.)\n",
+                    )
+                    sys.stderr.flush()
+                    _BLENDED_BYPASS_WARNED = True
                 if not self._in_blend:
                     self._step_io.emit_event("start", name, blend=True)
                     self._in_blend = True

@@ -900,8 +900,15 @@ def _build_full_panel(close_callback: Callable[[], None] | None = None) -> None:
                         validate_joint_trajectory,
                     )
                     cur = list(robot_state.angles.deg[:6])
+                    # gripper_only=True matches the docstring above
+                    # ("per the gripper-vs-environment manager") and
+                    # the design decision in commit d609024. With
+                    # gripper_only=False, parol6's simplified-mesh
+                    # arm self-collisions would falsely flag the
+                    # current static pose as unsafe in configurations
+                    # not covered by the adjacent-pair whitelist.
                     result = validate_joint_trajectory(
-                        cur, cur, gripper_only=False,
+                        cur, cur, gripper_only=True,
                     )
                     if not result.get("manager_ready", False):
                         _post_status(

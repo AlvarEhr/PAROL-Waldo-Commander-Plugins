@@ -798,8 +798,13 @@ def _calibration_thread() -> None:
                             )
 
                             current_q_deg = list(_rs.angles.deg[:6])
+                            # gripper_only=True: view_angles_deg is a
+                            # post-IK joint config from PoseGenerator;
+                            # arm self-collision is the IK solver's
+                            # job (commit d609024).
                             check = validate_joint_trajectory(
                                 current_q_deg, view_angles_deg,
+                                gripper_only=True,
                             )
                             if not check.get("safe", True):
                                 view_safe = False
@@ -838,8 +843,14 @@ def _calibration_thread() -> None:
                                         robot_state as _rs,
                                     )
                                     current_q_deg = list(_rs.angles.deg[:6])
+                                    # gripper_only=True: HOME_ANGLES_DEG
+                                    # is a fixed valid config; per
+                                    # d609024 design intent, arm
+                                    # self-collision is the IK
+                                    # solver's job.
                                     check = validate_joint_trajectory(
                                         current_q_deg, list(HOME_ANGLES_DEG),
+                                        gripper_only=True,
                                     )
                                     if not check.get("safe", True):
                                         home_safe = False
@@ -886,8 +897,13 @@ def _calibration_thread() -> None:
                                 robot_state as _rs,
                             )
                             current_q_deg = list(_rs.angles.deg[:6])
+                            # gripper_only=True: HOME_ANGLES_DEG is
+                            # a fixed valid config; arm self-
+                            # collision is the IK solver's job
+                            # (d609024).
                             check = validate_joint_trajectory(
                                 current_q_deg, list(HOME_ANGLES_DEG),
+                                gripper_only=True,
                             )
                             if not check.get("safe", True):
                                 home_safe = False

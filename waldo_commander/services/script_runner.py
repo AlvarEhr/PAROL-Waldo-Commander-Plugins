@@ -91,7 +91,10 @@ async def run_script(
 
     # Forward the mesh-collision master toggle so the subprocess's
     # SteppingClientWrapper pre-flight matches the GUI's gating. Default
-    # "1" (on) when the storage key isn't set yet.
+    # "1" (on) when the storage key isn't set yet. Specific exception
+    # tuple matches path_visualizer.py: ImportError when nicegui isn't
+    # importable in test contexts, RuntimeError / AttributeError when
+    # storage isn't bound to a request slot.
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
 
@@ -100,7 +103,7 @@ async def run_script(
             if bool(_ng_app.storage.general.get("mesh_collision_check_enabled", True))
             else "0"
         )
-    except Exception:  # noqa: BLE001
+    except (ImportError, RuntimeError, AttributeError):
         env["WALDO_MESH_COLLISION_ENABLED"] = "1"
 
     # Forward the GUI's active tool key. The controller's broadcast
@@ -112,14 +115,65 @@ async def run_script(
     # ``app.storage.general["selected_tool"]`` here picks up the
     # canonical key (built-in or custom:<name>) for the subprocess
     # to use as a tool_key override.
+    selected_tool: str = ""
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
 
-        env["WALDO_GUI_ACTIVE_TOOL_KEY"] = str(
+        selected_tool = str(
             _ng_app.storage.general.get("selected_tool", "") or "",
         )
-    except Exception:  # noqa: BLE001
-        env["WALDO_GUI_ACTIVE_TOOL_KEY"] = ""
+    except (ImportError, RuntimeError, AttributeError):
+        selected_tool = ""
+    env["WALDO_GUI_ACTIVE_TOOL_KEY"] = selected_tool
+
+    # Forward the variant key for the active tool, if any. The
+    # subprocess's local IK helper applies ``Robot.set_active_tool``
+    # with this variant so its kinematics match the controller —
+    # without it, the local IK would target the tool's default
+    # variant TCP while the controller uses the user-selected one,
+    # producing pre-flight rejections that don't match real
+    # collisions. Empty string means "no variant override".
+    variant_for_active: str = ""
+    if selected_tool:
+        try:
+            from nicegui import app as _ng_app  # noqa: PLC0415
+
+            variant_for_active = str(
+                _ng_app.storage.general.get(
+                    f"tool_variant_{selected_tool}", "",
+                ) or "",
+            )
+        except (ImportError, RuntimeError, AttributeError):
+            variant_for_active = ""
+    env["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = variant_for_active
+
+    # Forward the user TCP offset (in metres, JSON-encoded
+    # ``[x, y, z]``) for the active tool. The GUI stores it in mm as
+    # ``{"x": .., "y": .., "z": ..}`` per ``components/settings.py``;
+    # convert to metres here so the subprocess can pass it directly
+    # to ``Robot.set_active_tool(tcp_offset_m=...)``. Empty string
+    # means "no user offset" (the tool's registered TCP transform
+    # alone is used).
+    tcp_offset_for_active: str = ""
+    if selected_tool:
+        try:
+            from nicegui import app as _ng_app  # noqa: PLC0415
+
+            tcp_offset_mm = _ng_app.storage.general.get(
+                f"tcp_offset_{selected_tool}",
+            )
+            if isinstance(tcp_offset_mm, dict):
+                x_mm = float(tcp_offset_mm.get("x", 0) or 0)
+                y_mm = float(tcp_offset_mm.get("y", 0) or 0)
+                z_mm = float(tcp_offset_mm.get("z", 0) or 0)
+                if x_mm != 0 or y_mm != 0 or z_mm != 0:
+                    import json as _json  # noqa: PLC0415
+                    tcp_offset_for_active = _json.dumps(
+                        [x_mm / 1000.0, y_mm / 1000.0, z_mm / 1000.0],
+                    )
+        except (ImportError, RuntimeError, AttributeError, TypeError, ValueError):
+            tcp_offset_for_active = ""
+    env["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = tcp_offset_for_active
 
     # Determine which script to run
     if session_id:

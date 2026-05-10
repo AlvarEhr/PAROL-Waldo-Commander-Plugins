@@ -230,7 +230,16 @@ def _drive_hover_pose_thread(
             )
 
             current_q_deg = list(robot_state.angles.deg[:6])
-            check = validate_joint_trajectory(current_q_deg, list(angles_deg))
+            # gripper_only=True: angles_deg is a post-IK joint config
+            # (from Robot().ik above). Per the design decision in
+            # commit d609024 ("arm self-collision is the IK solver's
+            # job"), post-IK targets should not re-check arm-link
+            # self-collision against parol6's simplified meshes —
+            # those produce known false-positive overlaps that the
+            # adjacent-pair whitelist only partially suppresses.
+            check = validate_joint_trajectory(
+                current_q_deg, list(angles_deg), gripper_only=True,
+            )
             if not check.get("safe", True):
                 reason = check.get("reason", "collision")
                 pair = check.get("colliding_pair")
