@@ -325,13 +325,17 @@ class CustomToolConfig:
         }
         # Per-tool intrinsics + mount overrides — only persist non-None
         # values so the JSON stays clean for tools that inherit globals.
-        for k in (
-            "intr_fx", "intr_fy", "intr_cx", "intr_cy",
-            "intr_width", "intr_height",
-        ):
+        # Explicit per-key float / int membership instead of a clever
+        # substring expression: a future ``intr_height_max`` or
+        # ``intr_dist_k1`` field added to the dataclass would silently
+        # round to int with the substring check.
+        _INTR_FLOAT_KEYS = ("intr_fx", "intr_fy", "intr_cx", "intr_cy")
+        _INTR_INT_KEYS = ("intr_width", "intr_height")
+        for k in (*_INTR_FLOAT_KEYS, *_INTR_INT_KEYS):
             v = getattr(self, k)
-            if v is not None:
-                payload[k] = float(v) if "intr_" in k and "width" not in k and "height" not in k else int(v)
+            if v is None:
+                continue
+            payload[k] = float(v) if k in _INTR_FLOAT_KEYS else int(v)
         if self.cam_mount_translate_mm is not None:
             payload["cam_mount_translate_mm"] = list(self.cam_mount_translate_mm)
         if self.cam_mount_tilt_deg is not None:

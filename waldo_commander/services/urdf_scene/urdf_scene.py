@@ -1736,10 +1736,14 @@ class UrdfScene(
         # Only update the previous-mode slot if we're transitioning INTO
         # PREVIEW from a different mode. A re-entry while already in
         # PREVIEW preserves the original slot value so exit goes back
-        # to LIVE/SIMULATOR/EDITING correctly.
+        # to LIVE/SIMULATOR/EDITING correctly. Skip the mode-set when
+        # we're ALREADY in PREVIEW (re-entry on rapid clicks) — the
+        # underlying ``set_appearance_mode`` re-walks every arm / tool
+        # mesh material and re-emits its debug log line, so calling it
+        # for a no-op transition adds avoidable per-click overhead.
         if previous_mode != RobotAppearanceMode.PREVIEW:
             self._preview_previous_mode = previous_mode  # type: ignore[attr-defined]
-        self.set_appearance_mode(RobotAppearanceMode.PREVIEW)
+            self.set_appearance_mode(RobotAppearanceMode.PREVIEW)
         try:
             self._apply_joint_angles(seq)
         except Exception as e:  # noqa: BLE001

@@ -175,14 +175,20 @@ def get(key: str) -> Any:
     if key not in DEFAULTS:
         raise KeyError(f"Unknown calibration setting: {key}")
     # Layer 1: per-tool override.
+    # ImportError: parol6_vision tooling not installed (headless tests).
+    # RuntimeError: NiceGUI app.storage not in a request context (worker
+    #     threads, very-early init).
+    # AttributeError: ``active_tool_override`` shape changed upstream.
+    # Anything else escapes — broad ``except Exception`` would mask real
+    # bugs in the per-tool override path (e.g. a typo in a key name).
     try:
         from . import custom_tools  # noqa: PLC0415
 
         override = custom_tools.active_tool_override(key)
         if override is not None:
             return override
-    except Exception:  # noqa: BLE001
-        pass
+    except (ImportError, RuntimeError, AttributeError) as e:
+        logger.debug("settings.get: per-tool override layer skipped (%s)", e)
     # Layer 2: runtime (storage-backed) override.
     if key in _runtime:
         return _coerce(key, _runtime[key])

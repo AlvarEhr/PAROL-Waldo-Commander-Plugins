@@ -15,6 +15,14 @@ from .state import _T_BOARD2BASE, _state
 logger = logging.getLogger(__name__)
 
 
+# Controller endpoint — same loopback host:port the rest of the
+# calibration package uses (calibration_thread + localise + the
+# pose_popup go-to-pose dispatcher). Centralised here so a future
+# multi-host setup only has to flip one constant.
+_CONTROLLER_HOST: str = "127.0.0.1"
+_CONTROLLER_PORT: int = 5001
+
+
 # ---------------------------------------------------------------------------
 # Hover-above-board verification mode
 # ---------------------------------------------------------------------------
@@ -145,7 +153,7 @@ def _drive_hover_pose_thread(
         #   - look up the active tool's TCP transform via ``client.tool``
         #     (TCP mode only, but cheap regardless),
         #   - hand the same client to STOP via ``_state["client"]``.
-        client = RobotClient(host="127.0.0.1", port=5001)
+        client = RobotClient(host=_CONTROLLER_HOST, port=_CONTROLLER_PORT)
         _state["client"] = client
 
         if mode == "camera":
@@ -280,7 +288,7 @@ def _drive_hover_pose_thread(
                         try:
                             from parol6 import RobotClient as _RC  # noqa: PLC0415
 
-                            c = _RC(host="127.0.0.1", port=5001)
+                            c = _RC(host=_CONTROLLER_HOST, port=_CONTROLLER_PORT)
                             _state["client"] = c
                             _ps(
                                 f"Hover ({hover_label}): moving to "
