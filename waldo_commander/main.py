@@ -203,13 +203,18 @@ async def initialize_urdf_scene() -> None:
     urdf_path = Path(robot.urdf_path)
     mesh_dir = Path(robot.mesh_dir)
 
-    # parol6-vision: hijack the SSG-48 BODY mesh to embed the user's merged
-    # camera-bracket STL. Pass the active_robot so its tools collection
-    # parol6-vision calibration — startup migration + tool registration.
-    # Heavy: bakes STLs into parol6's mesh dir, mutates the tool registry.
-    # Gated on the soft toggle ``_calibration_features_active`` (default
-    # OFF) so a fresh user gets the calibration tab visible but no
-    # disk-write side effects until they explicitly opt in.
+    # parol6-vision: startup migration + custom-tool registration.
+    # Bakes STLs into parol6's mesh dir + mutates the tool registry,
+    # so it's heavy. Gated on the soft toggle
+    # ``_calibration_features_active`` (default OFF) so a fresh user
+    # gets the calibration tab visible but no disk-write side effects
+    # until they explicitly opt in.
+    #
+    # Historical note: an earlier ``hijack_ssg48_body_mesh`` call lived
+    # here; commit ee8674e removed it in favour of the custom-tool
+    # migration path. The legacy hijack helper still ships in
+    # ``calibration_overlays/ssg48_hijack.py`` for any out-of-tree code
+    # that imports it directly, but it's no longer wired into startup.
     if _calibration_features_active():
         try:
             from waldo_commander.components.calibration_overlays import (

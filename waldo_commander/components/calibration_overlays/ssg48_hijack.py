@@ -1,4 +1,22 @@
-"""Tool-registry hijack — replaces SSG-48 body mesh with user's merged STL."""
+"""DEPRECATED — superseded by ``custom_tools.auto_migrate_ssg48_with_bracket``.
+
+Tool-registry hijack — replaces SSG-48 body mesh with user's merged STL.
+
+This module's :func:`hijack_ssg48_body_mesh` was the original integration
+path for the calibration package. Commit ee8674e migrated the use case
+into a custom-tool registration (see ``custom_tools.py`` +
+``main.py:initialize_urdf_scene``), which is more flexible (supports
+any tool, not just SSG-48) and survives upstream tool-registry edits
+without colliding with the stock entry.
+
+The hijack helper is kept here, behaviourally unchanged, for any
+out-of-tree script that imports it directly. New integrations should
+use ``custom_tools.register_one`` / ``custom_tools.register_all``
+instead. The module is no longer imported from ``main.py`` and the
+``hijack_ssg48_body_mesh`` name is no longer re-exported from the
+package's ``__init__.py`` — it remains accessible only via direct
+``from ...ssg48_hijack import hijack_ssg48_body_mesh``.
+"""
 
 from __future__ import annotations
 
