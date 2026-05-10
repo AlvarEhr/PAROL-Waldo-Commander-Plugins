@@ -53,6 +53,13 @@ def _calibration_thread() -> None:
     """
     # Lazy import to break panel<->calibration_thread cycle.
     from .panel import _post_status  # noqa: PLC0415
+
+    # Track the controller client so the ``finally`` block can close
+    # its UDP socket + inner asyncio loop. Without this, every Run
+    # leaks one socket — fd / socket exhaustion over long-running
+    # sessions.
+    raw_client: Any = None
+
     try:
         # Lazy imports.
         from parol6 import Robot, RobotClient  # noqa: PLC0415
@@ -953,4 +960,16 @@ def _calibration_thread() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning("RealSenseCamera stop failed: %s", e)
             _state["real_camera"] = None
+        # Close the controller's UDP socket + inner asyncio loop so
+        # they don't leak across runs. ``raw_client`` is None when
+        # init failed before its construction.
+        if raw_client is not None:
+            try:
+                raw_client.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Calibration: RobotClient.close raised: %s", e)
+        # Drop the panel's reference to the now-closed client so the
+        # STOP button can't dispatch halt() through a dead socket.
+        if _state.get("client") is raw_client:
+            _state["client"] = None
         _state["is_running"] = False

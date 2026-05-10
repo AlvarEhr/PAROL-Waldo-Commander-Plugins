@@ -28,7 +28,7 @@ from typing import Any
 import numpy as np
 from nicegui import ui
 
-from .state import _state
+from .state import _state, _state_lock
 
 logger = logging.getLogger(__name__)
 
@@ -403,7 +403,14 @@ def register_click_handler(scene: Any) -> None:
         dot_idx: int | None = None
         had_dot_hit = False
         had_stale_dot_hit = False
-        current_gen = int(_state.get("reach_generation", 0))
+        # Snapshot generation + candidates atomically so a board-
+        # localise thread (or a fresh reachability render) bumping
+        # gen + clearing candidates can't make us see "new gen +
+        # old candidates" or "old gen + new candidates". Both halves
+        # are paired writes under ``_state_lock`` on the writer side.
+        with _state_lock:
+            current_gen = int(_state.get("reach_generation", 0))
+            candidates: list = list(_state.get("reachable_candidates") or [])
         for hit in hits:
             name = getattr(hit, "object_name", "") or ""
             if not name.startswith("calib:reach_dot_"):
@@ -445,7 +452,9 @@ def register_click_handler(scene: Any) -> None:
             # user can clear it by clicking off.
             _close_popup()
             return
-        candidates = _state.get("reachable_candidates") or []
+        # ``candidates`` snapshot was taken under _state_lock above
+        # so it's paired with current_gen. Don't re-read _state here
+        # or the snapshot's atomicity would be defeated.
         if dot_idx >= len(candidates):
             logger.debug(
                 "reach-dot click: dot_idx=%d but only %d candidates "

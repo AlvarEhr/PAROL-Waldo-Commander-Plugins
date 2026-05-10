@@ -18,7 +18,7 @@ from .constants import (
     _REACHABILITY_N_CANDIDATES,
     _REACHABILITY_USE_CONTINUOUS,
 )
-from .state import _hemi_azimuth_world_range_deg, _state
+from .state import _hemi_azimuth_world_range_deg, _state, _state_lock
 from .workspace import _ensure_workspace_envelope, envelope_contains
 
 logger = logging.getLogger(__name__)
@@ -319,16 +319,23 @@ def _render_reachability_dots(
         except Exception as e:  # noqa: BLE001
             logger.debug("reachability prior group cleanup failed: %s", e)
         _state["reachability_group"] = None
-    # Bump generation + write candidates list ATOMICALLY (single
-    # main-thread block, no await / yield). Sphere names embed the
-    # gen so the click handler can detect a stale click (user clicked
-    # a sphere from a prior generation) and ignore it. Visible-
-    # candidates write is paired with the gen bump so the indices
-    # always reference the SAME list as the spheres were tagged from.
-    generation = int(_state.get("reach_generation", 0)) + 1
-    _state["reach_generation"] = generation
-    if visible_candidates is not None:
-        _state["reachable_candidates"] = list(visible_candidates)
+    # Bump generation + write candidates list ATOMICALLY. Sphere
+    # names embed the gen so the click handler can detect a stale
+    # click (user clicked a sphere from a prior generation) and
+    # ignore it. Visible-candidates write is paired with the gen
+    # bump so the indices always reference the SAME list as the
+    # spheres were tagged from.
+    #
+    # Without the lock, a worker thread (localise) bumping gen +
+    # clearing candidates could interleave with this block — and
+    # the click handler's gen-then-candidates read could see the
+    # new gen with the old candidates list. ``_state_lock`` makes
+    # the pair appear atomic to readers using the same lock.
+    with _state_lock:
+        generation = int(_state.get("reach_generation", 0)) + 1
+        _state["reach_generation"] = generation
+        if visible_candidates is not None:
+            _state["reachable_candidates"] = list(visible_candidates)
     try:
         with scene_group:
             reach_group = (

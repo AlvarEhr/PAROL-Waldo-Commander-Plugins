@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 import numpy as np
@@ -17,6 +18,22 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Module-level state
 # ---------------------------------------------------------------------------
+
+
+# Lock guarding paired RMW updates to ``_state``. Acquire when reading or
+# writing more than one related key as a unit so other threads can't see
+# a half-updated view.
+#
+# Currently scopes the ``reach_generation`` + ``reachable_candidates`` pair
+# (writers in ``localise._update_T_board2base`` and
+# ``reachability._render_reachability_dots``; readers in
+# ``pose_popup._on_scene_click``). Single-key writes like
+# ``_state["is_running"] = True`` don't need the lock — the dict assignment
+# is GIL-atomic on its own.
+#
+# ``RLock`` so a path that already holds the lock can acquire it again
+# (e.g. a writer that calls into a helper which itself locks).
+_state_lock = threading.RLock()
 
 
 _state: dict[str, Any] = {

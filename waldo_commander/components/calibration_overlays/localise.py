@@ -26,7 +26,7 @@ from .constants import (
     _SETTLE_TIME_SIM_S,
 )
 from .overlays import refresh_board_dependent_overlays
-from .state import _T_BOARD2BASE, _state, current_board_config
+from .state import _T_BOARD2BASE, _state, _state_lock, current_board_config
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +110,12 @@ def _localise_board_thread() -> None:
         except Exception as e:  # noqa: BLE001
             logger.debug("localise trajectory pre-check skipped (%s)", e)
             return True
+
+    # Track the controller client so the ``finally`` block can close
+    # its UDP socket + inner asyncio loop. Without this, every
+    # Localise run leaks one socket — fd / socket exhaustion over
+    # long-running sessions.
+    raw_client: Any = None
 
     try:
         import cv2  # noqa: PLC0415
@@ -782,6 +788,13 @@ def _localise_board_thread() -> None:
                             raw_client.halt()
                             done_event.wait(2.0)
                             _post_status("Localise stopped by user")
+                            # Join the waiter thread before returning so its
+                            # in-flight ``wait_command(timeout=10.0)`` doesn't
+                            # leak — without this, every STOP during the J0
+                            # sweep orphans one daemon thread that keeps a
+                            # UDP socket open for up to 10 s. Bounded but
+                            # accumulates across rapid Localise/STOP cycles.
+                            waiter_thread.join(timeout=1.0)
                             return
                         # Per-chunk watchdog: ~1 s expected, 5 s caps it.
                         if time.monotonic() - chunk_started > 5.0:
@@ -1308,11 +1321,17 @@ def _localise_board_thread() -> None:
         # invalidates the on-screen sphere names so the click handler
         # sees a stale-gen mismatch (correct) instead of a wrong-list
         # dereference.
-        _state["trajectory_collision_mgr_pair"] = None
-        _state["reach_generation"] = (
-            int(_state.get("reach_generation", 0)) + 1
-        )
-        _state["reachable_candidates"] = []
+        #
+        # The ``_state_lock`` makes the gen-bump-plus-candidates-clear
+        # atomic from the click handler's perspective: pose_popup
+        # snapshots both keys under the same lock, so it can't see
+        # the new gen paired with the old candidates list.
+        with _state_lock:
+            _state["trajectory_collision_mgr_pair"] = None
+            _state["reach_generation"] = (
+                int(_state.get("reach_generation", 0)) + 1
+            )
+            _state["reachable_candidates"] = []
 
         # Stamp the successful-localise time so the Run button knows the
         # board has been localised this session and skips the warning dialog.
@@ -1339,4 +1358,17 @@ def _localise_board_thread() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning("RealSenseCamera stop failed: %s", e)
             _state["real_camera"] = None
+        # Close the controller's UDP socket + inner asyncio loop so
+        # they don't leak across runs. ``raw_client`` is None when
+        # init failed before its construction; ``close`` covers
+        # both bound and unbound asyncio loops.
+        if raw_client is not None:
+            try:
+                raw_client.close()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Localise: RobotClient.close raised: %s", e)
+        # Drop the panel's reference to the now-closed client so the
+        # STOP button can't dispatch halt() through a dead socket.
+        if _state.get("client") is raw_client:
+            _state["client"] = None
         _state["is_localising"] = False
