@@ -1,12 +1,8 @@
-"""Unit tests for the helpers introduced by the audit fix-batches.
+"""Unit tests for helpers introduced by the audit fix-batches.
 
-Each finding referenced as ``audit #N`` corresponds to the multi-agent
-code review's numbering from the synthesis report (1-12 in the original
-audit). Tests here cover the pure / deterministic helpers; cross-cutting
-GUI flows (browser interaction, real-controller IK with a tool bound,
-multi-step user workflows for tool delete + re-create) need
-in-environment testing — see commit messages for what specifically was
-deferred.
+Covers pure / deterministic helpers. ``audit #N`` references map to the
+multi-agent review's synthesis-report numbering. GUI flows are deferred
+to in-environment tests.
 """
 from __future__ import annotations
 
@@ -27,8 +23,8 @@ import pytest
 
 
 class TestValidateSafeName:
-    """Reject any string that could escape ``CUSTOM_TOOLS_ROOT`` /
-    ``parol6_mesh_dir`` via path-traversal or control chars."""
+    """Reject strings that could escape ``CUSTOM_TOOLS_ROOT`` via
+    path-traversal or control chars."""
 
     def _validator(self):
         from waldo_commander.components.calibration_overlays.custom_tools import (
@@ -73,8 +69,7 @@ class TestValidateSafeName:
 
 
 class TestStlSizeCheck:
-    """Reject STLs above the configured size cap so trimesh.load can't
-    OOM the server on a malicious / accidental large upload."""
+    """Reject oversized STLs so trimesh.load can't OOM on a bad upload."""
 
     def test_accepts_small_file(self, tmp_path: Path) -> None:
         from waldo_commander.components.calibration_overlays.custom_tools import (
@@ -106,9 +101,7 @@ class TestStlSizeCheck:
         from waldo_commander.components.calibration_overlays.custom_tools import (
             _STL_MAX_SIZE_MB,
         )
-        # Far above any realistic CAD-export end-effector (typical
-        # gripper STLs are 1-20 MB) but small enough to keep memory
-        # bounded on shared hardware.
+        # Above realistic end-effectors, below shared-hardware OOM risk.
         assert 50 <= _STL_MAX_SIZE_MB <= 500
 
 
@@ -129,8 +122,7 @@ class _FakeClient:
 
 @pytest.fixture
 def clean_env() -> None:
-    """Drop the three env vars the resolver reads, so each test starts
-    from a known baseline. Restores prior values after the test."""
+    """Pop the three env vars the resolver reads, restoring after the test."""
     keys = (
         "WALDO_GUI_ACTIVE_TOOL_KEY",
         "WALDO_GUI_ACTIVE_TOOL_VARIANT",
@@ -162,18 +154,15 @@ class TestResolveToolParamsForIk:
         assert tcp_offset is None
 
     def test_custom_env_wins_over_client_built_in(self, clean_env) -> None:
-        # Controller broadcast carries only the proxy built-in for
-        # custom tools, so the env var is the only source of truth
-        # for ``custom:`` keys.
+        # Env is the only source of truth for ``custom:`` keys.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "custom:my_grip"
         resolver = self._resolver()
         tool_key, _, _ = resolver(_FakeClient("VACUUM"))
         assert tool_key == "custom:my_grip"
 
     def test_client_wins_over_built_in_env(self, clean_env) -> None:
-        # Mid-script ``client.set_active_tool(...)`` change updates
-        # client.tool.key but the env var is stale; trust the client
-        # for built-in conflicts.
+        # Trust the client for built-in conflicts so mid-script
+        # set_active_tool propagates.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         resolver = self._resolver()
         tool_key, _, _ = resolver(_FakeClient("VACUUM"))
@@ -185,8 +174,7 @@ class TestResolveToolParamsForIk:
         assert tool_key == "NONE"
 
     def test_variant_parsed_from_env_when_keys_match(self, clean_env) -> None:
-        # env_key == client_key means no mid-script change happened;
-        # the env's variant applies to this tool.
+        # Keys match → no mid-script change → env's variant applies.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "v1"
         resolver = self._resolver()
@@ -194,12 +182,8 @@ class TestResolveToolParamsForIk:
         assert variant == "v1"
 
     def test_variant_dropped_when_client_disagrees(self, clean_env) -> None:
-        # Mid-script ``client.set_active_tool("VACUUM")`` changed the
-        # client's tool from the env's recorded "SSG-48". The env's
-        # variant ("ssg48_tape_jaws") belongs to SSG-48, not VACUUM,
-        # so it must NOT be carried forward — the local IK would
-        # otherwise call set_active_tool("VACUUM",
-        # variant_key="ssg48_tape_jaws") and corrupt the cache key.
+        # Env's variant is paired with env_key; carrying it forward to
+        # a different client_key would corrupt the helper-Robot cache.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "ssg48_tape_jaws"
         resolver = self._resolver()
@@ -215,8 +199,7 @@ class TestResolveToolParamsForIk:
         assert variant is None
 
     def test_tcp_offset_parsed_from_json_when_keys_match(self, clean_env) -> None:
-        # As with variant: only carry env's tcp_offset forward when
-        # env_key == client_key (or env wins for custom:).
+        # Same pairing as variant.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
             [0.001, -0.002, 0.003],
@@ -226,8 +209,7 @@ class TestResolveToolParamsForIk:
         assert tcp_offset == (0.001, -0.002, 0.003)
 
     def test_tcp_offset_dropped_when_client_disagrees(self, clean_env) -> None:
-        # Same argument as variant: env's tcp_offset is paired with
-        # env_key, must not leak into a different client_key.
+        # Same pairing as variant.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
             [0.001, -0.002, 0.003],
@@ -237,9 +219,7 @@ class TestResolveToolParamsForIk:
         assert tcp_offset is None  # env's offset doesn't apply to VACUUM
 
     def test_custom_env_carries_its_variant_and_offset(self, clean_env) -> None:
-        # Controller broadcast carries only the proxy built-in for
-        # custom: tools, so client.tool.key is the proxy. Env is the
-        # only source of truth for ALL of (key, variant, tcp_offset).
+        # Env is the only source of truth for all three when key is custom:.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "custom:my_grip"
         os.environ["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = "narrow_jaws"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = json.dumps(
@@ -252,8 +232,7 @@ class TestResolveToolParamsForIk:
         assert tcp_offset == (0.0, 0.0, -0.005)
 
     def test_malformed_tcp_offset_yields_none(self, clean_env) -> None:
-        # Robustness: a corrupt env var must not crash the subprocess
-        # — the pre-flight just falls through to "no tcp offset".
+        # A corrupt env var must not crash the subprocess.
         os.environ["WALDO_GUI_ACTIVE_TOOL_KEY"] = "SSG-48"
         os.environ["WALDO_GUI_ACTIVE_TCP_OFFSET_M"] = "not json"
         resolver = self._resolver()
@@ -269,15 +248,13 @@ class TestResolveToolParamsForIk:
 
 class TestSettingsGetGlobal:
     """``get_global`` skips Layer 1 (active-tool override) so an editor
-    seeded for a non-active tool sees the GLOBAL setting, not whatever
-    the currently-active tool happens to override the global with."""
+    seeded for a non-active tool sees the global value."""
 
     def test_get_global_skips_active_tool_override(self) -> None:
         from waldo_commander.components.calibration_overlays import settings
         from waldo_commander.components.calibration_overlays import custom_tools
 
-        # Pin ``active_tool_override`` to return a sentinel so we can
-        # confirm get_global ignores it while get returns it.
+        # Pin the override to a sentinel: get sees it, get_global doesn't.
         sentinel = 999.0
         with patch.object(
             custom_tools, "active_tool_override", return_value=sentinel,
@@ -294,7 +271,7 @@ class TestSettingsGetGlobal:
     def test_get_global_returns_runtime_or_default(self) -> None:
         from waldo_commander.components.calibration_overlays import settings
 
-        # No override patched → returns shipped default.
+        # Returns the shipped default with no override patched.
         val = settings.get_global("intr_width")
         assert val is not None
         assert isinstance(val, int | float)
@@ -306,8 +283,8 @@ class TestSettingsGetGlobal:
 
 
 class TestStateLockConsistency:
-    """The lock guards the ``reach_generation`` + ``reachable_candidates``
-    pair so a concurrent reader can never see a half-updated view."""
+    """The lock guards the (reach_generation, reachable_candidates) pair
+    against half-updated reads."""
 
     def test_paired_writes_visible_atomically(self) -> None:
         from waldo_commander.components.calibration_overlays.state import (

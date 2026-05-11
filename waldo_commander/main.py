@@ -110,15 +110,9 @@ def _update_connection_notification() -> None:
     """Show or dismiss persistent notification based on robot connection state."""
     global _connection_notification
 
-    # Skip if the URDF scene hasn't rendered yet — modifying notification
-    # elements during page serialization causes races. We use
-    # ``urdf_scene_ready`` here (set inside ``initialize_urdf_scene`` after
-    # the scene is fully built) rather than ``app_ready`` (which
-    # additionally requires a STATUS multicast from the controller).
-    # The latter never fires when parol6-server is in real-hardware mode
-    # without a physical robot, so gating on it would prevent this
-    # disconnect banner from ever showing in exactly the scenario it's
-    # most useful — i.e. exactly when the user needs to be told.
+    # Wait for the scene to render before touching notification elements;
+    # ``app_ready`` would also gate on a STATUS frame we may never see
+    # in real-hardware-no-robot mode.
     if not readiness_state.urdf_scene_ready.is_set():
         return
 
@@ -137,35 +131,16 @@ def _update_connection_notification() -> None:
 
 
 def _calibration_enabled() -> bool:
-    """Master kill switch for parol6-vision calibration. Default ON.
-
-    Hard gate: when ``WALDO_CALIBRATION_ENABLED=0``, the
-    calibration_overlays package is not imported, the calibration tab
-    is not added to the left strip, and no calibration scaffolding
-    runs. For genuinely low-spec machines or users who never want any
-    of the feature near their process — env var has to be flipped to
-    "0" to fully eliminate.
-
-    Whether the feature ACTUALLY DOES anything visible / heavy is a
-    separate question controlled by ``_calibration_features_active``
-    below — which is what the in-app toggle flips.
+    """Hard kill switch for parol6-vision calibration. When off, the
+    package is never imported and the calibration tab is hidden.
     """
     return os.environ.get("WALDO_CALIBRATION_ENABLED", "1") == "1"
 
 
 def _calibration_features_active() -> bool:
-    """Soft gate for the calibration features themselves. Defaults OFF.
-
-    When this is False but ``_calibration_enabled`` is True:
-    * Calibration tab IS visible in the left strip.
-    * Panel renders as just a master toggle + a "reload to apply" hint.
-    * ``add_overlays`` is NOT called — no scene timers, no IK sweeps,
-      no STL bakes, no scene groups added. Resource impact stays at
-      the package-import cost only.
-
-    Persisted via NiceGUI's ``app.storage.general`` so the toggle
-    survives restarts. The env var still wins — when it's off, this
-    returns False regardless of storage.
+    """Soft gate for the calibration features. Default OFF. When False
+    the tab is still visible but ``add_overlays`` doesn't run. Persisted
+    in ``app.storage.general``; the env var still wins when off.
     """
     if not _calibration_enabled():
         return False
@@ -178,16 +153,9 @@ def _calibration_features_active() -> bool:
 
 
 def _calibration_overlays_should_render() -> bool:
-    """Returns True iff the calibration scene overlays should be added
-    to the URDF scene this page-build. Gates on the active tool being
-    camera-bearing (built-in MSG, or any custom tool flagged
-    ``has_camera``) OR the per-user "Force-show overlays" override
-    being on.
-
-    Without this, overlays would render for every tool — including
-    ones with no camera (Jepson's stock SSG-48, Pneumatic, etc.) —
-    which is misleading: the frustum, hemisphere, etc. all assume a
-    camera is mounted.
+    """True iff the calibration scene overlays should render this page-
+    build. Requires the active tool to be camera-bearing or the
+    per-user force-show override.
     """
     try:
         from waldo_commander.components.calibration_overlays import (
@@ -212,17 +180,8 @@ async def initialize_urdf_scene() -> None:
     mesh_dir = Path(robot.mesh_dir)
 
     # parol6-vision: startup migration + custom-tool registration.
-    # Bakes STLs into parol6's mesh dir + mutates the tool registry,
-    # so it's heavy. Gated on the soft toggle
-    # ``_calibration_features_active`` (default OFF) so a fresh user
-    # gets the calibration tab visible but no disk-write side effects
-    # until they explicitly opt in.
-    #
-    # Historical note: an earlier ``hijack_ssg48_body_mesh`` call lived
-    # here; commit ee8674e removed it in favour of the custom-tool
-    # migration path. The legacy hijack helper still ships in
-    # ``calibration_overlays/ssg48_hijack.py`` for any out-of-tree code
-    # that imports it directly, but it's no longer wired into startup.
+    # Bakes STLs and mutates the tool registry, so gated on the soft
+    # ``_calibration_features_active`` toggle.
     if _calibration_features_active():
         try:
             from waldo_commander.components.calibration_overlays import (
@@ -230,9 +189,7 @@ async def initialize_urdf_scene() -> None:
             )
 
             # One-shot migration of the legacy SSG-48 + camera-bracket
-            # setup into a regular custom tool. No-op when the user
-            # doesn't have the merged STL (most users) or when the
-            # migration has already run once.
+            # setup into a custom tool. No-op without the merged STL.
             try:
                 _calib_custom_tools.auto_migrate_ssg48_with_bracket()
             except Exception as _ie:  # noqa: BLE001
@@ -240,8 +197,8 @@ async def initialize_urdf_scene() -> None:
 
             _registered = _calib_custom_tools.register_all()
             if _registered:
-                # Rebuild the active_robot's _tools so the freshly-
-                # registered entries are visible to the gripper dropdown.
+                # Refresh active_robot._tools so freshly-registered
+                # entries show up in the gripper dropdown.
                 try:
                     from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
 
@@ -308,39 +265,10 @@ async def initialize_urdf_scene() -> None:
         background_color=scene_config.background_color,
     )
 
-    # Align TCP and load tool mesh from controller's active tool —
-    # only when the GUI has no stored tool preference. The stored-
-    # tool block further down is the authoritative source when one
-    # exists; pre-applying the controller's tool here causes a
-    # workspace-hull cache thrash on cold start.
-    #
-    # Concrete failure mode (custom tool with non-zero TCP offset):
-    #
-    #   1. ``register_all`` above fires ``_notify_tool_registry_changed``
-    #      synchronously, which invokes the SettingsContent callback
-    #      that updates the gripper dropdown's value. That schedules
-    #      an async ``_on_tool_change`` task (NiceGUI dispatches
-    #      async on_change handlers via ``asyncio.create_task``).
-    #   2. The ``await client.tools()`` below yields to the loop, and
-    #      the scheduled ``_on_tool_change`` runs: it correctly
-    #      applies the GUI's selected tool (e.g.
-    #      ``custom:ssg48_realsense`` with offset -0.105) and the
-    #      workspace-hull cache HITS for that offset.
-    #   3. ``client.tools()`` then resolves with ``result.tool="NONE"``
-    #      (controller's default — it has no idea about the GUI's
-    #      custom-tool selection; custom tools are GUI-only).
-    #   4. The branch below USED to fire ``apply_tool("NONE")`` →
-    #      offset 0.0 → cache MISS → 6 s background hull regen.
-    #   5. The stored-tool block further down then fires
-    #      ``apply_tool("custom:ssg48_realsense")`` → offset -0.105
-    #      → ANOTHER cache miss against the just-saved 0.0-offset
-    #      hull → ANOTHER 6 s regen.
-    #
-    # Total wasted: ~12 s of background CPU per cold start.
-    # Skipping this branch when stored_tool is set eliminates the
-    # entire thrash; the stored-tool block does everything this
-    # would have done anyway (set_active_tool + apply_tool, plus
-    # the controller-side select_tool via proxy_tool_key).
+    # Align TCP and load tool mesh from the controller's active tool —
+    # only when no GUI-stored preference exists. The stored-tool block
+    # below is authoritative when one is set; running this in parallel
+    # caused workspace-hull cache thrash on cold start.
     try:
         stored_tool_pref = ng_app.storage.general.get("selected_tool", "")
         has_stored_pref = bool(stored_tool_pref) and stored_tool_pref != "NONE"
@@ -376,16 +304,9 @@ async def initialize_urdf_scene() -> None:
         )  # Z
 
     # parol6-vision: hand-eye calibration overlays + scene-driven timers.
-    # The control panel is built later as the "Calibration" side-tab —
-    # see ``_build_left_panels``. ``add_overlays`` is heavy: it adds
-    # scene groups (board, hemisphere, frustum, reachability dots) and
-    # registers the per-tick timers (post-cal 4 Hz, footprint 5 Hz,
-    # detection poll 0.5 Hz). Two layers of gating:
-    #   - ``_calibration_features_active``: the user master toggle
-    #   - ``custom_tools.active_tool_is_camera_bearing`` OR
-    #     the per-user "Force-show overlays" override: the active
-    #     gripper tool needs a camera, otherwise the overlays don't
-    #     render anything meaningful.
+    # ``add_overlays`` is heavy (scene groups + per-tick timers); gated
+    # by the master toggle and by ``_calibration_overlays_should_render``.
+    # See ``_build_left_panels`` for the side-tab.
     if _calibration_features_active() and _calibration_overlays_should_render():
         try:
             from waldo_commander.components.calibration_overlays import (
@@ -410,15 +331,10 @@ async def initialize_urdf_scene() -> None:
         vk = ng_app.storage.general.get(f"tool_variant_{stored_tool}")
         ui_state.active_robot.set_active_tool(stored_tool, variant_key=vk)
         ui_state.urdf_scene.apply_tool(stored_tool, variant_key=vk)
-        # Sync the controller's active tool too. For built-in tools
-        # ``client.select_tool(stored_tool)`` is direct; for custom
-        # tools we route through ``proxy_tool_key`` (the controller
-        # doesn't know ``custom:`` keys). Without this, the GUI
-        # presents the stored tool's mesh + IK while the controller
-        # silently keeps whatever tool it had at last shutdown — the
-        # parol6.PAROL6_ROBOT log shows ``Applied tool 'MSG'`` even
-        # when the GUI shows a custom gripper, and motor commands run
-        # with the wrong TCP transform.
+        # Sync the controller's active tool. Custom keys are routed
+        # through ``proxy_tool_key``; without this the controller would
+        # keep its previous tool and run motor commands with the wrong
+        # TCP transform.
         try:
             controller_tool = stored_tool
             if isinstance(stored_tool, str) and stored_tool.startswith(
@@ -665,12 +581,8 @@ def update_ui_from_status() -> None:
     if control_panel.estop:
         control_panel.estop.check_state_change()
 
-    # Notify listeners that robot state has changed (for envelope proximity updates)
-    # Skip if the URDF scene hasn't rendered yet — guards the same
-    # serialization race as ``_update_connection_notification`` above.
-    # We swapped from ``app_ready`` to ``urdf_scene_ready`` so the
-    # disconnect path still produces notifications even when no
-    # STATUS multicast ever arrives (real-hardware-no-robot scenario).
+    # Notify listeners that robot state has changed (for envelope proximity updates).
+    # Same serialization-race guard as ``_update_connection_notification``.
     if not readiness_state.urdf_scene_ready.is_set():
         return
 
@@ -702,9 +614,7 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
         gripper_tab.props("disable")
         gripper_tab.mark("tab-gripper")
         ui_state._gripper_tab = gripper_tab
-        # parol6-vision calibration — Run / Localise / STOP + view-overlay
-        # toggles. Tab only exists when WALDO_CALIBRATION_ENABLED=1 so
-        # disabled installs see the same left strip as upstream.
+        # parol6-vision calibration tab. Hidden when WALDO_CALIBRATION_ENABLED=0.
         if _calibration_enabled():
             calibration_tab = ui.tab(
                 name="calibration", label="", icon="precision_manufacturing",
@@ -804,10 +714,7 @@ def _build_left_panels(panels_wrap: ui.element) -> dict:
 
             ui_state._build_gripper_content = _build_gripper_content
 
-        # parol6-vision calibration tab — Run / Localise / STOP + view
-        # overlays. Tab panel only registered when the feature is opted
-        # in via ``WALDO_CALIBRATION_ENABLED`` (matching the tab-strip
-        # gate above).
+        # Calibration tab panel — matches the tab-strip gate above.
         if _calibration_enabled():
             with ui.tab_panel("calibration").classes(
                 "gap-2 overlay-card overflow-hidden"
@@ -990,26 +897,11 @@ def build_page_content() -> None:
         with ui.column().classes("absolute inset-0 z-0"):
 
             async def _init():
-                # Best-effort wait for the backend's first STATUS multicast
-                # before rendering. When the controller is healthy this
-                # typically resolves in <500 ms. When it isn't — e.g. real-
-                # hardware mode with no robot wired, where parol6-server
-                # emits no STATUS frames at all — don't block page
-                # rendering forever: fall through after a short timeout
-                # and let the URDF + scene render anyway. The persistent
-                # "Robot disconnected" notification (created via
-                # ``_update_connection_notification`` after the scene
-                # renders) surfaces the disconnect state non-blockingly.
-                #
-                # Prior behaviour (jepson2k commit 091f9bf1, 2026-03-06)
-                # was a 20-second hard timeout that displayed
-                # "Could not connect to controller" and never built the
-                # URDF, leaving the page unusable in real-no-robot mode.
-                # The decoupling here is safe because
-                # ``initialize_urdf_scene`` reads the URDF + meshes from
-                # disk and wraps every controller call (client.tools,
-                # client.select_tool) in try/except, so it does not
-                # require backend liveness.
+                # Don't block page rendering on the first STATUS multicast.
+                # Real-hardware-no-robot mode never emits one; the persistent
+                # "Robot disconnected" notification surfaces the state
+                # afterwards. ``initialize_urdf_scene`` reads from disk and
+                # wraps controller calls in try/except, so no backend is fine.
                 app_ready_in_time = True
                 try:
                     await asyncio.wait_for(
@@ -1040,14 +932,8 @@ def build_page_content() -> None:
                 except Exception:
                     hw_now = False
                 if hw_now and robot_state.simulator_active:
-                    # Honour the user's last explicit toggle choice. If
-                    # they were running in sim deliberately (e.g.
-                    # editing scripts with the robot powered off
-                    # nearby), don't override their choice just because
-                    # hardware is suddenly detectable. Only auto-switch
-                    # when no explicit preference has been recorded —
-                    # preserving the original "first launch with
-                    # hardware wired" convenience for fresh installs.
+                    # Honour the user's last explicit toggle choice; only
+                    # auto-switch when no preference is recorded.
                     try:
                         saved_mode = ng_app.storage.general.get("startup_mode")
                     except Exception:  # noqa: BLE001
@@ -1071,11 +957,8 @@ def build_page_content() -> None:
                 control_panel.update_robot_btn_visual()
                 readout_panel.update_conn_io()
 
-                # Show the persistent "Robot disconnected" notification
-                # if we're starting in robot mode without hardware. This
-                # used to fire only via the status-update callback path
-                # which never runs when no STATUS frames arrive — so we
-                # explicitly poke it here once the scene is ready.
+                # Fire once now since the status-update callback path
+                # never runs when no STATUS frames arrive.
                 _update_connection_notification()
 
                 # Enable gripper tab if a tool is already active
@@ -1162,19 +1045,10 @@ def _quiet_shutdown_exception_handler(
             exc, (asyncio.CancelledError, ConnectionResetError, BrokenPipeError)
         ):
             return
-        # Parol6 client's ``AsyncRobotClient.halt()`` task scheduled by
-        # ``_teardown_overlays`` (or any other pre-shutdown halt path)
-        # binds its inbox queue to the sync ``RobotClient``'s private
-        # thread-loop at construction. When the scheduled task runs on
-        # the main NiceGUI loop the queue-loop mismatch raises
-        # ``RuntimeError: <Queue ...> is bound to a different event
-        # loop``. The actual UDP HALT packet has already gone out
-        # synchronously (``sendto`` happens before the response
-        # wait), so the controller correctly halts — only the
-        # Python-side response wait fails. Filtering this trace
-        # during shutdown removes a chunk of ugly noise the user
-        # otherwise sees on every Ctrl+C; the underlying queue-loop
-        # binding fragility belongs upstream in parol6's client.
+        # parol6's AsyncRobotClient.halt() binds its inbox queue to the
+        # sync client's private thread-loop; on shutdown the cross-loop
+        # response-wait raises this. The HALT packet already went out
+        # synchronously, so the controller still halts cleanly.
         if isinstance(exc, RuntimeError) and (
             "bound to a different event loop" in str(exc)
         ):
@@ -1212,20 +1086,12 @@ def _register_handlers() -> None:
     async def _set_initial_mode(port: str) -> None:
         """Pick the controller's initial mode (sim vs hardware) and resume.
 
-        Priority order:
-          1. ``app.storage.general["startup_mode"]`` — the user's last
-             explicit toggle choice. Persisted by
-             ``ControlPanel.on_toggle_sim`` so a restart honours
-             "I was in sim last time, keep me there" without forcing
-             the user to re-toggle on every launch.
-          2. Fallback (no saved preference): sim if no com_port is
-             configured, otherwise leave the controller's pre-existing
-             serial transport alone. Matches the original Jepson
-             behaviour for fresh installs.
-
-        The page-load ping in ``_init`` may still upgrade sim→hardware
-        when hardware is actually detected — but only when the user
-        hasn't explicitly chosen sim (see auto-switch logic there).
+        Prefers ``app.storage.general["startup_mode"]`` (set by
+        ``ControlPanel.on_toggle_sim``) so a restart honours the user's
+        last toggle. Without that, sim if no port is configured, else
+        leave the serial transport alone. The page-load ping in
+        ``_init`` may still upgrade sim→hardware when hardware is
+        detected — unless the user explicitly chose sim.
         """
         try:
             saved_mode = ng_app.storage.general.get("startup_mode")
@@ -1240,20 +1106,18 @@ def _register_handlers() -> None:
             robot_state.simulator_active = True
             logger.debug("startup: restored saved mode = sim")
         elif saved_mode == "hardware":
-            # User explicitly chose hardware — leave controller in
-            # robot mode regardless of whether a com_port is set.
+            # Leave the controller in robot mode regardless of port config.
             robot_state.simulator_active = False
             logger.debug("startup: restored saved mode = hardware")
         elif not port:
-            # No saved preference + no port configured → default to sim.
+            # No saved preference + no port → default to sim.
             try:
                 await client.simulator(True)
             except Exception as e:
                 logger.error("startup: simulator(True) failed: %s", e)
             robot_state.simulator_active = True
-        # else: no saved preference but a port IS configured → leave
-        # the controller's existing serial transport in place. _init's
-        # ping-based auto-switch handles the hw-detected case.
+        # else: port configured but no preference → keep the existing
+        # serial transport; ``_init``'s ping-based auto-switch handles hw.
 
         try:
             await client.resume()
@@ -1272,10 +1136,9 @@ def _register_handlers() -> None:
         try:
             saved_tool = ng_app.storage.general.get("selected_tool", "")
             if saved_tool:
-                # Custom tools (``custom:<name>``) are not in the controller's
-                # built-in registry; route through their ``proxy_tool_key`` so
-                # the controller selects the underlying built-in tool. Mirrors
-                # the translation in ``initialize_urdf_scene``.
+                # Route ``custom:<name>`` through ``proxy_tool_key`` —
+                # the controller doesn't know custom keys. Mirrors the
+                # translation in ``initialize_urdf_scene``.
                 controller_tool = saved_tool
                 if isinstance(saved_tool, str) and saved_tool.startswith("custom:"):
                     from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
@@ -1866,14 +1729,9 @@ def main():
     # Pre-compile numba functions to avoid JIT lag during hot path
     warmup_pipelines()
 
-    # NiceGUI's ``app.storage.user`` requires a ``storage_secret`` for the
-    # per-browser-session HMAC; without it, every write silently fails (the
-    # calibration-overlays per-tool layer was hitting this and losing
-    # calibrated mounts on shutdown). Pull from env so production deploys
-    # can rotate the secret without code changes; fall back to a fixed
-    # constant for the local dev case. The exact value doesn't matter for
-    # correctness — only that it stays the same across restarts (otherwise
-    # existing user-storage files won't decrypt).
+    # ``app.storage.user`` writes silently fail without ``storage_secret``.
+    # Env-overridable; the constant must stay stable across restarts or
+    # existing user-storage files won't decrypt.
     storage_secret = os.environ.get(
         "WALDO_STORAGE_SECRET",
         "waldo-commander-local-dev-storage-secret",

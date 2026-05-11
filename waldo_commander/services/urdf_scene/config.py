@@ -21,8 +21,8 @@ class RobotAppearanceMode(Enum):
     LIVE: Normal robot view showing real-time joint angles from robot_state
     SIMULATOR: Amber/ghost appearance, still shows real-time angles
     EDITING: Grey semi-transparent appearance for target editing, shows editing angles
-    PREVIEW: Red semi-transparent appearance for collision-rejected pose preview;
-        shows non-live joint angles, live broadcast frozen until exit_preview()
+    PREVIEW: Red semi-transparent for collision-rejected pose preview; broadcast
+        frozen until exit_preview()
     """
 
     LIVE = "live"

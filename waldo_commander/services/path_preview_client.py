@@ -14,16 +14,10 @@ from typing import Any
 
 import numpy as np
 
-# Edit-time collision-check result cache. Keyed by
-# ``(q_from_quantized_rad, q_to_quantized_rad, config)`` where
-# ``config`` is the (frozen) :class:`CollisionEnvironmentConfig`. The
-# joint vectors are quantized to ``_EDIT_TIME_QUANTIZE_DECIMALS``
-# decimals in RADIANS — 4 decimals is ~0.006 deg precision, enough
-# to absorb broadcast jitter without merging meaningfully different
-# moves. Eviction is LRU (``move_to_end`` on hit;
-# ``popitem(last=False)`` removes the least-recently-used). ~5-10x
-# speedup on common edit loops where the user changes one line and
-# the rest of the program replays unchanged.
+# LRU cache for edit-time collision checks. Key: quantized joint
+# vectors + the (frozen) ``CollisionEnvironmentConfig``. 4-decimal
+# radians ≈ 0.006° — absorbs broadcast jitter without merging real
+# moves. Big win on edit loops that replay an unchanged program tail.
 _EDIT_TIME_PRECHECK_CACHE: "OrderedDict[tuple, dict[str, Any]]" = OrderedDict()
 _EDIT_TIME_PRECHECK_CACHE_MAX = 256
 _EDIT_TIME_QUANTIZE_DECIMALS = 4
@@ -132,9 +126,8 @@ class PathPreviewClient:
 
         self._client = dry_run_client_cls(initial_joints_deg=init_deg)
         self._tool_proxy = _ToolCollectionProxy(self)
-        # Seed last_joints_rad from the live robot pose so the FIRST
-        # move's edit-time collision check has a valid q_from. Without
-        # this, the first move in every program is silently skipped.
+        # Seed from the live pose so the first move's collision check
+        # has a valid q_from.
         self.last_joints_rad: list[float] | None = init_rad
         self._blend_move_type: str = ""
         self._pending_sleep: float = 0.0
@@ -304,22 +297,10 @@ class PathPreviewClient:
         result: DryRunResult,
         move_type: str,
     ) -> None:
-        """Run a gripper-vs-environment pre-flight check on this move's
-        planned trajectory.
-
-        Skipped for jog / checkpoint segments and when the master
-        ``mesh_collision_check_enabled`` toggle is off. Failures append a
-        ``"Line {n}: collision: {reason}"`` entry to
-        :attr:`accumulated_errors`, which the editor's diagnostic pipeline
-        renders as an inline lint squiggle on the offending line.
-
-        Failure modes that fall back to fail-open silently:
-
-        * ``parol6_vision`` is not installed (collision_core unavailable).
-        * The parol6 mesh directory can't be located.
-        * The previous move's end-joints are unknown (first move in
-          program — script's starting joints come from the live robot
-          state, but we don't fault on the seed move).
+        """Gripper-vs-environment pre-flight for this move. Failures
+        append ``"Line N: collision: <reason>"`` to ``accumulated_errors``
+        (rendered as a lint squiggle). Fail-open when parol6_vision
+        isn't installed, the mesh dir is missing, or this is the seed move.
         """
         if prev_joints_rad is None:
             return
@@ -336,9 +317,8 @@ class PathPreviewClient:
             ):
                 return
         except (ImportError, AttributeError, RuntimeError):
-            # NiceGUI not importable / no app context / storage not
-            # initialized (CI / headless smoke tests). Treat as on so
-            # a dry-run still surfaces collisions.
+            # Storage unavailable (CI / headless smoke). Default on so
+            # dry-runs still surface collisions.
             pass
 
         try:
@@ -355,25 +335,11 @@ class PathPreviewClient:
         if mesh_dir is None:
             return
 
-        # Prefer the GUI's selected tool over robot_state.tool_key:
-        # the controller broadcast only carries BUILT-IN keys (custom
-        # tools with proxy_tool_key set route motor commands through
-        # a built-in like VACUUM or SSG-48), so reading
-        # robot_state.tool_key would silently load the WRONG gripper
-        # meshes for any custom tool.
-        #
-        # Resolution order:
-        # 1. ``WALDO_GUI_ACTIVE_TOOL_KEY`` env var. Path-preview
-        #    runs inside ``run.cpu_bound`` (a process-pool worker)
-        #    where ``app.storage.general`` is a stale on-disk
-        #    snapshot, NOT the live GUI session. The parent's
-        #    ``_run_simulation_isolated`` forwards the resolved key
-        #    via env var before each invocation; this is the only
-        #    reliable path inside the worker.
-        # 2. ``_active_gui_tool_key()``. Only correct in the
-        #    in-process fallback (when cpu_bound failed and we ran
-        #    sync). Reads ``app.storage.general``.
-        # 3. ``robot_state.tool_key`` last-ditch fallback.
+        # Resolution: env var (set by ``_run_simulation_isolated`` and
+        # the only reliable source in the cpu_bound worker), then
+        # ``_active_gui_tool_key`` for the in-process fallback, then
+        # ``robot_state.tool_key`` (which carries proxy built-ins, not
+        # ``custom:`` keys, so loses meshes for custom tools).
         import os  # noqa: PLC0415
         tool_key: str | None = os.environ.get("WALDO_GUI_ACTIVE_TOOL_KEY", "").strip() or None
         if not tool_key:
@@ -393,15 +359,8 @@ class PathPreviewClient:
             except (ImportError, AttributeError):
                 tool_key = "NONE"
 
-        # Wrap mesh resolution + config build in a defensive
-        # try/except so a future contract change in parol6_vision
-        # (e.g. ``resolve_tool_meshes_from_registry`` returning a
-        # dict without "BODY" / "JAW" roles, or
-        # ``CollisionEnvironmentConfig`` adding required fields)
-        # can't propagate up into ``_collect_from_result`` and skip
-        # segment collection for the whole script. Without this,
-        # the user would see "no segment recorded" with no
-        # indication that the pre-check itself broke.
+        # Defensive: a parol6_vision contract change here must not
+        # propagate up and break segment collection for the whole script.
         try:
             tool_meshes = resolve_tool_meshes_from_registry(tool_key, mesh_dir)
             config = CollisionEnvironmentConfig(
@@ -421,11 +380,8 @@ class PathPreviewClient:
             )
             return
 
-        # LRU cache lookup keyed by quantized (q_from, q_to, config).
-        # CollisionEnvironmentConfig is a frozen hashable dataclass so
-        # it serves as part of the key directly. q vectors quantized to
-        # ~0.006 deg precision so jitter from the controller's discrete
-        # joint state doesn't blow the cache.
+        # LRU lookup. CollisionEnvironmentConfig is a frozen hashable
+        # dataclass so it slots straight into the key.
         q_from_key = tuple(
             round(v, _EDIT_TIME_QUANTIZE_DECIMALS) for v in prev_joints_rad
         )
@@ -448,17 +404,9 @@ class PathPreviewClient:
             except Exception as e:  # noqa: BLE001
                 logger.debug("preview collision check skipped: %s", e)
                 return
-            # Only cache when the collision manager was actually
-            # ready. ``manager_ready=False`` means python-fcl or the
-            # mesh files were unavailable on this call (e.g. a
-            # transient mount issue, or first-call before the lazy
-            # FCL build settled), and the result is a fail-open
-            # ``safe=True`` placeholder. Caching that placeholder
-            # would mask any real collision on the same (q_from,
-            # q_to, config) for the rest of the session, since the
-            # cache is hit before re-running the check. Skipping
-            # the write lets a subsequent call try the build again
-            # and catch real collisions.
+            # Don't cache the fail-open ``safe=True`` placeholder that
+            # ``manager_ready=False`` returns — caching it would mask
+            # real collisions on the same (q_from, q_to) later.
             if check.get("manager_ready", True):
                 _EDIT_TIME_PRECHECK_CACHE[cache_key] = check
                 _EDIT_TIME_PRECHECK_CACHE.move_to_end(cache_key)
@@ -514,8 +462,7 @@ class PathPreviewClient:
         if result is None:
             return
 
-        # Snapshot the prior move's end-joints BEFORE the update below
-        # so the edit-time collision check can use it as q_from.
+        # Snapshot before the update so the collision check has q_from.
         prev_joints_rad = (
             list(self.last_joints_rad) if self.last_joints_rad else None
         )
@@ -523,11 +470,6 @@ class PathPreviewClient:
         if result.end_joints_rad.size > 0:
             self.last_joints_rad = result.end_joints_rad.tolist()
 
-        # Edit-time gripper-vs-environment collision check. Best-effort,
-        # gripper-only, tablet-skipped (matches the program-runner
-        # subprocess gating). Surfaced as a "Line N: ..." entry in
-        # accumulated_errors — picked up by the editor's lint pipeline
-        # as a red squiggle on the offending line.
         self._check_segment_collision(prev_joints_rad, result, move_type)
 
         if result.tcp_poses.shape[0] == 0:

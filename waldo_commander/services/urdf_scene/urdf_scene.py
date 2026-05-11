@@ -261,12 +261,8 @@ class UrdfScene(
 
         # Robot appearance mode (unified state machine)
         self._appearance_mode: RobotAppearanceMode = RobotAppearanceMode.LIVE
-        # PREVIEW mode tracks the prior mode so ``exit_preview`` can
-        # restore it (e.g. dot-click → PREVIEW → exit_preview should
-        # return to LIVE, not always LIVE if the user was in EDITING
-        # before entering preview). Initialised to None here so static
-        # analyzers see the slot exists; idempotent ``apply_preview_pose``
-        # only writes when transitioning from non-PREVIEW.
+        # Prior mode captured on PREVIEW entry so ``exit_preview`` can
+        # restore EDITING / SIMULATOR rather than always LIVE.
         self._preview_previous_mode: RobotAppearanceMode | None = None
 
         # Editing mode state
@@ -1709,38 +1705,17 @@ class UrdfScene(
         logger.debug("Robot appearance mode set to %s", mode.value)
 
     def apply_preview_pose(self, angles_rad: list[float] | np.ndarray) -> None:
-        """Pose-jump the URDF to a non-live joint configuration for
-        collision-rejected pose preview.
-
-        While in PREVIEW mode the live status broadcast → URDF apply
-        path is frozen (``set_axis_values`` short-circuits), the arm
-        renders in the configured ``preview_color`` translucent, and
-        TCP / joint transform controls are suspended. Call
-        :meth:`exit_preview` to restore live mode.
-
-        Idempotent: calling twice in succession (without an intervening
-        :meth:`exit_preview`) preserves the original `previous_mode`
-        rather than overwriting it with PREVIEW (which would strand the
-        scene because ``exit_preview`` would restore PREVIEW->PREVIEW).
-
-        Args:
-            angles_rad: 6-vector joint angles in radians.
+        """Pose-jump the URDF to a non-live joint configuration. Freezes the
+        live broadcast path, renders translucent, and suspends transform
+        controls. Idempotent: re-entry preserves the original
+        ``_preview_previous_mode``. Call :meth:`exit_preview` to restore.
         """
-        # Ensure ``angles_rad`` is a list of floats - _apply_joint_angles
-        # tolerates ndarray but the preview seed is the canonical shape.
         try:
             seq = list(angles_rad)
         except TypeError:
             return
         previous_mode = self._appearance_mode
-        # Only update the previous-mode slot if we're transitioning INTO
-        # PREVIEW from a different mode. A re-entry while already in
-        # PREVIEW preserves the original slot value so exit goes back
-        # to LIVE/SIMULATOR/EDITING correctly. Skip the mode-set when
-        # we're ALREADY in PREVIEW (re-entry on rapid clicks) — the
-        # underlying ``set_appearance_mode`` re-walks every arm / tool
-        # mesh material and re-emits its debug log line, so calling it
-        # for a no-op transition adds avoidable per-click overhead.
+        # Skip the re-walk + log when already in PREVIEW (rapid clicks).
         if previous_mode != RobotAppearanceMode.PREVIEW:
             self._preview_previous_mode = previous_mode  # type: ignore[attr-defined]
             self.set_appearance_mode(RobotAppearanceMode.PREVIEW)
@@ -1754,13 +1729,9 @@ class UrdfScene(
             self._preview_previous_mode = None  # type: ignore[attr-defined]
 
     def exit_preview(self) -> None:
-        """Exit PREVIEW mode and resume the live broadcast -> URDF
-        apply path. Restores the appearance mode that was active before
-        :meth:`apply_preview_pose` was called.
-
-        Safe to call when not in PREVIEW (no-op). Defensively coerces
-        to LIVE if the previous-mode slot is None or accidentally
-        PREVIEW (which would otherwise leave the scene stranded).
+        """Resume the live broadcast → URDF path and restore the prior
+        appearance mode. No-op when not in PREVIEW; defensively falls
+        back to LIVE if the saved slot is unusable.
         """
         if self._appearance_mode != RobotAppearanceMode.PREVIEW:
             return

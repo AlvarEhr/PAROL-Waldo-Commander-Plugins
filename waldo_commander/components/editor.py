@@ -865,16 +865,9 @@ print(f"Robot status: {{status}}")
         self.playback.update_scrub_segments()
 
         # Apply initial tool selection from script to scene and controller.
-        # Skip the apply when the GUI's active tool already matches what
-        # the script's header selects — re-applying the same tool would
-        # re-trigger ``_update_envelope_for_tool_change`` which, when the
-        # tool's TCP offset differs from the current cached hull, kicks
-        # off a 6-second workspace-hull regeneration. On cold start with
-        # an active custom tool (TCP offset != 0), the debounced auto-sim
-        # used to flip the GUI's tool transiently and cause two hull
-        # regenerations to thrash back-to-back (~12 s wasted on the
-        # asyncio loop). Comparing against ``urdf_scene._current_tool``
-        # (the canonical "what's currently applied") avoids that.
+        # Skip when the GUI already has the script's selection applied —
+        # re-applying triggers a workspace-hull cache regen on TCP-offset
+        # changes. ``urdf_scene._current_tool`` is the canonical "applied".
         if simulation_state.tool_selections and ui_state.urdf_scene:
             first_sel = simulation_state.tool_selections[0]
             if first_sel.segment_index < 0:
@@ -882,10 +875,7 @@ print(f"Robot status: {{status}}")
                 variant_key = first_sel.variant_key or None
                 current_key = getattr(ui_state.urdf_scene, "_current_tool", None)
                 current_vk = getattr(robot_state, "tool_variant_key", "") or None
-                # Case-insensitive compare on the key so NONE/none/"" all
-                # treat as the same no-tool state — urdf_scene normalises
-                # to "none" when tool is empty, but scripts and storage
-                # both use the uppercase "NONE" form.
+                # Case-insensitive: urdf_scene stores "none", storage "NONE".
                 keys_match = (
                     (tool_key or "").lower() == (current_key or "").lower()
                 )

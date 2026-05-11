@@ -89,12 +89,8 @@ async def run_script(
 
     env["WALDO_BACKEND_PACKAGE"] = ui_state.active_robot.backend_package
 
-    # Forward the mesh-collision master toggle so the subprocess's
-    # SteppingClientWrapper pre-flight matches the GUI's gating. Default
-    # "1" (on) when the storage key isn't set yet. Specific exception
-    # tuple matches path_visualizer.py: ImportError when nicegui isn't
-    # importable in test contexts, RuntimeError / AttributeError when
-    # storage isn't bound to a request slot.
+    # Forward the mesh-collision master toggle so the subprocess pre-
+    # flight matches the GUI's gating. Default "1" when storage is unset.
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
 
@@ -106,15 +102,9 @@ async def run_script(
     except (ImportError, RuntimeError, AttributeError):
         env["WALDO_MESH_COLLISION_ENABLED"] = "1"
 
-    # Forward the GUI's active tool key. The controller's broadcast
-    # only carries BUILT-IN keys (custom tools route motor commands
-    # through their proxy_tool_key), so the subprocess's
-    # _maybe_check_collision can't resolve a custom tool's actual
-    # mesh paths from ``client.tool.key`` alone — it'd silently load
-    # the proxy tool's meshes instead. Reading from
-    # ``app.storage.general["selected_tool"]`` here picks up the
-    # canonical key (built-in or custom:<name>) for the subprocess
-    # to use as a tool_key override.
+    # Forward the GUI's active tool key. The controller broadcast only
+    # carries built-in keys; without this the subprocess would load the
+    # proxy's meshes instead of the custom tool's actual meshes.
     selected_tool: str = ""
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
@@ -126,13 +116,8 @@ async def run_script(
         selected_tool = ""
     env["WALDO_GUI_ACTIVE_TOOL_KEY"] = selected_tool
 
-    # Forward the variant key for the active tool, if any. The
-    # subprocess's local IK helper applies ``Robot.set_active_tool``
-    # with this variant so its kinematics match the controller —
-    # without it, the local IK would target the tool's default
-    # variant TCP while the controller uses the user-selected one,
-    # producing pre-flight rejections that don't match real
-    # collisions. Empty string means "no variant override".
+    # Forward the active tool's variant so the subprocess's local IK
+    # targets the same TCP the controller uses.
     variant_for_active: str = ""
     if selected_tool:
         try:
@@ -147,13 +132,8 @@ async def run_script(
             variant_for_active = ""
     env["WALDO_GUI_ACTIVE_TOOL_VARIANT"] = variant_for_active
 
-    # Forward the user TCP offset (in metres, JSON-encoded
-    # ``[x, y, z]``) for the active tool. The GUI stores it in mm as
-    # ``{"x": .., "y": .., "z": ..}`` per ``components/settings.py``;
-    # convert to metres here so the subprocess can pass it directly
-    # to ``Robot.set_active_tool(tcp_offset_m=...)``. Empty string
-    # means "no user offset" (the tool's registered TCP transform
-    # alone is used).
+    # Forward the user TCP offset, converting GUI mm → metres + JSON.
+    # Empty string means no override (tool's registered TCP only).
     tcp_offset_for_active: str = ""
     if selected_tool:
         try:

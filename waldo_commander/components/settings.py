@@ -47,14 +47,9 @@ def _setting_row(title: str, description: str):
 
 
 def _live_apply_calibration_state() -> None:
-    """Best-effort hook into the parol6-vision calibration overlays so
-    a tool change / master-toggle flip / force-show flip live-applies
-    without a page reload.
-
-    Lazy-imports the package because ``WALDO_CALIBRATION_ENABLED=0``
-    keeps it out of the main load path entirely. Failures are
-    swallowed — the calibration package is optional for the rest of
-    the app.
+    """Re-run calibration overlay state after a tool / toggle change,
+    without a page reload. Lazy-imported because the package may be
+    hard-disabled; failures are swallowed.
     """
     try:
         from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
@@ -77,9 +72,8 @@ class SettingsContent:
         self._cam_refresh_timer: ui.timer | None = None
         self._variant_container: ui.column | None = None
         self._tcp_offset_container: ui.column | None = None
-        # Tool dropdown reference + the parol6-vision callback we
-        # subscribe to so newly-added / deleted custom tools refresh
-        # the dropdown without a page reload.
+        # Subscribed via ``subscribe_tool_registry_changed`` to refresh
+        # the dropdown when custom tools are added or deleted.
         self._tool_select: ui.select | None = None
         self._tool_registry_cb: Callable[[], None] | None = None
 
@@ -112,9 +106,7 @@ class SettingsContent:
             self._refresh_timer.cancel()
         if self._cam_refresh_timer is not None:
             self._cam_refresh_timer.cancel()
-        # Unsubscribe the tool-registry-changed callback so a stale
-        # SettingsContent instance can't keep firing dropdown updates
-        # after the panel is torn down.
+        # Unsubscribe so a torn-down panel can't keep firing updates.
         if self._tool_registry_cb is not None:
             try:
                 from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
@@ -127,15 +119,9 @@ class SettingsContent:
             self._tool_registry_cb = None
 
     def _refresh_tool_options(self) -> None:
-        """Re-read parol6's tool registry, update the gripper dropdown's
-        options, and sync the visible value to whatever is currently
-        persisted in ``app.storage.general["selected_tool"]``.
-
-        Called after a custom tool is registered or deleted via the
-        calibration_overlays callback. Reading the persisted selection
-        ensures that the "Use this tool" button on a custom-tool card
-        (which writes ``selected_tool`` but doesn't directly touch the
-        dropdown) updates the dropdown's visible value.
+        """Re-read the tool registry and sync the dropdown to the persisted
+        ``selected_tool``. Picks up changes the dropdown itself didn't
+        make (custom-tool "Use this tool" buttons, etc.).
         """
         if self._tool_select is None:
             return
@@ -147,10 +133,8 @@ class SettingsContent:
         except Exception:  # noqa: BLE001
             return
         self._tool_select.options = tool_options
-        # Sync the displayed selection to the persisted active tool so
-        # a programmatic tool change updates the dropdown. Falls back
-        # to the first option when the persisted value is gone (e.g.
-        # the user just deleted the active custom tool).
+        # Fall back to the first option when the persisted value is
+        # gone (e.g. the active custom tool was just deleted).
         stored = ng_app.storage.general.get("selected_tool")
         if stored and stored in tool_options:
             self._tool_select.value = stored
@@ -365,13 +349,8 @@ class SettingsContent:
         async def _on_tool_change(e):
             tool = e.value
             vk = self._get_variant_key(tool)
-            # Custom tools (``custom:<name>``) live only in the GUI
-            # process — the controller's _TOOL_REGISTRY doesn't know
-            # them, so ``client.select_tool("custom:...")`` raises with
-            # "Unknown tool". Instead, route motor commands through the
-            # custom tool's ``proxy_tool_key`` (a built-in the
-            # controller does know), and apply the local scene + state
-            # using the custom key.
+            # ``custom:<name>`` keys are GUI-only — route motor commands
+            # through the proxy built-in instead.
             if isinstance(tool, str) and tool.startswith("custom:"):
                 proxy = ""
                 try:
@@ -392,8 +371,7 @@ class SettingsContent:
                             "proxy select_tool(%s) for %s failed: %s",
                             proxy, tool, exc,
                         )
-                        # Don't bail — local apply still works; tell
-                        # the user motor commands won't be live.
+                        # Local apply still works; warn that motor commands won't be live.
                         ui.notify(
                             f"Custom tool {tool} active locally; motor "
                             f"commands proxied to {proxy} failed "
@@ -406,11 +384,8 @@ class SettingsContent:
                 self._rebuild_variant_selector(tool)
                 self._rebuild_tcp_offset(tool)
                 self._notify_and_resimulate()
-                # Live-apply calibration overlays + panel for the new
-                # tool: re-evaluates camera-bearing gating, picks up
-                # per-tool intrinsic / mount overrides, builds or
-                # tears down scene overlays as needed. No page reload
-                # required.
+                # Live-apply: re-evaluates camera-bearing gating and
+                # rebuilds overlays for the new tool.
                 _live_apply_calibration_state()
                 ui.notify(
                     f"Switched to {tool}.",
@@ -431,16 +406,11 @@ class SettingsContent:
             self._rebuild_variant_selector(tool)
             self._rebuild_tcp_offset(tool)
             self._notify_and_resimulate()
-            # Live-apply calibration overlays + panel for the new
-            # tool — see custom-tool branch above.
+            # See custom-tool branch above.
             _live_apply_calibration_state()
 
-        # Defensive rebuild — Robot._tools is a snapshot taken at
-        # construction time, so any tools registered afterwards (the
-        # parol6-vision custom tools system pushes ``custom:<name>``
-        # entries into the registry post-init) wouldn't show up here
-        # without this. Cheap call (~ms) so safe to run on every
-        # settings-panel open.
+        # Robot._tools is a construction-time snapshot; rebuild so any
+        # tools registered post-init (custom tools) show up here.
         try:
             from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
 
@@ -471,11 +441,7 @@ class SettingsContent:
                 .mark("select-tool")
             )
 
-        # Subscribe to parol6-vision's tool-registry-changed events so
-        # newly-added / deleted custom tools update the dropdown
-        # without a page reload. Idempotent — re-builds of the section
-        # (panel refresh, etc.) replace the prior subscription with a
-        # fresh one bound to the new dropdown ref.
+        # Idempotent subscribe: drop the prior callback on rebuild.
         if self._tool_registry_cb is not None:
             try:
                 from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
@@ -566,16 +532,9 @@ class SettingsContent:
                 self._cam_select.options = new_options
                 self._cam_select.update()
 
-        # Windows: auto-refresh disabled because ``cv2.VideoCapture(i)``
-        # actually opens each camera device for a moment, which causes
-        # user-visible flicker on USB cameras (especially Intel RealSense).
-        # The user can click the Settings panel to trigger a one-shot
-        # refresh instead.
-        # Linux / macOS: V4L2 / AVFoundation enumeration is non-intrusive
-        # (queries the kernel device list without opening), so the auto-
-        # refresh runs as before — preserves the "plug a camera in
-        # mid-session and see it appear in the dropdown" behaviour for
-        # those platforms.
+        # Windows auto-refresh disabled — cv2.VideoCapture(i) opens each
+        # device briefly during enumeration, flickering USB cameras. V4L2
+        # / AVFoundation enumeration is non-intrusive, so leave it on.
         self._cam_refresh_timer = ui.timer(
             10.0, _refresh_camera_devices, active=sys.platform != "win32",
         )
@@ -637,22 +596,16 @@ class SettingsContent:
                 ).classes("w-24").props("dense disable")
 
     # ── Calibration & motion-safety extras ──────────────────────────
-    #
-    # Toggles for the parol6-vision additions: the calibration features
-    # master switch (mirrored here for discoverability — same value as
-    # the toggle in the calibration panel) and the mesh collision check
-    # gate. The mesh collision check is independent of the calibration
-    # features — it powers ``validate_joint_trajectory`` (a generic
-    # motion-safety primitive) and the calibration-time pose filter,
-    # but is useful even for users who don't run calibration.
+    # Calibration master switch (mirrored from the calibration panel) +
+    # the mesh-collision gate. The collision gate is independent — it
+    # also powers ``validate_joint_trajectory`` for non-calibration use.
 
     def _build_calibration_extras(self) -> None:
         ui.label("Calibration & motion safety").classes(
             "text-sm font-medium opacity-80",
         )
 
-        # Master soft-toggle for calibration features. Same storage key
-        # the calibration panel writes to.
+        # Mirrors the calibration panel's master toggle.
         cal_initial = bool(
             ng_app.storage.general.get("calibration_features_active", False)
         )
@@ -660,10 +613,7 @@ class SettingsContent:
         def _on_calibration_toggle(e) -> None:
             new_value = bool(getattr(e, "value", False))
             ng_app.storage.general["calibration_features_active"] = new_value
-            # Live-apply: build or tear down overlays + refresh the
-            # calibration panel so its three-state branch picks up
-            # the new state. First off→on may take ~1–2 s on disk
-            # (custom-tool STL bake); subsequent flips are fast.
+            # First off→on may stall briefly on the custom-tool STL bake.
             if new_value:
                 ui.notify(
                     "Loading calibration features…",
@@ -689,11 +639,7 @@ class SettingsContent:
                 "dense",
             )
 
-        # Mesh collision check gate. Default ON because collision
-        # checking is generally useful for motion safety (it powers
-        # ``validate_joint_trajectory`` plus the calibration-time
-        # pose filter). Users can disable on lower-spec machines or
-        # when iterating quickly without safety guards.
+        # Default ON; users may disable on lower-spec machines.
         coll_initial = bool(
             ng_app.storage.general.get("mesh_collision_check_enabled", True)
         )
@@ -701,8 +647,7 @@ class SettingsContent:
         def _on_collision_toggle(e) -> None:
             new_value = bool(getattr(e, "value", False))
             ng_app.storage.general["mesh_collision_check_enabled"] = new_value
-            # Drop the cached collision manager so the next call
-            # picks up the new gate state.
+            # Drop the cached manager so the next call picks up the new gate.
             try:
                 from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
                     state as _calib_state,

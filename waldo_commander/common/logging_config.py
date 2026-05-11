@@ -160,20 +160,10 @@ def _have_file_handler(logger: logging.Logger) -> bool:
 
 
 def _resolve_log_file_path() -> Path | None:
-    """Resolve the destination path for the rotating-file log.
-
-    Order of precedence:
-
-    1. ``WALDO_LOG_FILE`` env var (explicit override).
-    2. ``WALDO_LOG_DIR`` env var (write ``waldo-commander.log`` inside).
-    3. The OneDrive-synced ``Project Files\\Waldo Logs\\`` directory if
-       it exists — keeps logs visible to the development workflow that
-       frequently inspects them across machines.
-    4. ``~/.waldo-commander/waldo-commander.log`` as the universal
-       fallback (mirrors the workspace-hull cache location).
-
-    Returns None if path resolution + parent-dir creation both fail
-    (callers treat that as "no file logging").
+    """Resolve the rotating log path. Precedence: ``WALDO_LOG_FILE``,
+    ``WALDO_LOG_DIR``, the OneDrive ``Project Files\\Waldo Logs\\`` dir
+    when present, then ``~/.waldo-commander/``. Returns None when all
+    paths fail to mkdir; callers treat that as "no file logging".
     """
     explicit = os.environ.get("WALDO_LOG_FILE")
     if explicit:
@@ -234,9 +224,7 @@ def configure_logging(
         log_path = _resolve_log_file_path()
         if log_path is not None:
             try:
-                # 10 MB per file, keep 5 backups → up to 60 MB on disk.
-                # Plain text (no ANSI colors) so the file is readable
-                # without a terminal that interprets escape codes.
+                # 10 MB x 5 backups, plain text (no ANSI).
                 file_handler = logging.handlers.RotatingFileHandler(
                     str(log_path),
                     maxBytes=10 * 1024 * 1024,
@@ -252,9 +240,7 @@ def configure_logging(
                 )
                 logger.addHandler(file_handler)
             except OSError as exc:
-                # Don't fail startup just because the log file can't
-                # be opened (e.g. permission issue on a locked-down
-                # path). Console + UI handlers still work.
+                # Don't fail startup on a non-writable log path.
                 sys.stderr.write(
                     f"[logging] could not open log file {log_path}: {exc}\n",
                 )

@@ -33,31 +33,12 @@ def _collision_check_with_dialog(
     context: str,
     on_send_anyway: Callable[[], None],
 ) -> bool:
-    """Pre-flight collision check for a discrete-target control-panel
-    move (Home, joint-limit, go-to-angle).
+    """Pre-flight collision check for a discrete-target control-panel move.
 
-    Returns True if the dispatch should proceed (safe, check
-    unavailable, or master gate off). Returns False if a collision
-    was detected — in that case the shared collision dialog is opened
-    (Cancel / Preview in sim / Send anyway), and ``on_send_anyway``
-    will be invoked when the user clicks the override button.
-
-    The dialog handles the override path itself, so the caller
-    should just ``return`` when this helper returns False.
-
-    Skipped (returns True) when:
-
-    * ``calibration_overlays`` is hard-off via
-      ``WALDO_CALIBRATION_ENABLED=0`` (package not importable).
-    * Master mesh-collision toggle is off (validator returns
-      ``manager_ready=False``).
-    * ``robot_state.angles`` hasn't been populated by the live
-      broadcast yet — using stale zeros as q_from would falsely
-      flag the trajectory through unrealistic configurations
-      (e.g. arm-flat-out at startup before connection).
-
-    The check runs synchronously on the main loop. FCL queries are
-    fast (~50ms total); not enough to noticeably block UI.
+    Returns True to proceed (safe, unavailable, or toggle off). Returns
+    False on collision — the shared dialog is opened (Cancel / Preview /
+    Send anyway) and ``on_send_anyway`` runs on override. Caller should
+    just ``return`` when this returns False.
     """
     try:
         from waldo_commander.components.calibration_overlays.collision import (  # noqa: PLC0415
@@ -74,14 +55,9 @@ def _collision_check_with_dialog(
         logger.debug("control collision pre-check skipped (angles): %s", e)
         return True
 
-    # Startup heuristic: if the live broadcast hasn't populated yet,
-    # robot_state.angles is the dataclass default (zeros). Checking
-    # a trajectory from [0, 0, 0, 0, 0, 0] (arm pointing straight
-    # along +X) to anything else interpolates through configs that
-    # almost certainly clip the floor in our simplified-mesh world,
-    # producing a false rejection — most visibly on the very first
-    # Home button click after launching the GUI. Skip the check when
-    # the broadcast hasn't given us real joint state yet.
+    # Skip when angles are still the all-zero dataclass default — a
+    # trajectory from arm-straight-out interpolates through configs
+    # that clip the floor in our simplified-mesh world.
     if all(abs(v) < 1e-9 for v in current):
         return True
 
@@ -1532,9 +1508,8 @@ class ControlPanel:
         if not self._movement_allowed():
             return
 
-        # Pre-flight check on the home target. Home is a recovery
-        # move, so a hard-block here is particularly painful — wire
-        # the override dialog so the user can always Send anyway.
+        # Home is a recovery move; route through the override dialog
+        # so a hard-block never strands the user.
         try:
             from parol6.config import HOME_ANGLES_DEG  # noqa: PLC0415
 
@@ -1597,12 +1572,7 @@ class ControlPanel:
         """Toggle between robot and simulator modes and update URDF appearance.
 
         Persists the resulting mode to ``app.storage.general["startup_mode"]``
-        so the next restart honours the user's last explicit choice
-        (``"sim"`` or ``"hardware"``). Without this the only signal
-        ``_set_initial_mode`` had on startup was whether a ``com_port``
-        was configured — which forces hardware mode even when the user
-        last ran in sim, causing the surprising "I was in sim, why am
-        I in hardware now?" behaviour on every restart.
+        so ``_set_initial_mode`` can restore it on the next restart.
         """
         try:
             # Stop any running user script before mode switch (safety)
