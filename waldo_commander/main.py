@@ -110,8 +110,16 @@ def _update_connection_notification() -> None:
     """Show or dismiss persistent notification based on robot connection state."""
     global _connection_notification
 
-    # Skip if app not ready - avoid modifying elements during page serialization
-    if not readiness_state.app_ready.is_set():
+    # Skip if the URDF scene hasn't rendered yet — modifying notification
+    # elements during page serialization causes races. We use
+    # ``urdf_scene_ready`` here (set inside ``initialize_urdf_scene`` after
+    # the scene is fully built) rather than ``app_ready`` (which
+    # additionally requires a STATUS multicast from the controller).
+    # The latter never fires when parol6-server is in real-hardware mode
+    # without a physical robot, so gating on it would prevent this
+    # disconnect banner from ever showing in exactly the scenario it's
+    # most useful — i.e. exactly when the user needs to be told.
+    if not readiness_state.urdf_scene_ready.is_set():
         return
 
     needs_warning = not robot_state.simulator_active and not robot_state.connected
@@ -623,8 +631,12 @@ def update_ui_from_status() -> None:
         control_panel.estop.check_state_change()
 
     # Notify listeners that robot state has changed (for envelope proximity updates)
-    # Skip if app not ready to avoid race with NiceGUI page serialization
-    if not readiness_state.app_ready.is_set():
+    # Skip if the URDF scene hasn't rendered yet — guards the same
+    # serialization race as ``_update_connection_notification`` above.
+    # We swapped from ``app_ready`` to ``urdf_scene_ready`` so the
+    # disconnect path still produces notifications even when no
+    # STATUS multicast ever arrives (real-hardware-no-robot scenario).
+    if not readiness_state.urdf_scene_ready.is_set():
         return
 
     _update_connection_notification()
@@ -943,21 +955,45 @@ def build_page_content() -> None:
         with ui.column().classes("absolute inset-0 z-0"):
 
             async def _init():
+                # Best-effort wait for the backend's first STATUS multicast
+                # before rendering. When the controller is healthy this
+                # typically resolves in <500 ms. When it isn't — e.g. real-
+                # hardware mode with no robot wired, where parol6-server
+                # emits no STATUS frames at all — don't block page
+                # rendering forever: fall through after a short timeout
+                # and let the URDF + scene render anyway. The persistent
+                # "Robot disconnected" notification (created via
+                # ``_update_connection_notification`` after the scene
+                # renders) surfaces the disconnect state non-blockingly.
+                #
+                # Prior behaviour (jepson2k commit 091f9bf1, 2026-03-06)
+                # was a 20-second hard timeout that displayed
+                # "Could not connect to controller" and never built the
+                # URDF, leaving the page unusable in real-no-robot mode.
+                # The decoupling here is safe because
+                # ``initialize_urdf_scene`` reads the URDF + meshes from
+                # disk and wraps every controller call (client.tools,
+                # client.select_tool) in try/except, so it does not
+                # require backend liveness.
+                app_ready_in_time = True
                 try:
                     await asyncio.wait_for(
-                        readiness_state.app_ready.wait(), timeout=20.0
+                        readiness_state.app_ready.wait(), timeout=3.0
                     )
                 except asyncio.TimeoutError:
-                    loading_spinner.set_visibility(False)
+                    app_ready_in_time = False
+                    logger.info(
+                        "Backend not ready within 3s — proceeding with "
+                        "URDF render. A STATUS frame may arrive later and "
+                        "swap the UI into connected mode without a refresh."
+                    )
                     loading_status.text = (
-                        "Could not connect to controller. "
-                        "Check that the controller is running and refresh the page."
+                        "Robot disconnected — proceeding without live data."
                     )
                     loading_status.style(
-                        "color: #ef4444; font-size: 1rem; text-align: center; "
+                        "color: #f59e0b; font-size: 0.9rem; text-align: center; "
                         "max-width: 400px;"
                     )
-                    return
 
                 await initialize_urdf_scene()
 
@@ -981,6 +1017,13 @@ def build_page_content() -> None:
                 control_panel.update_robot_btn_visual()
                 readout_panel.update_conn_io()
 
+                # Show the persistent "Robot disconnected" notification
+                # if we're starting in robot mode without hardware. This
+                # used to fire only via the status-update callback path
+                # which never runs when no STATUS frames arrive — so we
+                # explicitly poke it here once the scene is ready.
+                _update_connection_notification()
+
                 # Enable gripper tab if a tool is already active
                 if robot_state.tool_key and robot_state.tool_key != "NONE":
                     if ui_state._build_gripper_content is not None:
@@ -991,6 +1034,13 @@ def build_page_content() -> None:
                 scene_loading_overlay.classes("opacity-0 pointer-events-none")
                 await asyncio.sleep(0.4)
                 scene_loading_overlay.delete()
+
+                if not app_ready_in_time:
+                    logger.info(
+                        "URDF + scene rendered with backend-unready "
+                        "fallback. Connection state will update live "
+                        "if/when STATUS frames begin arriving."
+                    )
 
             ui.timer(0.05, _init, once=True)
 
