@@ -891,6 +891,18 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
         bake_jobs.append(
             (f"variant_{v.key}_jaw_right", cfg.variant_jaw_path(v.key, "right")),
         )
+    # mtime-cache key: the bake output depends on both the source STL
+    # bytes AND the bake parameters in config.json (mesh_scale,
+    # mesh_rpy_rad, mesh_translate_m). We use mtime as a cheap proxy
+    # for "either has changed since last bake". Captured once per
+    # call so repeated stat() across roles doesn't add up.
+    try:
+        cfg_mtime = (
+            cfg.config_path.stat().st_mtime if cfg.config_path.exists() else 0.0
+        )
+    except OSError:
+        cfg_mtime = 0.0
+
     for role, src_path in bake_jobs:
         if not src_path.exists():
             continue
@@ -901,10 +913,32 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
         # downgrades).
         if not _stl_size_check(src_path):
             continue
+        dst = mesh_dir / _baked_filename(cfg.name, role)
+        # Idempotency guard: skip re-bake when the destination file
+        # is newer than both the source STL and config.json. This
+        # turns a redundant register_all call (we currently observe
+        # 2-3 per cold start) from ~500-800 ms of trimesh.load +
+        # transform + export per STL into ~3 stat() calls — total
+        # cost of a redundant call drops from ~2 s to ~5 ms for the
+        # ssg48_realsense tool (body + 2 jaws + N variant jaws).
+        # Re-baking still fires automatically when the user edits
+        # the source STL or tweaks the placement transform in the
+        # custom-tools UI (which rewrites config.json).
+        try:
+            if dst.exists():
+                dst_mtime = dst.stat().st_mtime
+                src_mtime = src_path.stat().st_mtime
+                if dst_mtime >= max(src_mtime, cfg_mtime):
+                    out[role] = dst
+                    continue
+        except OSError as e:
+            logger.debug(
+                "custom_tools: mtime check failed for %s/%s: %s; "
+                "will re-bake defensively", cfg.name, role, e,
+            )
         try:
             mesh = trimesh.load(str(src_path), force="mesh")
             mesh.apply_transform(T)
-            dst = mesh_dir / _baked_filename(cfg.name, role)
             mesh.export(str(dst))
             out[role] = dst
         except Exception as e:  # noqa: BLE001
