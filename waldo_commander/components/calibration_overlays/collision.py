@@ -1,19 +1,11 @@
 """Public collision-validation API for the Waldo-Commander integration.
 
 Thin wrapper over :mod:`parol6_vision.calibration.collision_core` that wires
-in the NiceGUI master toggle, the active-tool lookup via ``robot_state``,
-the live ``_T_BOARD2BASE`` board pose, and the user-editable settings layer.
+the NiceGUI master toggle, the active-tool lookup via ``robot_state``, the
+live ``_T_BOARD2BASE`` board pose, and the user-editable settings layer.
 
-The core module (:mod:`parol6_vision.calibration.collision_core`) holds the
-actual FCL + trimesh + parol6 mesh logic and is NiceGUI-free, so the
-program-runner subprocess and ``PathPreviewClient`` (both of which can't
-import NiceGUI) can use the same code path via direct ``collision_core``
-imports.
-
-Backwards-compatible private helpers (``_build_collision_manager``,
-``_self_collides``, ``_trajectory_collides``, ``_resolve_active_tool_meshes``,
-``_mesh_collision_enabled``) remain for the existing in-package consumers
-(``calibration_thread.py``, ``frustum.py``).
+The core module is NiceGUI-free so subprocess / path-preview consumers can
+use it directly. Private helpers here remain for in-package callers.
 """
 
 from __future__ import annotations
@@ -47,9 +39,8 @@ logger = logging.getLogger(__name__)
 
 
 def _mesh_collision_enabled() -> bool:
-    """Master gate for the mesh-collision machinery. Read from
-    ``app.storage.general['mesh_collision_check_enabled']`` (default
-    True). Flipped from the bottom-right Settings tab.
+    """Master gate for the mesh-collision machinery. Default True; flipped
+    from the bottom-right Settings tab.
     """
     try:
         from nicegui import app  # noqa: PLC0415
@@ -72,20 +63,9 @@ def _resolve_active_tool_meshes(
 
     Returns ``(tool_key, {"BODY": [Path, ...], "JAW": [Path, ...]})``.
 
-    Resolves the active tool from the GUI's logical selection
-    (``app.storage.general["selected_tool"]``) — which includes
-    ``custom:<name>`` keys — rather than ``robot_state.tool_key``,
-    which only reflects what the controller broadcasts and only ever
-    knows BUILT-IN tool keys. For custom tools that have a
-    ``proxy_tool_key`` set (so motor commands route through a
-    built-in), the controller broadcasts the proxy and
-    ``robot_state.tool_key`` would yield e.g. ``"VACUUM"`` even when
-    the GUI is actually presenting ``custom:msg_ai_realsense``.
-    Using the GUI selection means the collision check loads the
-    correct gripper meshes for the user's actual tool.
-
-    Falls back to ``robot_state.tool_key``, then ``"NONE"`` (no
-    gripper meshes) when both lookups fail.
+    Prefers the GUI's logical selection (handles ``custom:<name>`` keys
+    that the controller can't broadcast because they proxy a built-in).
+    Falls back to ``robot_state.tool_key``, then ``"NONE"``.
     """
     tool_key: str | None = None
     try:
@@ -119,11 +99,9 @@ def _config_from_settings(
     gripper_only: bool = False,
     include_tablet: bool = True,
 ) -> CollisionEnvironmentConfig | None:
-    """Build a :class:`CollisionEnvironmentConfig` from the live
-    NiceGUI state + settings layer + ``_T_BOARD2BASE``.
-
-    Returns None when the parol6 mesh directory can't be located —
-    callers treat that as fail-open.
+    """Build a :class:`CollisionEnvironmentConfig` from the live NiceGUI
+    state, settings layer, and ``_T_BOARD2BASE``. Returns None when the
+    parol6 mesh directory can't be located (callers fail-open).
     """
     mesh_dir = parol6_mesh_dir()
     if mesh_dir is None:
@@ -166,11 +144,8 @@ def _config_from_settings(
 def _build_collision_manager(
     tablet_T_board2base: NDArray[np.float64] | None = None,
 ) -> tuple[Any, set[tuple[str, str]], dict[str, Any]] | None:
-    """Backwards-compatible shim. ``tablet_T_board2base`` is accepted for
-    signature compatibility but the live ``_T_BOARD2BASE`` is always used
-    when the surface setting is enabled — which matches the previous
-    behaviour because every existing caller already passed
-    ``tablet_T_board2base=_T_BOARD2BASE``.
+    """Backwards-compatible shim. ``tablet_T_board2base`` is ignored; the
+    live ``_T_BOARD2BASE`` is always used (matches existing call sites).
     """
     config = _config_from_settings(gripper_only=False, include_tablet=True)
     if config is None:
@@ -218,23 +193,16 @@ def validate_joint_trajectory(
     Args:
         q_from: 6-vector start joint angles.
         q_to: 6-vector target joint angles.
-        n_samples: Number of interior interpolation points to check.
-            Endpoints are also checked.
+        n_samples: Number of interior interpolation points; endpoints
+            are also checked.
         degrees: True if ``q_from`` / ``q_to`` are degrees.
-        gripper_only: When True, skip the arm-link block in the
-            collision manager so only gripper-vs-(floor + tablet + jaws)
-            is checked. Use for callers where the arm's joint
-            configuration is already trusted (user programs whose
-            IK has produced a known-good joint vector).
+        gripper_only: Skip arm-link checks (use when the joint config
+            is already known-good, e.g. a user-program IK result).
 
     Returns:
-        dict with keys ``safe``, ``start_safe``, ``end_safe``,
-        ``interior_safe``, ``manager_ready``, ``reason``.
-
-        ``manager_ready=False`` means the master toggle is off OR
-        python-fcl / parol6 link meshes are unavailable; in that case
-        ``safe`` defaults to True (fail-open) and the caller should
-        treat the move as accepted.
+        dict with ``safe``, ``start_safe``, ``end_safe``, ``interior_safe``,
+        ``manager_ready``, ``reason``. ``manager_ready=False`` fails open
+        (``safe=True``); caller should treat the move as accepted.
     """
     if not _mesh_collision_enabled():
         return {
@@ -277,54 +245,33 @@ def validate_joint_trajectory(
 
 
 # ---------------------------------------------------------------------------
-# Cache shim: localise.py invalidates _state["trajectory_collision_mgr_pair"]
-# on board-pose change. The new core has its own keyed cache so this isn't
-# strictly necessary anymore, but a stale entry there harms nothing.
-# Frustum still reads it as an opaque tuple of (mgr, adjacent, meshes).
+# Cache shim — legacy ``_state`` slot that frustum still reads.
+# collision_core has its own keyed cache; this one mirrors for it.
 # ---------------------------------------------------------------------------
 
 
 def _refresh_state_cache_pair() -> None:
-    """Rebuild ``_state['trajectory_collision_mgr_pair']`` from the live
-    settings + board pose so frustum's per-tick mesh visualisation has a
-    consistent reference. The collision-core cache handles its own
-    invalidation by config-key; this one is purely for the legacy
-    ``_state`` slot.
-    """
+    """Rebuild ``_state['trajectory_collision_mgr_pair']`` for frustum."""
     pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
     _state["trajectory_collision_mgr_pair"] = pair
 
 
 def _warm_collision_managers_blocking() -> None:
-    """Pre-build both collision managers (full + gripper-only) so the
-    first ``_raycast_footprint_tick`` and ``_live_pose_indicator_tick``
-    don't block the asyncio loop doing trimesh.load + FCL BVH build.
-
-    Each manager build costs 2-5 s on cold start (10+ STL loads, BVH
-    construction for every link + gripper body + jaws + floor + tablet),
-    and the two ticks use DIFFERENT configs (``gripper_only=False`` vs
-    ``True``), so the collision_core keyed cache doesn't share them —
-    both get built independently on first hit.
-
-    Intended to be invoked via ``asyncio.to_thread`` from
-    ``add_overlays`` so the heavy work runs on a worker thread while
-    the page renders. The full pair is stashed into the legacy
-    ``_state`` slot that ``_raycast_footprint_tick`` reads; the
-    gripper-only manager is left in the collision_core cache for
-    ``validate_joint_trajectory`` to find on its next call.
+    """Pre-build both collision managers so the first frustum / live-pose
+    tick doesn't block the asyncio loop on trimesh + FCL setup. Run via
+    ``asyncio.to_thread`` from ``add_overlays``.
     """
     from parol6_vision.calibration.collision_core import (  # noqa: PLC0415
         build_collision_manager as _core_build,
     )
 
-    # Full manager for trajectory checks (frustum tick + path-preview).
+    # Full manager — frustum tick + path-preview.
     full_pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
     if full_pair is not None:
         _state["trajectory_collision_mgr_pair"] = full_pair
 
-    # Gripper-only manager for the live-pose collision indicator.
-    # Not stashed in _state; collision_core's keyed cache serves
-    # subsequent ``validate_joint_trajectory`` calls.
+    # Gripper-only manager — live-pose indicator. Lives in collision_core's
+    # keyed cache, not in _state.
     gripper_cfg = _config_from_settings(gripper_only=True, include_tablet=True)
     if gripper_cfg is not None:
         _core_build(gripper_cfg)

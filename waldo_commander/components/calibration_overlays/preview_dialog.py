@@ -1,26 +1,12 @@
 """Shared collision-rejected-move dialog with preview-in-sim option.
 
-Called from any worker thread that pre-flight-rejected a move (hover,
-pose-popup, localise, post-cal home, etc.). Surfaces a modal with three
-choices:
+Offers Cancel / Preview-in-sim (pose-jump the URDF scene to the rejected
+target) / Send-anyway (invoke caller's un-pre-checked dispatch). Per-move
+bypass — flip ``mesh_collision_check_enabled`` in Settings for a
+session-wide off.
 
-* **Cancel** — close the dialog, do nothing. Default.
-* **Preview in sim** — pose-jump the URDF scene to the rejected target
-  pose, painted red translucent, with the live broadcast frozen until
-  the user explicitly exits or dispatches a real move. The user can
-  rotate / zoom the scene to inspect exactly which mesh would collide.
-* **Send anyway** — invoke ``on_send_anyway()`` (the caller's
-  un-pre-checked dispatch). Useful when the user has reviewed the
-  preview and decided the FCL margin is overcautious.
-
-This is a per-move bypass, NOT a master-toggle replacement. Flipping
-the master ``mesh_collision_check_enabled`` toggle off in Settings
-remains the way to disable checks session-wide.
-
-Threading: workers should call :func:`show_collision_dialog_threadsafe`
-which schedules dialog construction on the main asyncio loop via
-``loop.call_soon_threadsafe``. Direct calls (from request-context code
-in the panel UI) can use :func:`show_collision_dialog` directly.
+Worker threads use :func:`show_collision_dialog_threadsafe`; request-context
+code can call :func:`show_collision_dialog` directly.
 """
 
 from __future__ import annotations
@@ -35,21 +21,15 @@ from .state import _state
 logger = logging.getLogger(__name__)
 
 
-# Module-level state: at most one active preview AND at most one open
-# collision dialog at a time. A second collision-rejection while a
-# preview is active replaces the old preview rather than stacking; a
-# second rejection while a dialog is open closes the old dialog and
-# replaces it. This avoids the stranding-and-stacking failure modes
-# where a stale dialog dismisses a different preview's state.
+# Module state: at most one active preview AND one open dialog. A second
+# rejection replaces both rather than stacking, avoiding stranded state.
 _active_preview: dict[str, Any] | None = None
 _active_dialog: Any | None = None
 
 
 def reset_preview_state() -> None:
-    """Forcefully exit any active preview AND close any open dialog.
-
-    Called from `_teardown_overlays` so a feature on/off cycle never
-    leaves the URDF scene stranded in PREVIEW.
+    """Exit any active preview AND close any open dialog. Called from
+    ``_teardown_overlays`` so a feature toggle can't strand PREVIEW.
     """
     global _active_preview, _active_dialog
     _exit_active_preview()
@@ -62,9 +42,7 @@ def reset_preview_state() -> None:
 
 
 def _exit_active_preview() -> None:
-    """Restore the URDF scene from any active preview. Safe no-op when
-    no preview is active.
-    """
+    """Restore the URDF scene from any active preview. No-op when none."""
     global _active_preview
     if _active_preview is None:
         return
@@ -82,16 +60,11 @@ def _exit_active_preview() -> None:
 def _enter_preview(target_q_deg: list[float]) -> bool:
     """Pose-jump the URDF scene to ``target_q_deg`` for preview.
 
-    Returns True on success, False if the scene isn't available or the
-    apply call fails. Idempotent: a second `_enter_preview` while a
-    preview is already active first exits the old one so the
-    `_preview_previous_mode` slot on the scene doesn't get clobbered
-    with PREVIEW (which would break exit).
+    Idempotent: exits any existing preview first so the scene's
+    ``_preview_previous_mode`` slot isn't clobbered with PREVIEW.
     """
     global _active_preview
     if _active_preview is not None:
-        # Already in a preview — exit cleanly first so the previous-mode
-        # slot is restored to LIVE before we re-enter.
         _exit_active_preview()
     try:
         from waldo_commander.state import ui_state  # noqa: PLC0415
@@ -119,26 +92,19 @@ def show_collision_dialog(
 ) -> None:
     """Open the collision-rejected-move dialog.
 
-    Must be called from within a NiceGUI request context (i.e. from
-    the main asyncio loop). For worker-thread callers use
-    :func:`show_collision_dialog_threadsafe`.
-
-    Serialises with any prior open dialog: a second invocation while
-    one is already showing closes the old one first so the user is
-    never staring at two stacked persistent modals.
+    Must run inside a NiceGUI request context; worker threads should call
+    :func:`show_collision_dialog_threadsafe`. A second invocation closes
+    any prior dialog so persistent modals never stack.
     """
     global _active_dialog
     from nicegui import ui  # noqa: PLC0415
 
-    # Close any prior dialog to avoid stacking persistent modals.
     if _active_dialog is not None:
         try:
             _active_dialog.close()
         except (RuntimeError, AttributeError):
             pass
         _active_dialog = None
-    # Also exit any prior preview before opening the new dialog so the
-    # scene mode is clean on entry.
     _exit_active_preview()
 
     dialog = ui.dialog().props("persistent")
@@ -150,11 +116,11 @@ def show_collision_dialog(
                 "font-mono text-caption",
             )
 
-        # Preview-mode controls reveal when the user enters preview.
+        # Revealed once Preview is entered.
         preview_panel = ui.row().classes("w-full justify-end gap-2")
         preview_panel.set_visibility(False)
 
-        # Captured here so handlers can disable Preview after first click.
+        # Captured so handlers can disable Preview after first click.
         preview_button: Any = None
 
         def _close_dialog() -> None:
@@ -184,9 +150,7 @@ def show_collision_dialog(
                 )
                 return
             preview_panel.set_visibility(True)
-            # Disable the Preview button after first click so a fast
-            # re-click can't re-enter and confuse the previous-mode
-            # slot tracking on the scene.
+            # Block a re-click that would clobber previous-mode tracking.
             if preview_button is not None:
                 preview_button.disable()
 
@@ -197,8 +161,7 @@ def show_collision_dialog(
                 preview_button.enable()
 
         def _do_send_anyway() -> None:
-            # Auto-exit any active preview before dispatch so the scene
-            # snaps back to LIVE before the actual move begins.
+            # Snap the scene back to LIVE before the actual move starts.
             _exit_active_preview()
             _close_dialog()
             try:
@@ -225,11 +188,8 @@ def show_collision_dialog(
                 "Exit preview", on_click=_do_exit_preview,
             ).props("flat color=info")
 
-        # Keyboard accessibility: Escape cancels (Quasar persistent
-        # dialogs ignore Escape by default), Enter confirms Cancel
-        # (the autofocused button). The keyboard listener is scoped
-        # to the dialog's lifetime via the cancel handler that closes
-        # it, so it doesn't leak across dialogs.
+        # Escape cancels (Quasar persistent dialogs ignore it by default).
+        # The listener is scoped to dialog lifetime via visibility binding.
         def _handle_keydown(e: Any) -> None:
             key = getattr(e, "key", None) or getattr(e, "args", {}).get("key", "")
             if key == "Escape":
@@ -240,10 +200,7 @@ def show_collision_dialog(
                 dialog, "value",
             )
         except Exception as exc:  # noqa: BLE001
-            # ui.keyboard requires a UI context; if the dialog is being
-            # built from a non-page context (e.g. a teardown race), we
-            # accept the lack of Escape support — Cancel button still
-            # works.
+            # ui.keyboard needs a UI context; without it Cancel still works.
             logger.debug("preview_dialog: keyboard hook failed: %s", exc)
 
     _active_dialog = dialog
@@ -257,20 +214,12 @@ def show_collision_dialog_threadsafe(
     on_send_anyway: Callable[[], None],
     on_cancel: Callable[[], None] | None = None,
 ) -> bool:
-    """Schedule the dialog on the main asyncio loop. Safe to call from
-    a worker thread.
+    """Schedule the dialog on the main asyncio loop from a worker thread.
 
-    Returns True if the schedule was queued, False if the main loop
-    isn't available (no preview / dialog will appear; caller should
-    fall back to a status-line update).
-
-    The lambda enters the captured NiceGUI client's content slot
-    (``with client:``) before calling :func:`show_collision_dialog`.
-    Without that, ``ui.dialog()`` raises
-    ``"The current slot cannot be determined because the slot stack
-    for this task is empty."`` — every worker-thread collision
-    rejection floods the log with that traceback. The client is
-    captured during ``add_overlays`` from the request context.
+    Returns False when the loop is unavailable (caller should fall back to
+    status line). Enters the captured NiceGUI client's slot before calling
+    :func:`show_collision_dialog`, without which ``ui.dialog()`` raises
+    "slot stack is empty" on every worker rejection.
     """
     loop = _state.get("main_loop")
     if loop is None:
@@ -288,10 +237,8 @@ def show_collision_dialog_threadsafe(
                         on_cancel=on_cancel,
                     )
             else:
-                # No client captured — fall through and hope the
-                # current slot stack happens to be valid (the
-                # dialog will fail loudly if not, which surfaces
-                # the missing capture).
+                # No client captured — try anyway; the dialog will fail
+                # loudly if the current slot stack is invalid.
                 show_collision_dialog(
                     message=message,
                     target_q_deg=list(target_q_deg),
@@ -299,10 +246,7 @@ def show_collision_dialog_threadsafe(
                     on_cancel=on_cancel,
                 )
         except RuntimeError as e:
-            # Client likely deleted between schedule and fire (page
-            # reload / disconnect). Fall back to a logged warning;
-            # the caller already posted the rejection to the
-            # status line.
+            # Client likely deleted between schedule and fire (page reload).
             logger.debug(
                 "preview_dialog: scheduled show failed (%s)", e,
             )

@@ -46,21 +46,14 @@ logger = logging.getLogger(__name__)
 
 
 def _calibration_thread() -> None:
-    """Run the calibration sim end-to-end and push joint updates to the GUI.
-
-    Drives the running parol6-server's controller via UDP — same path
-    Waldo-Commander uses — so each ``move_j`` is executed by the controller
-    and its joint state is broadcast to all subscribers (including the
-    URDF scene's status consumer). The GUI animates naturally; no
-    update_urdf_angles thread plumbing required.
+    """Run calibration end-to-end and animate via the controller's
+    50 Hz status broadcasts — no joint-update plumbing here.
     """
-    # Lazy import to break panel<->calibration_thread cycle.
+    # Lazy import — break the panel<->calibration_thread cycle.
     from .panel import _post_status  # noqa: PLC0415
 
-    # Track the controller client so the ``finally`` block can close
-    # its UDP socket + inner asyncio loop. Without this, every Run
-    # leaks one socket — fd / socket exhaustion over long-running
-    # sessions.
+    # Tracked so the ``finally`` can close the UDP socket + inner
+    # asyncio loop and avoid leaks across runs.
     raw_client: Any = None
 
     try:
@@ -88,11 +81,7 @@ def _calibration_thread() -> None:
             _flange_pose_from_client,
         )
 
-        # Mode dispatch: piggyback off Waldo-Commander's existing real/sim
-        # toggle (the orange-when-sim "robot" button at the top of the page).
-        # robot_state.simulator_active=True means the user is in simulator
-        # mode → use VirtualCamera; False means real-hardware mode → use
-        # RealSenseCamera. Default to sim if the import fails (defensive).
+        # Sim vs. real dispatched off the page-level robot toggle.
         try:
             from waldo_commander.state import robot_state  # noqa: PLC0415
             is_sim_mode = bool(robot_state.simulator_active)
@@ -101,9 +90,8 @@ def _calibration_thread() -> None:
 
         T_BOARD2BASE = _T_BOARD2BASE
         if is_sim_mode:
-            # Sim ground truth: cold-start tunable + small fixed perturbation
-            # (±2 mm / ±2°) so the simulated calibration always has something
-            # realistic to converge to.
+            # Sim ground truth — cold start + small fixed perturbation so
+            # the simulated calibration has something to converge to.
             cam_translate = settings.cam_mount_translate_mm
             cam_tilt = settings.cam_mount_tilt_deg
             ground_truth_mount = CameraMount.from_eyeball_estimate(
@@ -126,24 +114,15 @@ def _calibration_thread() -> None:
 
         robot = Robot()
 
-        # Drive the running parol6-server (controller in fake-serial mode).
-        # Each move_j blocks until motion completes; the controller broadcasts
-        # joint state at 50 Hz, which Waldo-Commander's status consumer picks
-        # up and feeds into the URDF scene. No thread/queue plumbing needed.
+        # Each move_j blocks until motion completes; the controller's
+        # 50 Hz status broadcasts drive the URDF scene.
         raw_client = RobotClient(host="127.0.0.1", port=5001)
 
-        # Wrap the client so the STOP button can short-circuit subsequent
-        # move_j calls — halt() alone only aborts the in-flight motion;
-        # the orchestrator's own loop will happily request the next pose
-        # right after. Returning -1 from move_j makes _move_to_joints
-        # treat each remaining pose as a MotionError and the orchestrator
-        # gives up cleanly with ``insufficient_samples_pass1``.
+        # STOP-aware wrapper — halt() only aborts the in-flight motion,
+        # so without this the orchestrator queues the next pose anyway.
+        # Returning -1 from move_j makes the orchestrator give up cleanly.
         class _HaltableClient:
-            """Thin wrapper that short-circuits motion-bearing calls
-            after the user pressed STOP. Without this, calls like
-            ``home()`` and ``move_l()`` proxy directly through to the
-            underlying client and ignore the stop flag.
-            """
+            """STOP-aware wrapper around motion-bearing calls."""
 
             _MOTION_METHODS: frozenset[str] = frozenset({
                 "move_j", "move_l", "move_p", "move_c", "move_s", "home",
@@ -168,13 +147,11 @@ def _calibration_thread() -> None:
                 return attr
 
         client = _HaltableClient(raw_client)
-        # Stash the raw client so the STOP button can call halt() directly.
+        # Stash the raw client so STOP can call halt() directly.
         _state["client"] = raw_client
 
-        # A prior run's STOP / Localise / Hover sent halt() and latched the
-        # controller into the disabled state. Resume at the start so the
-        # first move_j of this run doesn't fail with "Controller disabled
-        # (User requested halt)". Same fix as localise.py applies here.
+        # HALT latches the controller into DISABLED until a RESUME, so a
+        # prior STOP / Localise / Hover would block the first move_j.
         try:
             raw_client.resume()
         except Exception as e:  # noqa: BLE001
@@ -184,15 +161,9 @@ def _calibration_thread() -> None:
                 type(e).__name__, e,
             )
 
-        # Same FK-based flange pose query as the localise thread —
-        # client.pose("WRF") returns TCP (with the gripper's 105 mm tool
-        # offset baked in), NOT the flange. The mount transform
-        # T_cam2flange is defined relative to the FLANGE, so feeding TCP
-        # poses into it puts the VirtualCamera 105 mm out of position
-        # (verified live: detection succeeded at only 4 / 16 bootstrap
-        # poses because the camera was rendering far too close to the
-        # board). Run forward kinematics on the live joint angles to
-        # bypass the tool offset.
+        # FK-based flange pose — ``client.pose("WRF")`` returns TCP (tool
+        # offset baked in) and ``T_cam2flange`` is flange-relative, so
+        # mixing them puts the camera ~105 mm off in sim.
         from scipy.spatial.transform import Rotation as _R_calib_fk  # noqa: PLC0415
 
         def flange_pose() -> NDArray[np.float64] | None:
@@ -227,12 +198,11 @@ def _calibration_thread() -> None:
                 width=intr_w,
                 height=intr_h,
                 fps=30,
-                enable_depth=False,  # calibration only needs color frames
+                enable_depth=False,  # calibration only needs color
                 enable_color=True,
             )
-            # Stash BEFORE start(): if start() raises mid-pipeline-init the
-            # device may have already been claimed; the finally-block must
-            # see the camera handle to call .stop() cleanly.
+            # Stash before start() — if start() partially claims the
+            # device, ``finally`` needs the handle to clean up.
             _state["real_camera"] = camera
             camera.start()
             intrinsics = camera.intrinsics
@@ -254,15 +224,11 @@ def _calibration_thread() -> None:
             tilt_z_deg=cs_tilt[2],
         )
 
-        # Hemisphere CENTRE — also the calibration's look-at target. Uses the
-        # hemisphere override if set (decouples from board rotation), else
-        # falls back to the board centre. With no override (sim default), this
-        # is the board's geometric centre as before.
+        # Hemisphere CENTRE + look-at target. Honours the optional override
+        # so board rotation doesn't shift the hemisphere.
         target_world = _hemi_centre_world()
 
-        # Diagnostic: confirm the board CENTER is reachable per waldo-commander's
-        # workspace hull. If not, the orchestrator will struggle to find any
-        # valid hemisphere candidates.
+        # Diagnostic — flag when the board centre is outside the hull.
         _ensure_workspace_envelope()
         max_reach = _state.get("envelope_max_reach")
         if max_reach is not None:
@@ -275,32 +241,14 @@ def _calibration_thread() -> None:
                 max_reach,
             )
 
-        # Hull-aware + floor-aware + collision-aware + occlusion-aware +
-        # trajectory-aware + farthest-first PoseGenerator.
-        # Filters layered on top of the base PoseGenerator:
-        #   1. Workspace-hull check on flange position.
-        #   2. Floor-clipping check: gripper fingertips above floor.
-        #   3. Self-collision: gripper/bracket vs arm links at the destination pose.
-        #   4. Camera occlusion: line-of-sight from camera to board NOT blocked
-        #      by any robot link. Catches "robot body in front of the lens" poses
-        #      that aren't collisions but produce useless calibration captures.
-        #   5. Greedy farthest-first selection (spatial spread).
-        #   6. Trajectory self-collision: each move from the previous accepted
-        #      candidate to this one must not pass through self-collision at
-        #      any sampled point along the joint-space line. Plus a check from
-        #      HOME → first candidate. Catches the "fingertips clip mid-move"
-        #      case the user reported.
-        FLOOR_Z_MIN_M = 0.005  # 5 mm safety margin above the workbench
-        TCP_OFFSET_FLANGE = np.array([0.0, 0.0, -0.105, 1.0])  # SSG-48 TCP point in flange frame
+        # PoseGenerator filter pipeline (see HullFilteredPoseGenerator
+        # below): hull → floor → self-collision → occlusion → viewing
+        # angle → farthest-first → trajectory self-collision.
+        FLOOR_Z_MIN_M = 0.005  # safety margin above the workbench
+        TCP_OFFSET_FLANGE = np.array([0.0, 0.0, -0.105, 1.0])  # SSG-48 TCP
 
-        # Build collision manager + occlusion meshes once (loads 7 link
-        # meshes + gripper for collision; 7 link meshes for occlusion).
-        # The tablet primitive is placed at the current _T_BOARD2BASE
-        # so the robot won't drive into the physical ChArUco display.
-        # Master gate: the bottom-right Settings tab's "Mesh collision
-        # check" toggle (default True) overrides the calibration-only
-        # ``enable_self_collision_check`` setting — when the master is
-        # off, no collision filtering happens during pose generation.
+        # Built once. ``_mesh_collision_enabled`` is the Settings master
+        # gate; ``enable_self_collision_check`` only applies inside it.
         from .collision import _mesh_collision_enabled  # noqa: PLC0415
 
         _collision_active = (
@@ -322,19 +270,10 @@ def _calibration_thread() -> None:
                 kwargs["max_count"] = max_count * 5
 
                 # Multi-target relaxed look-at — DEFERRED_FEATURES.md §6.
-                # Build the per-pass aim points in board-local UV ∈ [0, 1]²,
-                # convert to world frame, pass to super().generate() as
-                # `look_at_targets`. The hemisphere CENTRE stays anchored on
-                # self.target_world (the value of _hemi_centre_world() at
-                # construction time — possibly the override); only the
-                # look-at aim varies per pass.
-                #
-                # When settings.hemi_centre_override_m is set, self.target_world is
-                # the override (a fixed workable-space anchor). The aim
-                # points STILL come from _T_BOARD2BASE — i.e. cameras aim
-                # at the actual board, not the override. Single-target mode
-                # uses the centre offset (0.5, 0.5) explicitly so the same
-                # invariant holds with or without multi-target.
+                # Hemisphere CENTRE stays at ``self.target_world`` (may be
+                # the override); aim points always derive from
+                # ``_T_BOARD2BASE``. Single-target uses (0.5, 0.5) so the
+                # invariant holds either way.
                 cfg = current_board_config()
                 w_m_b = cfg.squares_x * cfg.square_length
                 h_m_b = cfg.squares_y * cfg.square_length
@@ -406,13 +345,9 @@ def _calibration_thread() -> None:
                             pre - len(cands), pre,
                         )
 
-                # 4. Camera-occlusion filter — multi-ray sampling across the
-                # board face. Cast a ray from the camera position to each of
-                # _OCCLUSION_BOARD_SAMPLES_LOCAL (default centre + 4 corners,
-                # in board-local UV ∈ [0, 1]²). If MORE than
-                # _OCCLUSION_MAX_BLOCKED rays hit a robot link before reaching
-                # the target, reject the pose. Catches partial-frame occlusion
-                # (e.g. arm body blocks the side of the FOV but not the centre).
+                # 4. Camera-occlusion filter — multi-ray sampling so a
+                # robot link blocking a quadrant of the FOV still rejects
+                # even when the centre is clear.
                 if occlusion_meshes is not None:
                     cold_T = self.mount.T_cam2flange
                     cfg = current_board_config()
@@ -449,13 +384,8 @@ def _calibration_thread() -> None:
                             len(_OCCLUSION_BOARD_SAMPLES_LOCAL),
                         )
 
-                # 4.5. Viewing-angle filter — reject candidates whose camera
-                # optical axis is more than _MAX_CAM_BOARD_ANGLE_DEG off the
-                # board surface normal. At extreme angles the board projects
-                # as a thin sliver, ChArUco corner detection works but reproj
-                # error is high and the calibration's effective resolution
-                # drops. Threshold defaults to 65° — admits the bottom of the
-                # configured 25°-elevation hemisphere, rejects anything worse.
+                # 4.5. Viewing-angle filter — reject when the optical
+                # axis is more than the threshold off the board normal.
                 if _MAX_CAM_BOARD_ANGLE_DEG < 90.0:
                     cold_T = self.mount.T_cam2flange
                     board_z_world = _T_BOARD2BASE[:3, 2]
@@ -468,9 +398,8 @@ def _calibration_thread() -> None:
                         T_flange2base = np.asarray(c.flange_pose, dtype=np.float64)
                         T_cam2base = T_flange2base @ cold_T
                         cam_z_world = T_cam2base[:3, 2]
-                        # Use abs() — board normal could point either way
-                        # depending on board placement; we care about the
-                        # angle, not the orientation.
+                        # abs() — board normal orientation is incidental;
+                        # we care about the angle.
                         if abs(float(cam_z_world @ board_z_world)) >= cos_threshold:
                             survivors.append(c)
                     cands = survivors
@@ -490,14 +419,9 @@ def _calibration_thread() -> None:
                     )
                     logger.info("farthest-first selected %d well-spread candidates", len(cands))
 
-                # 6. Trajectory self-collision (pairwise). Each successive
-                # move from the previously-selected candidate to the next must
-                # not pass through self-collision at any sampled point along
-                # the joint-space line. The FIRST candidate is accepted
-                # unconditionally — the orchestrator will be coming from the
-                # last bootstrap pose at that point, not from HOME, and we
-                # don't know where bootstrap landed (it'd over-reject if we
-                # assumed HOME).
+                # 6. Pairwise trajectory self-collision. First candidate
+                # accepted unconditionally — bootstrap's final pose, not
+                # HOME, is the entry config and is unknown here.
                 if collision_mgr_pair is not None and len(cands) > 0:
                     coll_mgr, adjacent_pairs, _ = collision_mgr_pair
                     safe: list = [cands[0]]
@@ -520,50 +444,17 @@ def _calibration_thread() -> None:
 
                 return cands, stats
 
-        # NB: prior to this commit we monkey-patched
-        # ``parol6_vision.calibration.orchestrator.PoseGenerator`` here so
-        # the orchestrator's main hemisphere pass would use our filtered
-        # subclass. The orchestrator now accepts a ``pose_generator_factory``
-        # in its config, so the subclass is injected explicitly via
-        # ``OrchestratorConfig(pose_generator_factory=...)`` further down.
-
-        # NB: prior to this commit we monkey-patched
-        # ``parol6_vision.calibration.refinement.board_position_from_sample``
-        # AND ``parol6_vision.calibration.pose_generator.look_at_pose`` here.
-        # Both are now upstreamed — refinement takes a ``board: BoardConfig``
-        # kwarg, and the pose generator's ``generate()`` takes
-        # ``look_at_targets=[...]`` to drive multi-target relaxed look-at.
-        # Zero monkey-patches remain in this thread.
-
-        # Hemisphere params for the bootstrap pass and the main pass.
-        #
-        # MAIN pass: drives off the user-facing _HEMI_* tunables. Wide range,
-        # may include low-elevation / close-distance poses where part of the
-        # board can't fit in the FOV — that's fine, the orchestrator only
-        # needs PARTIAL board visibility (≥6 corners) to count a sample.
-        #
-        # BOOTSTRAP pass: uses CONSERVATIVE bounds that are independent of
-        # the user-facing tunables. The bootstrap's job is to localise the
-        # board reliably (it only takes a handful of seed poses), so we want
-        # poses where the entire 210×150 mm board comfortably fits in the
-        # 640×480 FOV (≥0.22 m at fx=fy=615 gives ~230 mm horizontal coverage,
-        # so the board fits with margin). Mid-range elevations (30–55°) avoid
-        # extreme foreshortening that hurts ChArUco corner detection.
-        #
-        # Both grids are DENSE because tilt_x=180 forces wrist-flip
-        # configurations and only ~5% of grid points pass IK.
+        # Hemisphere params. The MAIN pass drives the user tunables (may
+        # include partial-board views; orchestrator only needs ≥6 corners).
+        # The BOOTSTRAP pass uses conservative bounds so the whole board
+        # fits comfortably in FOV for reliable initial localisation. Both
+        # grids are dense — tilt_x=180 wrist-flip drops IK pass rate to ~5%.
         d_min, d_max = settings.hemi_distance_range_m
         ev_min, ev_max = settings.hemi_elevation_range_deg
         az_world_range = _hemi_azimuth_world_range_deg()
         if _CALIBRATION_USE_CONTINUOUS:
-            # Sobol low-discrepancy sampling — same volume as the discrete
-            # grids below, but provably uniform 3D coverage. Avoids the
-            # "ring" artefacts where discrete grids put grid corners at
-            # specific azimuths and IK feasibility correlates with those
-            # corners; survivors come from genuine reachability rather
-            # than grid alignment. Bootstrap's elevation range is bumped
-            # up (45° lower bound, 88° upper) to match the dense bootstrap
-            # config's intent of capturing mostly-overhead views.
+            # Sobol — same volume, uniform 3D coverage. Discrete grids
+            # produce "rings" when IK feasibility correlates with axes.
             bootstrap_params = HemisphereParams(
                 n_candidates=_BOOTSTRAP_N_CANDIDATES,
                 distance_range_m=(0.22, 0.34),
@@ -581,14 +472,11 @@ def _calibration_thread() -> None:
                 max_joint_change_deg=180.0,
             )
         else:
-            # Legacy discrete grids — kept for bisection if continuous
-            # ever regresses. Both grids are dense because tilt_x=180
-            # forces wrist-flip configurations and only ~15% of grid
-            # points pass IK.
+            # Legacy discrete grids — bisection fallback.
             bootstrap_params = HemisphereParams(
                 distances_m=(0.22, 0.26, 0.30, 0.34),
                 elevations_deg=(30.0, 45.0, 60.0, 75.0, 88.0),
-                azimuth_counts=(16, 14, 12, 10, 8),  # 60 az per distance × 4 = 240
+                azimuth_counts=(16, 14, 12, 10, 8),
                 azimuth_range_deg=az_world_range,
                 workspace_xy_max_m=0.55,
                 max_joint_change_deg=180.0,
@@ -596,7 +484,7 @@ def _calibration_thread() -> None:
             main_params = HemisphereParams(
                 distances_m=tuple(np.linspace(d_min, d_max, 6).tolist()),
                 elevations_deg=tuple(np.linspace(ev_min, ev_max, 6).tolist()),
-                azimuth_counts=(20, 16, 12, 9, 6, 4),  # 67 az per distance × 6 = 402
+                azimuth_counts=(20, 16, 12, 9, 6, 4),
                 azimuth_range_deg=az_world_range,
                 max_joint_change_deg=180.0,
                 workspace_xy_max_m=0.55,
@@ -608,21 +496,15 @@ def _calibration_thread() -> None:
             target_world=target_world,
             params=bootstrap_params,
         )
-        # 16 bootstrap candidates instead of 8 — at observed ~25-50% detection
-        # rate, 8 sometimes gives <4 successful detections (orchestrator's
-        # consensus threshold). 16 gives ~4-8 detections, well above threshold.
-        # Cost: a few extra seconds of robot motion at calibration start.
+        # 16 candidates — at ~25-50% detection rate, 8 sometimes fell
+        # below the orchestrator's 4-detection consensus threshold.
         bcands, _ = bg.generate(max_count=16)
         boot_cfg = tuple(
             tuple(np.degrees(c.joint_angles_rad).tolist()) for c in bcands
         )
 
-        # Pose-generator factory: injects our HullFilteredPoseGenerator
-        # subclass into the orchestrator's `_collect_hemisphere` so the same
-        # six-stage filter pipeline (hull, floor, self-collision, occlusion,
-        # farthest-first, trajectory) runs in both the bootstrap and main
-        # passes. Replaces the previous monkey-patch on
-        # `orchestrator.PoseGenerator`.
+        # Factory injecting the filter-pipeline subclass into the
+        # orchestrator's bootstrap and main passes.
         def _hull_filtered_factory(robot, mount, target_world, params):
             return HullFilteredPoseGenerator(
                 robot=robot,
@@ -631,11 +513,9 @@ def _calibration_thread() -> None:
                 params=params,
             )
 
-        # Sample count trades calibration quality for wallclock time; 12 is
-        # enough for a watchable demo. Settle time is short in sim (the
-        # controller's motion physics is already discrete) but bumped on
-        # real hardware so PAROL6's belt-driven joints + camera bracket
-        # flex have time to fully stabilise before each capture.
+        # 12 samples — enough for a watchable demo without long wallclock.
+        # Sim settle is short (discrete-time physics); real hardware needs
+        # longer for belt + bracket flex to die out.
         settle_s = _SETTLE_TIME_SIM_S if is_sim_mode else _SETTLE_TIME_REAL_S
         config = OrchestratorConfig(
             bootstrap_joint_configs_deg=boot_cfg,
@@ -660,9 +540,8 @@ def _calibration_thread() -> None:
         if output.failed:
             _post_status(f"Calibration FAILED: {output.failure_reason}")
         else:
-            # In sim mode we have a known perturbation as ground truth
-            # so we can report position error directly. Real hardware
-            # has no ground truth; report just the calibrated mount.
+            # Sim has a known perturbation as ground truth → report
+            # error; real hardware reports the calibrated mount.
             if is_sim_mode and ground_truth_mount is not None:
                 gt = ground_truth_mount.T_cam2flange[:3, 3]
                 cal = output.mount.T_cam2flange[:3, 3]
@@ -681,25 +560,17 @@ def _calibration_thread() -> None:
                 )
             _state["calibrated_mount"] = output.mount
 
-            # Persist the calibrated mount onto the active custom tool's
-            # config (when applicable). The next time the user activates
-            # this tool, settings.get() reads the calibrated values via
-            # the per-tool override layer — calibration result follows
-            # the gripper instead of being a global one-shot.
+            # Persist the calibrated mount onto the active custom tool so
+            # the next activation reads it through the per-tool override.
             try:
                 from . import custom_tools as _calib_ct  # noqa: PLC0415
                 from scipy.spatial.transform import Rotation as _SciR  # noqa: PLC0415
 
                 T_cf = output.mount.T_cam2flange
                 translate_mm = tuple(float(v) * 1000.0 for v in T_cf[:3, 3])
-                # CameraMount.from_eyeball_estimate reconstructs the
-                # rotation as R = Rz @ Ry @ Rx (extrinsic xyz =
-                # scipy lowercase "xyz"). Decomposing with uppercase
-                # "XYZ" gives intrinsic XYZ angles (R = Rx @ Ry @ Rz)
-                # which do NOT round-trip through from_eyeball_estimate
-                # for non-trivial angles — silently corrupting any
-                # persisted tilt across restarts. Use lowercase "xyz"
-                # to match.
+                # Use lowercase "xyz" — ``from_eyeball_estimate``
+                # reconstructs R = Rz @ Ry @ Rx; uppercase "XYZ" would
+                # silently corrupt the persisted tilt across restarts.
                 tilt_deg = tuple(
                     float(v) for v in _SciR.from_matrix(T_cf[:3, :3])
                     .as_euler("xyz", degrees=True)
@@ -714,23 +585,12 @@ def _calibration_thread() -> None:
                     _e,
                 )
 
-            # Apply the calibration's refined board FULL POSE (translation
-            # AND rotation) back to the GUI's ``_T_BOARD2BASE`` so the
-            # board overlay reflects what the calibration's running
-            # estimator actually converged on.
-            #
-            # The estimator integrates the bootstrap RANSAC inliers AND
-            # every subsequent hemisphere sample, tracking both 3D
-            # position (Kalman-weighted updates) and orientation
-            # (quaternion-averaged with a 45° outlier gate for mirror-
-            # flipped solvePnP samples). Pass 2 samples are back-projected
-            # through the refined first_mount, so the final pose is
-            # significantly tighter than localise can produce.
-            #
-            # The board's ORIGIN (corner-anchored, OpenCV ChArUco convention)
-            # is what _T_BOARD2BASE stores; the estimator tracks the board
-            # CENTRE. To convert: origin = centre - R @ center_local where
-            # center_local is the half-board offset in board-local frame.
+            # Apply the estimator's refined full pose to ``_T_BOARD2BASE``
+            # — tighter than localise can produce because it integrates
+            # bootstrap inliers + every hemisphere sample. The estimator
+            # tracks the board CENTRE; ``_T_BOARD2BASE`` stores the
+            # corner-anchored origin, so we convert via the half-board
+            # offset in board-local frame.
             try:
                 if output.board_pose_world is not None:
                     new_pose = np.asarray(
@@ -748,7 +608,7 @@ def _calibration_thread() -> None:
                         ],
                         dtype=np.float64,
                     )
-                    # Origin in world = centre - R @ centre-in-board-local
+                    # World origin = centre - R @ centre-in-board-local.
                     new_origin = new_centre - new_R @ center_local
 
                     old_R = _T_BOARD2BASE[:3, :3].copy()
@@ -758,23 +618,20 @@ def _calibration_thread() -> None:
                     pos_shift_mm = float(
                         np.linalg.norm(new_centre - old_centre)
                     ) * 1000.0
-                    # Rotation delta (geodesic angle).
+                    # Geodesic rotation delta.
                     R_diff = new_R @ old_R.T
                     cos_theta = float(
                         np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
                     )
                     rot_shift_deg = float(np.degrees(np.arccos(cos_theta)))
 
-                    # Apply unconditionally on calibration success — the
-                    # estimator's data is much stronger evidence than the
-                    # localise-set _T_BOARD2BASE. Tiny shifts still get
-                    # applied; we log at debug-level when shift is small.
+                    # Apply unconditionally on success — estimator data is
+                    # stronger evidence than the localise-set pose.
                     new_T = np.eye(4, dtype=np.float64)
                     new_T[:3, :3] = new_R
                     new_T[:3, 3] = new_origin
                     _T_BOARD2BASE[:] = new_T
-                    # Persist for browser-refresh + waldo-commander-restart
-                    # restoration (mode-tagged).
+                    # Persist (mode-tagged) for refresh + restart restoration.
                     save_recovered_board_pose(new_T)
 
                     with _state_lock:
@@ -806,13 +663,9 @@ def _calibration_thread() -> None:
                     _e,
                 )
 
-            # Post-calibration: drive to a "view board" pose using the
-            # freshly-calibrated mount (much more accurate than cold-start).
-            # Camera ends up looking straight down at the board centre from
-            # ~32 cm — the entire board fits comfortably in the FOV (which
-            # is ~33 cm wide at that distance), giving the user a clean
-            # visual confirmation of the calibration result. If no overhead
-            # pose is reachable for whatever reason, fall back to home.
+            # Post-cal courtesy move: drive to an overhead view-board
+            # pose with the calibrated mount. Falls back to home() when
+            # no candidate is reachable.
             try:
                 from parol6_vision.calibration.view_pose import (  # noqa: PLC0415
                     DEFAULT_MARGIN_PX as _VIEW_MARGIN_PX,
@@ -841,14 +694,10 @@ def _calibration_thread() -> None:
                     width=int(settings.intr_width), height=int(settings.intr_height),
                     dist_coeffs=np.zeros(5, dtype=np.float64),
                 )
-                # Hemisphere range derived from intrinsics + board geometry —
-                # the score function picks the candidate that best frames the
-                # board (entire-board-in-frame is the priority, vertical
-                # overhead-ness + target-fill quality break ties). Wide range
-                # gives the pose generator IK headroom; PAROL6 typically can
-                # only reach the near end of the perfect-fit shell, so the
-                # "closest-to-fit" fallback in the scoring is what usually
-                # gets selected on this arm.
+                # Range derived from intrinsics + board geometry. Wide so
+                # the pose generator has IK headroom; PAROL6 usually only
+                # reaches the near end so the scoring fallback picks
+                # "closest-to-fit".
                 d_min, d_max = view_distance_range(view_intrinsics, _view_cfg)
                 view_params = HemisphereParams(
                     n_candidates=512,
@@ -893,10 +742,7 @@ def _calibration_thread() -> None:
                         best_info["distance_m"] * 1000,
                         d_min * 1000, d_max * 1000, len(view_cands),
                     )
-                    # Honour STOP between calibration end and the view-pose
-                    # move: the user may have hit STOP near the end of the
-                    # last sample's motion; calibration still succeeds but
-                    # the post-cal courtesy move shouldn't fire.
+                    # Honour STOP between calibration end and view move.
                     if _state.get("stop_requested"):
                         _post_status(
                             "Calibration done; STOP pressed, skipping "
@@ -906,11 +752,8 @@ def _calibration_thread() -> None:
                         view_angles_deg = list(
                             np.degrees(best_view.joint_angles_rad).tolist()
                         )
-                        # Pre-flight self/board/tablet collision check.
-                        # The view-pose generator above used PoseGenerator
-                        # (not the hull-filtered subclass) so candidates
-                        # are NOT collision-screened. Run the same check
-                        # hover and pose-popup use.
+                        # The view-pose generator uses the unfiltered
+                        # PoseGenerator — re-run the standard check here.
                         view_safe = True
                         try:
                             from .collision import (  # noqa: PLC0415
@@ -921,10 +764,8 @@ def _calibration_thread() -> None:
                             )
 
                             current_q_deg = list(_rs.angles.deg[:6])
-                            # gripper_only=True: view_angles_deg is a
-                            # post-IK joint config from PoseGenerator;
-                            # arm self-collision is the IK solver's
-                            # job (commit d609024).
+                            # gripper_only=True — post-IK config; arm
+                            # self-collision is the IK solver's job.
                             check = validate_joint_trajectory(
                                 current_q_deg, view_angles_deg,
                                 gripper_only=True,
@@ -966,11 +807,7 @@ def _calibration_thread() -> None:
                                         robot_state as _rs,
                                     )
                                     current_q_deg = list(_rs.angles.deg[:6])
-                                    # gripper_only=True: HOME_ANGLES_DEG
-                                    # is a fixed valid config; per
-                                    # d609024 design intent, arm
-                                    # self-collision is the IK
-                                    # solver's job.
+                                    # gripper_only=True — HOME is fixed-valid.
                                     check = validate_joint_trajectory(
                                         current_q_deg, list(HOME_ANGLES_DEG),
                                         gripper_only=True,
@@ -1020,10 +857,7 @@ def _calibration_thread() -> None:
                                 robot_state as _rs,
                             )
                             current_q_deg = list(_rs.angles.deg[:6])
-                            # gripper_only=True: HOME_ANGLES_DEG is
-                            # a fixed valid config; arm self-
-                            # collision is the IK solver's job
-                            # (d609024).
+                            # gripper_only=True — HOME is fixed-valid.
                             check = validate_joint_trajectory(
                                 current_q_deg, list(HOME_ANGLES_DEG),
                                 gripper_only=True,
@@ -1056,10 +890,8 @@ def _calibration_thread() -> None:
                 )
 
     except Exception as e:  # noqa: BLE001
-        # The orchestrator's own `finally` calls set_tcp_offset to restore the
-        # previous offset; if the user pressed STOP partway through, the
-        # controller is halted and that call raises MotionError. Treat
-        # exceptions during a stop request as a clean stop, not a crash.
+        # The orchestrator's finally calls set_tcp_offset, which raises
+        # MotionError after a STOP — treat that case as a clean stop.
         if _state.get("stop_requested"):
             logger.info("Calibration stopped by user (caught %s: %s)",
                         type(e).__name__, e)
@@ -1068,7 +900,7 @@ def _calibration_thread() -> None:
             logger.exception("Calibration thread crashed")
             _post_status(f"ERROR: {e}")
     finally:
-        # Stop the RealSenseCamera if we started one in real-hardware mode.
+        # Real-mode camera cleanup.
         real_cam = _state.get("real_camera")
         if real_cam is not None:
             try:
@@ -1076,16 +908,14 @@ def _calibration_thread() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning("RealSenseCamera stop failed: %s", e)
             _state["real_camera"] = None
-        # Close the controller's UDP socket + inner asyncio loop so
-        # they don't leak across runs. ``raw_client`` is None when
-        # init failed before its construction.
+        # Close the controller socket + inner loop so they don't leak
+        # across runs. None when init failed before construction.
         if raw_client is not None:
             try:
                 raw_client.close()
             except Exception as e:  # noqa: BLE001
                 logger.debug("Calibration: RobotClient.close raised: %s", e)
-        # Drop the panel's reference to the now-closed client so the
-        # STOP button can't dispatch halt() through a dead socket.
+        # Drop the panel's handle so STOP can't fire through a dead socket.
         if _state.get("client") is raw_client:
             _state["client"] = None
         _state["is_running"] = False

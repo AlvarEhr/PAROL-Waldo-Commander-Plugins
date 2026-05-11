@@ -13,17 +13,11 @@ logger = logging.getLogger(__name__)
 
 
 def _build_occlusion_mesh() -> Any | None:
-    """Load all PAROL6 LINK meshes (NOT the gripper) into a single combined
-    trimesh for line-of-sight occlusion queries. The gripper is excluded
-    because it sits between the camera and... well, IS where the camera is
-    mounted, so it can't occlude the camera's own view of the scene.
+    """Load PAROL6 link meshes for line-of-sight occlusion queries. Gripper
+    is excluded — it carries the camera and can't occlude its own view.
 
-    Verifies trimesh's ray-casting is functional before returning. Trimesh
-    requires the ``rtree`` package for the BVH used by
-    ``ray.intersects_location``; without rtree, every ray query raises
-    ``ModuleNotFoundError`` and the occlusion filter silently no-ops.
-    Returns None and logs a loud warning when rtree is missing — better
-    to fail open with notice than fail silently.
+    Returns None (with a loud warning) when trimesh's ray BVH is unavailable
+    so the occlusion filter fails open with notice rather than silently.
     """
     try:
         import trimesh  # noqa: PLC0415
@@ -43,10 +37,8 @@ def _build_occlusion_mesh() -> Any | None:
         except Exception as e:  # noqa: BLE001
             logger.warning("occlusion mesh load failed for %s: %s", path, e)
 
-    # Sanity-check: a single ray trace through the first mesh's bounding
-    # volume. If this raises ModuleNotFoundError on rtree, the rest of
-    # the occlusion filter would silently no-op for every candidate, so
-    # bail loudly here instead.
+    # One-shot ray trace to surface ``rtree`` missing before per-candidate
+    # failures silently no-op the whole filter.
     if meshes_with_link:
         try:
             first_mesh = meshes_with_link[0][1]
@@ -85,31 +77,20 @@ def _camera_occlusion_count(
     *,
     early_termination_after: int | None = None,
 ) -> int:
-    """Count how many rays from the camera to each board sample point pass
-    through a robot link mesh.
+    """Count rays from the camera to each target point blocked by a link mesh.
 
-    For each target point, we cast a ray from ``camera_pos_world`` toward
-    that point and check intersection against each robot link mesh in its
-    local frame (cheaper than transforming triangles into world frame).
-    Per-link transforms + their inverses are computed ONCE per pose and
-    reused across all target rays.
+    Ray tests run in each link's local frame (cheaper than transforming
+    triangles). Per-link transforms and their inverses are computed once.
 
     Args:
-        link_meshes: List of (link_name, trimesh.Trimesh) for the robot
-            arm links. The gripper is intentionally NOT in this list — it
-            holds the camera, so it can't occlude the camera's view of the
-            scene.
+        link_meshes: ``(link_name, trimesh.Trimesh)`` for arm links only.
         joint_angles_rad: Current joint configuration.
         camera_pos_world: (3,) world-frame camera optical centre.
-        target_points_world: Iterable of (3,) world points to test
-            line-of-sight against. Typical use: the board centre + 4 corners.
-        early_termination_after: If set, return as soon as the blocked
-            count strictly EXCEEDS this number (saves work when the caller
-            only cares whether it's "too many").
+        target_points_world: World points to test (e.g. board centre + corners).
+        early_termination_after: Return as soon as blocked count exceeds this.
 
     Returns:
-        Count of rays blocked by any robot link. ``0`` means full
-        line-of-sight to every target point.
+        Number of rays blocked. ``0`` means full line-of-sight.
     """
     from parol6_vision.sim.robot_kinematics import link_poses  # noqa: PLC0415
     poses = link_poses(np.asarray(joint_angles_rad, dtype=np.float64))
@@ -122,7 +103,6 @@ def _camera_occlusion_count(
         "L5": poses.l5,
         "L6": poses.l6_visual,
     }
-    # Pre-invert each link transform once — saves a 4×4 inverse per ray.
     inv_transforms = {
         k: np.linalg.inv(v) for k, v in link_transforms.items()
     }
@@ -149,12 +129,8 @@ def _camera_occlusion_count(
                     multiple_hits=False,
                 )
             except (ValueError, RuntimeError, IndexError) as e:
-                # Numerical / degenerate-ray cases — skip this link only.
-                # ModuleNotFoundError (rtree missing) and other "this is
-                # broken at the package level" errors are caught by the
-                # one-shot sanity check in _build_occlusion_mesh; if we
-                # reach here for one, it's a per-call quirk worth a debug
-                # log but not silent skip.
+                # Numerical / degenerate-ray case — skip this link only;
+                # package-level failures are caught upstream.
                 logger.debug(
                     "ray.intersects_location skipped for %s: %s: %s",
                     link_name, type(e).__name__, e,
@@ -162,8 +138,7 @@ def _camera_occlusion_count(
                 continue
             if len(locations) == 0:
                 continue
-            # Distance from ray origin (camera) to first intersection in LOCAL frame
-            # is the same as in world frame (rigid transforms preserve distances).
+            # Local-frame distance equals world-frame distance (rigid transform).
             intersection_dist = float(np.linalg.norm(locations[0] - ray_origin_local))
             if intersection_dist < target_distance - safety_margin_m:
                 ray_blocked = True

@@ -45,43 +45,35 @@ def _raycast_frustum_footprint(
     meshes: dict[str, Any],
     default_depth_m: float,
 ) -> tuple[list[tuple[float, float, float]], tuple[float, float, float], tuple[float, float, float]]:
-    """Cast rays from the camera apex against the static scene primitives
-    (``VISUAL_FLOOR`` and ``VISUAL_TABLET`` if present in ``meshes``) and
-    return where each ray hits.
+    """Cast rays from the camera apex against static scene primitives
+    (``VISUAL_FLOOR`` / ``VISUAL_TABLET`` in ``meshes``) and return hits.
 
-    The arm links and gripper meshes are intentionally NOT raycast against:
-    the camera is mounted on the gripper looking outward, so it can't see
-    its own arm in any normal configuration. If a future mount geometry
-    points the camera back at itself, extend ``meshes`` with the relevant
-    link entries — they're already populated by ``_build_collision_manager``.
+    Arm / gripper meshes are skipped — the camera is mounted on the
+    gripper looking outward and can't see its own arm.
 
-    Returns ``(footprint_hits, camera_world_pos, center_hit)`` — all in
-    world frame, all metres. ``footprint_hits`` is the four (or more)
-    perimeter samples interpolated along the far-plane edges; ``center_hit``
-    is the optical-axis intersection used by the centerline rendering.
-    Rays that don't hit anything within ``default_depth_m`` terminate at
-    that depth so the visualisation stays bounded."""
+    Returns ``(footprint_hits, camera_world_pos, center_hit)`` in world
+    metres. Rays that miss terminate at ``default_depth_m`` for bounded viz.
+    """
     T_cam2base = T_flange2base @ T_cam2flange
     cam_pos_world = T_cam2base[:3, 3]
 
     # 4 far corners in camera frame, at the default maximum depth
     corners_cam = _frustum_corners_local(default_depth_m)[1:]
 
-    # Generate points along the edges of the far plane to handle hitting multiple surfaces smoothly
+    # Edge points along the far plane — 10 segments × 4 edges = 40 rays,
+    # plus one centre ray for the optical axis line.
     edge_points = []
-    num_segments = 10  # 10 segments per edge = 40 rays total for the perimeter
+    num_segments = 10
     for i in range(4):
         p_start = np.array(corners_cam[i])
         p_end = np.array(corners_cam[(i + 1) % 4])
         for t in np.linspace(0, 1, num_segments, endpoint=False):
             edge_points.append(p_start * (1 - t) + p_end * t)
 
-    # Add the center of the far plane for the optical axis line
     edge_points.append(np.array([0.0, 0.0, default_depth_m]))
 
     num_rays = len(edge_points)
 
-    # Rays in world frame
     ray_origins = np.tile(cam_pos_world, (num_rays, 1))
     ray_directions = []
     for c in edge_points:
@@ -89,25 +81,21 @@ def _raycast_frustum_footprint(
         ray_directions.append(c_world - cam_pos_world)
     ray_directions = np.array(ray_directions)
 
-    # Norms is the distance from apex to the default_depth plane for each corner/point
     norms = np.linalg.norm(ray_directions, axis=1, keepdims=True)
-    # Avoid division by zero
     norms[norms < 1e-6] = 1.0
     ray_directions /= norms
 
     best_t = np.full(num_rays, np.inf)
 
-    # We check against static scene elements (floor and tablet).
+    # The mesh dict already holds world-frame transforms.
     for name, mesh in meshes.items():
         if name not in ("VISUAL_FLOOR", "VISUAL_TABLET"):
             continue
 
-        # These are already transformed to world space in _build_collision_manager
         T_obj2base = np.eye(4, dtype=np.float64)
 
         T_base2obj = np.linalg.inv(T_obj2base)
 
-        # Transform rays to object local frame
         origins_local = (T_base2obj[:3, :3] @ ray_origins.T + T_base2obj[:3, 3:4]).T
         dirs_local = (T_base2obj[:3, :3] @ ray_directions.T).T
 
@@ -127,10 +115,9 @@ def _raycast_frustum_footprint(
     hits_world = []
     for i in range(num_rays):
         t = min(best_t[i], float(norms[i][0]))
-        # Pull back slightly to avoid Z-fighting with surfaces,
-        # but only if we actually hit something (not at max depth)
+        # 2 mm pull-back avoids Z-fighting; only when we actually hit.
         if best_t[i] < np.inf:
-            t = max(0.0, t - 0.002)  # 2mm offset towards the camera
+            t = max(0.0, t - 0.002)
         hit_world = ray_origins[i] + ray_directions[i] * t
         hits_world.append(tuple(hit_world.tolist()))
 
@@ -143,19 +130,10 @@ def _raycast_frustum_footprint(
 def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> list[Any]:
     """Add frustum lines inside ``scene_group`` (parented to tcp_anchor).
 
-    Two cones are drawn:
-
-    * The **near frustum** at depth ``_FRUSTUM_DEPTH_M`` — bright red, with
-      the full apex-to-corner + far-plane-rectangle line set. This is the
-      "where the camera is looking right now" indicator.
-    * Optionally a **far frustum** at depth ``_FRUSTUM_FAR_DEPTH_M`` (set
-      to ``None`` to disable) — drawn fainter, no apex-to-corner lines, just
-      the far rectangle and four edge-extension lines from the near corners
-      to the far corners, giving a "laser pointer" projection so you can see
-      where the FOV lands on the floor / board without dynamic recomputation.
-
-    Frustum corners are transformed by ``T_cam2flange`` so the apex sits at
-    the camera optical centre relative to the flange.
+    Draws the near cone at ``_FRUSTUM_DEPTH_M`` (bright red, full apex +
+    far-plane lines). The optional far cone at ``_FRUSTUM_FAR_DEPTH_M``
+    extends as a "laser pointer" — fainter, far rectangle + edge extensions
+    only. Corners are pre-transformed by ``T_cam2flange``.
     """
     R = T_cam2flange[:3, :3]
     t = T_cam2flange[:3, 3]
@@ -163,14 +141,12 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
     def to_flange(corners: list[tuple[float, float, float]]) -> list[tuple[float, float, float]]:
         return [tuple((R @ np.asarray(c) + t).tolist()) for c in corners]
 
-    # Load workspace envelope (lazy, cached). Used downstream for diagnostic
-    # reachability checks of calibration candidates.
+    # Lazy-cache the workspace envelope for downstream reachability checks.
     _ensure_workspace_envelope()
 
     near = to_flange(_frustum_corners_local(_FRUSTUM_DEPTH_M))
 
-    # Diagnostic: log the actual far-plane span in flange frame so we can
-    # confirm the tilt rotation is taking effect at the geometry level.
+    # Diagnostic — confirms the tilt is taking effect at geometry level.
     far_corners = near[1:]
     fx_span = max(c[0] for c in far_corners) - min(c[0] for c in far_corners)
     fy_span = max(c[1] for c in far_corners) - min(c[1] for c in far_corners)
@@ -183,9 +159,8 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
     objects: list[Any] = []
     with scene_group:
-        # Wrap the near-cone lines in their own sub-group so the panel's
-        # "Fixed frustum" toggle can hide/show the whole bundle at runtime
-        # via a single `.visible(False)` call instead of iterating eight lines.
+        # Sub-group so the "Fixed frustum" toggle can hide all eight lines
+        # with a single `.visible(False)`.
         near_cone_group = (
             ui.scene.group()
             .with_name("calib:near_cone")
@@ -193,8 +168,7 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
         )
         _state["near_cone_group"] = near_cone_group
         with near_cone_group:
-            # Apex-to-corner rays (bright pink) + far-plane rectangle
-            # (slightly darker pink).
+            # Apex-to-corner rays + far-plane rectangle.
             for i in range(1, 5):
                 objects.append(
                     ui.scene.line(list(near[0]), list(near[i])).material("#ff8080")
@@ -208,16 +182,9 @@ def _populate_frustum(scene_group: Any, T_cam2flange: NDArray[np.float64]) -> li
 
 
 def update_frustum(T_cam2flange: NDArray[np.float64]) -> None:
-    """Replace frustum lines after a mount update.
-
-    Deletes the entire ``near_cone_group`` (not just its line children),
-    then rebuilds. Deleting only the lines leaves an empty group behind
-    in the three.js scene tree; on browsers that batch the websocket
-    diffs lazily, the OLD lines may not actually disappear visually
-    even after the line ``delete()`` calls succeed server-side, so
-    switching tools showed both the OLD tool's frustum AND the new
-    one's. Deleting the whole group forces the browser to drop every
-    line at once.
+    """Replace frustum lines after a mount update. Deletes the whole
+    ``near_cone_group`` (not just line children) so browsers that batch
+    websocket diffs lazily drop every line in one scene-tree diff.
     """
     group = _state.get("frustum_group")
     if group is None:
@@ -229,8 +196,8 @@ def update_frustum(T_cam2flange: NDArray[np.float64]) -> None:
         except Exception:  # noqa: BLE001
             pass
         _state["near_cone_group"] = None
-    # Belt and braces: also delete each tracked line in case the
-    # near_cone_group reference was stale.
+    # Belt-and-braces — also delete each tracked line in case the group
+    # reference was stale.
     for obj in _state.get("frustum_objects", []) or []:
         try:
             obj.delete()
@@ -241,12 +208,7 @@ def update_frustum(T_cam2flange: NDArray[np.float64]) -> None:
 
 def _post_calibration_tick() -> None:
     """Apply the calibrated mount to the frustum once calibration finishes.
-
-    Called by a NiceGUI timer at 4 Hz. The robot animates via the existing
-    parol6-server status broadcast → Waldo-Commander status consumer →
-    URDF scene path, so we don't need to drive joint updates ourselves.
-    The only remaining bit of plumbing is updating the frustum once the
-    calibration finishes and we have a calibrated ``T_cam2flange``.
+    Robot animation rides on the existing status-broadcast path.
     """
     try:
         if not _state.get("is_running") and _state.get("calibrated_mount") is not None:
@@ -254,37 +216,26 @@ def _post_calibration_tick() -> None:
             _state["current_mount"] = _state["calibrated_mount"]
             _state["calibrated_mount"] = None
     except RuntimeError as e:
-        # Catch "The parent slot of the element has been deleted."
+        # "The parent slot of the element has been deleted."
         if "parent slot" in str(e):
             return
         raise
 
 
-# ``_raycast_footprint_tick`` runs on the asyncio event loop. To keep the
-# UI responsive during heavy CPU spikes (calibration thread spawning IK
-# sweeps, parol6's 50 Hz status broadcasts updating the URDF scene), it
-# uses three early-exit optimisations:
-#   1. Skip when both ``show_footprint`` and ``show_centerline`` are off
-#      — no point raycasting if neither result is rendered.
-#   2. Skip when ``(joint_angles, mount)`` are unchanged from the last
-#      successful tick — the projection result is identical, so the
-#      delete/recreate websocket churn would be wasted.
-#   3. Lower fire rate (5 Hz) — visually fluid for a sanity overlay,
-#      halves the websocket pressure compared to the previous 10 Hz.
+# ``_raycast_footprint_tick`` runs on the asyncio loop. Three early exits
+# keep it cheap: skip when both overlays are hidden, skip when inputs
+# haven't moved past the deltas below, and the tick rate itself is low.
 _FOOTPRINT_TICK_HZ: float = 5.0
-_FOOTPRINT_JOINT_DELTA_RAD: float = 1e-4    # ~0.006° per-joint epsilon
-_FOOTPRINT_MOUNT_DELTA_M: float = 1e-5      # 10 µm translation epsilon
+_FOOTPRINT_JOINT_DELTA_RAD: float = 1e-4    # ~0.006° per joint
+_FOOTPRINT_MOUNT_DELTA_M: float = 1e-5      # 10 µm translation
 
 
 def _footprint_inputs_changed(
     q: NDArray[np.float64],
     T_cam2flange: NDArray[np.float64],
 ) -> bool:
-    """Return True iff the joint angles or mount differ enough from the
-    previous tick to warrant rebuilding the footprint geometry. Also
-    returns True when there are no rendered objects yet — covers the
-    case where settings changed (or page rebuilt) and the dynamic
-    overlays got dropped without being re-rendered.
+    """True when joint angles or mount differ enough to rebuild, or when
+    nothing's rendered (covers settings-change / page-rebuild drops).
     """
     if not _state.get("footprint_objects"):
         return True
@@ -300,14 +251,9 @@ def _footprint_inputs_changed(
 
 
 def _delete_footprint_group() -> None:
-    """Drop the dynamic-overlay sub-group AND the per-object handles
-    so a re-render leaves no orphan lines/polylines in the three.js
-    scene. Wrapping the per-tick lines in a parent group + deleting
-    the whole group (rather than each child line individually) forces
-    the browser to drop every line at once — the same pattern
-    ``update_frustum`` uses for the near-cone, fixing the same
-    websocket-batching artefact (browsers sometimes don't drop
-    individually-deleted lines until the next scene-tree diff).
+    """Drop the dynamic-overlay sub-group AND tracked handles so the next
+    render starts clean. One-shot group delete avoids the websocket-batching
+    artefact where individually-deleted lines linger client-side.
     """
     grp = _state.get("footprint_group")
     if grp is not None:
@@ -316,8 +262,8 @@ def _delete_footprint_group() -> None:
         except Exception:  # noqa: BLE001
             pass
         _state["footprint_group"] = None
-    # Belt-and-braces: also delete each tracked line in case the
-    # group reference was stale and didn't actually carry them.
+    # Belt-and-braces — also delete each tracked line in case the group
+    # reference was stale.
     for obj in _state.get("footprint_objects", []) or []:
         try:
             obj.delete()
@@ -327,56 +273,31 @@ def _delete_footprint_group() -> None:
 
 
 def _raycast_footprint_tick() -> None:
-    """Update the dynamic ray-projected footprint at ``_FOOTPRINT_TICK_HZ``.
-
-    Projects rays from the camera apex through the far frustum corners and
-    draws the resulting polygon (and centerline) in the world scene. Four
-    early-exit paths keep the asyncio loop unburdened — see the module
-    comment above this function.
-    """
+    """Per-tick raycast footprint + centerline update at ``_FOOTPRINT_TICK_HZ``."""
     try:
-        # Early exit (1): if neither overlay is visible, skip everything —
-        # no raycast, no scene churn, no collision-manager rebuild.
+        # Both overlays hidden — tear down and skip.
         show_footprint = bool(_state.get("show_footprint", True))
         show_centerline = bool(_state.get("show_centerline", True))
         if not show_footprint and not show_centerline:
-            # Tear down any stale objects from a previous-frame state
-            # change so they don't linger when both flags are off.
             if _state.get("footprint_objects") or _state.get("footprint_group"):
                 _delete_footprint_group()
                 _state["footprint_last_q"] = None
                 _state["footprint_last_mount"] = None
             return
 
-        # Early exit (1.5a): NiceGUI's three.js handler silently drops
-        # ``create`` messages until the browser has processed
-        # ``init_objects`` (scene.js:416 ``if (!this.is_initialized)
-        # return;``). If our timer fires before the browser's 'init'
-        # event reaches the server, anything we add to the scene is
-        # lost (server-side it's in ``scene.objects`` but the 3JS
-        # scene never sees it). ``add_overlays`` hooks 'init' to flip
-        # this slot to True; until then, skip drawing entirely.
+        # Three.js drops scene mutations until ``init_objects`` runs; the
+        # scene_initialized flag is flipped from its 'init' hook.
         if not _state.get("scene_initialized", False):
             return
 
-        # Early exit (1.5b): if the status consumer hasn't received a
-        # broadcast yet, ``robot_state.angles`` is the dataclass
-        # default (zeros). Drawing a frustum + raycast hits at the
-        # zero pose leaves a stale overlay floating at coordinates
-        # that don't match where the URDF lands once the broadcast
-        # catches up. ``last_update_ts`` is set by the status consumer
-        # on every broadcast (main.py); 0.0 means we haven't received
-        # one yet. NOTE: ``robot_state.connected`` reflects the
-        # hardware-ping status, NOT broadcast receipt — it stays False
-        # in fake-serial / sim mode, so it's NOT a usable gate here.
+        # Wait for the first status broadcast — ``angles`` defaults to
+        # zeros otherwise. ``robot_state.connected`` is the hardware-ping
+        # flag and stays False in fake-serial mode, so don't gate on it.
         try:
             from waldo_commander.state import robot_state  # noqa: PLC0415
         except ImportError:
             return
         if float(getattr(robot_state, "last_update_ts", 0.0)) <= 0.0:
-            # If we already drew something during a startup window
-            # before the first broadcast, tear it down so the user
-            # doesn't see a frozen overlay.
             if _state.get("footprint_objects") or _state.get("footprint_group"):
                 _delete_footprint_group()
                 _state["footprint_last_q"] = None
@@ -386,8 +307,7 @@ def _raycast_footprint_tick() -> None:
         scene_root = _state.get("scene_root")
         if scene_root is None:
             return
-        # Scene-liveness guard — avoids "parent slot deleted" exceptions
-        # during page-teardown / hot-reload races.
+        # Liveness guard against page-teardown / hot-reload races.
         try:
             if hasattr(scene_root, "id") and scene_root.id is None:
                 return
@@ -400,19 +320,15 @@ def _raycast_footprint_tick() -> None:
 
         pair = _state.get("trajectory_collision_mgr_pair")
         if pair is None:
-            # If the cold-start warmup is still running, skip this
-            # tick rather than synchronously building the FCL manager
-            # on the event loop. The warmup finishes within ~2 s of
-            # page render and stashes the full pair into ``_state``;
-            # the next tick after that proceeds normally.
+            # Skip while cold-start warmup is running rather than build
+            # the FCL manager synchronously on the loop.
             if _state.get("collision_mgr_warming", False):
                 return
             pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
             if pair is None:
                 return
             _state["trajectory_collision_mgr_pair"] = pair
-        # Only the ``meshes`` dict is needed here — the collision manager
-        # itself drives self-collision / trajectory checks elsewhere.
+        # Only the meshes dict matters here.
         _, _, meshes = pair
 
         try:
@@ -431,9 +347,7 @@ def _raycast_footprint_tick() -> None:
             logger.warning("footprint tick skipped (kinematics error): %s", e)
             return
 
-        # Early exit (2): if neither joint angles nor mount have changed
-        # meaningfully since the last successful tick, the footprint we
-        # already drew is still correct — skip the work.
+        # No meaningful input change since the last tick.
         if not _footprint_inputs_changed(q, mount.T_cam2flange):
             return
 
@@ -445,17 +359,13 @@ def _raycast_footprint_tick() -> None:
                 _FRUSTUM_FAR_DEPTH_M or 1.5,
             )
 
-            # Drop the previous tick's group (and its child lines) in
-            # ONE scene-tree diff so the browser drops every line at
-            # once rather than retaining stragglers.
+            # One-shot delete so every old line vanishes in one diff.
             _delete_footprint_group()
 
             objects = []
             with scene_root:
-                # New per-tick container: every line/polyline lives
-                # inside this sub-group so the next tick's
-                # ``_delete_footprint_group`` cleanly tears down the
-                # whole bundle.
+                # Per-tick container — the next ``_delete_footprint_group``
+                # tears the whole bundle down in one call.
                 footprint_group = (
                     ui.scene.group().with_name("calib:footprint_group")
                 )
@@ -473,21 +383,13 @@ def _raycast_footprint_tick() -> None:
                             .material("#ffff00")
                         )
             _state["footprint_objects"] = objects
-            # Force the scene element to enqueue a client-side update
-            # so the new line/polyline objects render immediately. The
-            # parent `with` context normally schedules this, but on
-            # the very first tick after broadcast (no prior user
-            # interaction to kick the flush) the new geometry was
-            # waiting for the next event before appearing — visible
-            # symptom: the centerline + footprint didn't show until
-            # the user clicked anything. Update on the scene_root is
-            # cheap and idempotent on subsequent ticks.
+            # Force a client-side flush so the first post-broadcast tick
+            # doesn't wait for an unrelated event to show its geometry.
             try:
                 scene_root.update()
             except Exception as e:  # noqa: BLE001
                 logger.debug("scene_root.update() failed: %s", e)
-            # Cache the inputs we just rendered so the next tick can
-            # short-circuit if nothing's changed.
+            # Cache for the next tick's short-circuit check.
             _state["footprint_last_q"] = q.copy()
             _state["footprint_last_mount"] = mount.T_cam2flange.copy()
         except Exception as e:  # noqa: BLE001

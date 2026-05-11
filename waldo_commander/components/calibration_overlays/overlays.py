@@ -35,33 +35,17 @@ logger = logging.getLogger(__name__)
 
 
 def _live_pose_indicator_tick() -> None:
-    """2 Hz background poll that updates the live-pose collision-status
-    indicator chip in the calibration panel header.
+    """Update the live-pose collision-status chip in the panel header.
 
-    Reads ``robot_state.angles.deg``, runs a single-config gripper-only
-    collision check against the floor + active-tool meshes (no full
-    arm-vs-arm; ~7x faster), and updates ``_state["live_pose_status"]``
-    with one of:
-
-    * ``"ok"`` — current pose is collision-free.
-    * ``"collide:<reason>"`` — current pose collides; reason includes
-      the colliding pair when available.
-    * ``"unavailable"`` — master toggle off, parol6 not importable, no
-      tool selected, etc.
-
-    The indicator chip in panel.py reads this slot and updates its
-    color / tooltip on each tick.
+    Runs a gripper-only check on the live joint angles and updates the
+    chip text + tooltip via the handles cached in ``_state``.
     """
     label = _state.get("live_pose_label")
     if label is None:
         return  # panel hasn't built yet
 
-    # Skip while the cold-start collision-manager warmup is in
-    # progress. Running ``validate_joint_trajectory`` here would
-    # synchronously build the gripper-only FCL manager on the event
-    # loop, undoing the entire point of the off-loop warmup. The
-    # warmup finishes within ~2 s of page render; this tick fires
-    # again 500 ms later and updates the chip with real state.
+    # Skip while warmup is running — would build the gripper-only FCL
+    # manager on the loop and undo the point of the off-loop warmup.
     if _state.get("collision_mgr_warming", False):
         return
 
@@ -100,12 +84,8 @@ def _live_pose_indicator_tick() -> None:
     try:
         label.text = text
         label.props(f"color={color}")
-        # Update the existing tooltip element in place (the chip's
-        # tooltip is created ONCE in panel.py and stashed in
-        # ``_state["live_pose_tooltip"]``). Calling
-        # ``label.tooltip(...)`` here used to APPEND a new tooltip
-        # element on every tick; the chip ended up with hundreds of
-        # stacked QTooltips and hovers fired them all at once.
+        # Update the existing tooltip in place — ``label.tooltip(...)``
+        # appends a new QTooltip every tick and they stack.
         tooltip_el = _state.get("live_pose_tooltip")
         if tooltip_el is not None:
             try:
@@ -140,17 +120,10 @@ def _ensure_static_mounts(merged_stl_path: Path, board_png_path: Path) -> tuple[
 def add_overlays(urdf_scene: Any) -> None:
     """Bolt the merged STL + board + frustum onto a running ``UrdfScene``.
 
-    Call this AFTER ``urdf_scene.show()`` has built the scene — typically right
-    after the world-axes lines are drawn in ``main.build_page_content``.
-
-    Idempotent: re-entrant calls during cold start (one from the
-    reentrant ``_on_tool_change`` chain via ``apply_calibration_state``,
-    one from ``initialize_urdf_scene`` line ~352) used to render every
-    overlay group twice — a wasted ~50 ms of WebSocket churn and a
-    duplicate set of board/frustum/hemisphere/reachability geometry
-    that the next ``_teardown_overlays`` would have to clean up. The
-    ``overlays_built`` flag is cleared by teardown, so a legitimate
-    toggle-off → toggle-on cycle still rebuilds correctly.
+    Call after ``urdf_scene.show()`` (typically right after the world-axes
+    lines in ``main.build_page_content``). The ``overlays_built`` flag
+    makes this idempotent across cold-start re-entrants; teardown clears
+    it so a toggle-off / toggle-on cycle still rebuilds.
     """
     if _state.get("overlays_built", False):
         logger.debug("add_overlays: already built; skipping duplicate call")
@@ -161,14 +134,10 @@ def add_overlays(urdf_scene: Any) -> None:
     if urdf_scene.tcp_anchor is None:
         logger.warning("add_overlays: UrdfScene has no tcp_anchor; gripper bracket won't follow flange")
 
-    # Pull persisted user settings into the runtime cache BEFORE the scene
-    # builds so the initial board / hemisphere / cam-mount geometry uses
-    # whatever the user last saved (rather than the module-default values).
-    # Any exceptions here are caught inside load_from_storage; safe to call.
+    # Hydrate runtime settings before the scene builds so geometry reflects
+    # the user's saved values, then rebuild ``_T_BOARD2BASE`` to absorb any
+    # shifts in board placement / surface thickness.
     settings.load_from_storage()
-    # Settings load may have shifted board placement / surface thickness
-    # vs. the initial _T_BOARD2BASE built at module import time. Rebuild
-    # before any consumer reads it.
     from .state import (  # noqa: PLC0415
         _T_BOARD2BASE,
         rebuild_T_board2base,
@@ -177,17 +146,13 @@ def add_overlays(urdf_scene: Any) -> None:
 
     rebuild_T_board2base()
 
-    # Look for a previously-recovered board pose (in-memory first for
-    # browser refresh, then storage for waldo-commander restart). If
-    # found and the saved sim/real mode matches the current mode, apply
-    # it on top of the configured pose. ``restore_recovered_board_pose``
-    # logs an info line on hit so the user can see the restore happened.
+    # Apply any previously-recovered board pose (in-memory first, then
+    # storage). ``restore_recovered_board_pose`` logs on hit.
     recovered_T = restore_recovered_board_pose()
     if recovered_T is not None:
         _T_BOARD2BASE[:] = recovered_T
 
-    # Lazy import — keep parol6-vision out of the main load path so
-    # Waldo-Commander still imports cleanly without it.
+    # Lazy import — keep parol6-vision out of the main load path.
     try:
         from parol6_vision.calibration.board import render_board_png  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import CameraMount  # noqa: PLC0415
@@ -197,53 +162,35 @@ def add_overlays(urdf_scene: Any) -> None:
 
     import cv2  # noqa: PLC0415
 
-    # Resolve paths.
     pkg_root = Path(__file__).resolve().parent.parent.parent.parent.parent / "parol6-vision"
     merged_stl = pkg_root / "parol6_vision" / "sim" / "meshes" / "ssg48_body_realsense.stl"
     if not merged_stl.exists():
         logger.warning("merged STL not found at %s; skipping calibration overlays", merged_stl)
         return
 
-    # Render board texture and cache it. We re-render every restart so the
-    # PNG always reflects the current BoardConfig + render settings without
-    # needing manual cache invalidation. Render takes ~50 ms.
+    # Re-render every restart — the PNG always reflects the current
+    # BoardConfig without manual cache invalidation.
     cache_dir = Path(__file__).resolve().parent.parent.parent / "_calib_cache"
     cache_dir.mkdir(parents=True, exist_ok=True)
     board_png = cache_dir / "board.png"
     canonical = render_board_png(current_board_config(), pixels_per_metre=4000.0, margin_squares=0.0)
-    # No vertical flip: NiceGUI's Three.js Texture material uses flipY=false
-    # AND our texture-coord array maps world (0,0,0) -> UV (0,0) -> the PNG's
-    # top-left pixel. cv2.flip(...,0) was double-flipping that and producing
-    # a mirrored / scrambled-looking board where the markers were unreadable.
+    # No vertical flip — Three.js Texture uses flipY=false and our UV
+    # array already maps world (0,0,0) to the PNG's top-left.
     canonical_rgb = cv2.cvtColor(canonical, cv2.COLOR_GRAY2RGB)
     cv2.imwrite(str(board_png), canonical_rgb)
     logger.info("rendered ChArUco board PNG: %s (%d×%d)", board_png, canonical.shape[1], canonical.shape[0])
 
     stl_url, png_url = _ensure_static_mounts(merged_stl, board_png)
 
-    # Capture the asyncio loop so the worker thread can post UI updates.
-    # Only clobber the existing slot when we have a real loop. A re-add
-    # path that runs without a running loop should NOT zero out a
-    # previously-captured valid loop ref — worker threads spawned
-    # earlier would lose their ability to schedule UI updates. (The
-    # state.py module-level seed for this key is None, so on a true
-    # first-call without a running loop the slot stays None either way.
-    # The protection here is for the multi-add re-entry path.)
+    # Capture the asyncio loop for worker threads. Don't clobber a
+    # previously-captured loop on re-entry without one.
     try:
         _state["main_loop"] = asyncio.get_running_loop()
     except RuntimeError:
-        # Preserve whatever was there. No-op when slot is None
-        # (first call); preserves a real loop on re-add.
         pass
 
-    # Capture the NiceGUI client. Worker-thread callbacks scheduled via
-    # ``loop.call_soon_threadsafe`` run OUTSIDE any request slot, so
-    # ``ui.dialog()`` / ``ui.notify()`` etc. fail with
-    # ``"The current slot cannot be determined because the slot stack
-    # for this task is empty."``. The fix: enter the client's content
-    # slot via ``with client:`` before creating UI from a worker
-    # callback. ``preview_dialog.show_collision_dialog_threadsafe``
-    # uses this slot.
+    # Capture the NiceGUI client so worker callbacks can enter its slot
+    # via ``with client:`` — ``ui.dialog()`` / ``ui.notify()`` need it.
     try:
         from nicegui import context  # noqa: PLC0415
 
@@ -252,29 +199,16 @@ def add_overlays(urdf_scene: Any) -> None:
         logger.debug("nicegui client capture failed: %s", e)
         _state["nicegui_client"] = None
 
-    # Register a disconnect handler so our timers (footprint tick,
-    # post-cal tick, live-pose chip, detection poll, reachability
-    # pending defer, scene-init delay) are cancelled when the
-    # browser closes its tab. Without this, NiceGUI's ``ui.timer``
-    # keeps firing on the asyncio loop after page teardown; its
-    # ``_run_once`` enters ``self.parent_slot`` which raises
-    # ``RuntimeError: The parent slot of the element has been
-    # deleted.`` once for every tick. The error spams the log
-    # (~5 / sec for the 5 Hz footprint tick) without affecting
-    # functionality, but it's noisy and indicates orphaned tasks
-    # consuming CPU.
+    # Cancel timers on browser disconnect — without this, ``ui.timer``
+    # ticks after teardown log "parent slot deleted" every tick.
     try:
         client = _state.get("nicegui_client")
         if client is not None:
             from .panel import _teardown_overlays  # noqa: PLC0415
 
             def _on_disconnect_cleanup() -> None:
-                # Best-effort cancel of every tracked timer + group
-                # so NiceGUI doesn't try to render into a dead slot.
-                # Reuses the panel's teardown logic (which already
-                # cancels calib_timers + detection_overlay_timer +
-                # reachability_pending_timer, and clears scene
-                # group handles + per-tool runtime state).
+                # Reuse the panel's teardown (cancels every tracked timer +
+                # group and clears per-tool runtime state).
                 try:
                     _teardown_overlays()
                 except Exception as exc:  # noqa: BLE001
@@ -286,43 +220,13 @@ def add_overlays(urdf_scene: Any) -> None:
     except Exception as e:  # noqa: BLE001
         logger.debug("disconnect-handler registration failed: %s", e)
 
-    # Defer "scene is initialized" gating via a short delayed timer
-    # rather than ``urdf_scene.scene.on("init", ...)``. The listener
-    # path looks tempting, but ``Element.on()`` calls
-    # ``Element.update()`` (element.py:388), which enqueues an update
-    # message. ``add_overlays`` runs AFTER ``await client.tools()`` in
-    # ``initialize_urdf_scene``, so the outbox already flushed the
-    # scene construction message; the new listener arrives in a SECOND
-    # update. NiceGUI's frontend (nicegui.js:482-496) compares
-    # ``listener_id``s, sees a new one, fires the
-    # ``"Event listeners changed after initial definition.
-    # Re-rendering affected elements."`` warning, then DELETES the
-    # scene element and re-mounts it. Re-mount calls
-    # ``init_objects`` AGAIN on the same client-side THREE.scene
-    # (scene.js:1138-1172). Each ``create()`` call inside that loop
-    # (scene.js:414-608) does
-    # ``this.objects.set(id, mesh); parent.add(mesh)`` — ``Map.set``
-    # overwrites the dict entry, but THREE.js's ``parent.add(child)``
-    # does NOT dedupe by ``object_id``. Result: the OLD mesh stays
-    # parented to the old THREE.js group as a phantom while the NEW
-    # mesh receives subsequent broadcasts. The user sees TWO arms,
-    # one frozen at the page-open pose, one live. ``hard refresh``
-    # wipes the THREE.scene and starts clean — confirming the
-    # client-side accumulation theory.
-    #
-    # The delayed-timer alternative achieves the same gate (footprint
-    # tick + reachability defer waiting for the browser to be ready)
-    # without going through ``Element.on()``. 600ms is comfortably
-    # past first-mount + ``init_objects`` for any reasonable machine;
-    # even if it lands fractionally early, the worst case is one
-    # extra defer-cycle on the reachability render, not a duplicate
-    # arm. The timer is fire-once and cheap (no re-render ripple).
+    # Delayed timer for "scene initialized" gating instead of
+    # ``scene.on("init", ...)``. The listener path mutates the element
+    # and triggers NiceGUI's "event listeners changed" re-mount, which
+    # double-renders every mesh under three.js's non-deduping
+    # ``parent.add``. 600 ms beats first-mount + ``init_objects``.
     _state["scene_initialized"] = False
-    # Cancel a stale prior init-defer timer if a previous add_overlays
-    # left one queued; otherwise it'd fire later against this rebuild's
-    # state and could clobber a True flag with True (cosmetic, but the
-    # parent slot deletion on page-tear-down also surfaces as noisy
-    # ``parent_slot deleted`` log lines).
+    # Cancel a stale prior init-defer timer.
     old_init_timer = _state.get("scene_init_defer_timer")
     if old_init_timer is not None:
         try:
@@ -338,8 +242,7 @@ def add_overlays(urdf_scene: Any) -> None:
         )
     except Exception as e:  # noqa: BLE001
         logger.debug("scene init defer-timer failed: %s", e)
-        # Fall back to optimistic-true so timer-driven creates
-        # aren't stuck behind a permanently-False gate.
+        # Optimistic-true so timer-driven creates don't stay gated.
         _state["scene_initialized"] = True
 
     # Cache mount + paths for the worker thread.
@@ -356,14 +259,8 @@ def add_overlays(urdf_scene: Any) -> None:
         tilt_z_deg=cam_tilt[2],
     )
 
-    # ------------------------------------------------------------------
-    # Camera frustum group, parented to tcp_anchor.
-    #
-    # Idempotent: a leftover frustum_group from a previous add_overlays
-    # call (live re-add path after teardown) is deleted before creating
-    # a fresh one. Otherwise the old group accumulates as the user
-    # toggles features off/on or switches between camera-bearing tools.
-    # ------------------------------------------------------------------
+    # Camera frustum group, parented to tcp_anchor. Idempotent — drop
+    # any leftover from a prior add_overlays so toggles don't accumulate.
     old_frustum = _state.get("frustum_group")
     if old_frustum is not None:
         try:
@@ -380,40 +277,22 @@ def add_overlays(urdf_scene: Any) -> None:
                 frustum_group, _state["current_mount"].T_cam2flange
             )
 
-    # ------------------------------------------------------------------
-    # ChArUco board → world frame (parented to scene root via instance method).
-    # Raised 1mm above the floor so the polar-grid ground plane doesn't
-    # z-fight with it, and bordered with a coloured outline so it's easy
-    # to spot even if the texture fails to load.
-    # ------------------------------------------------------------------
+    # ChArUco board in world frame (1 mm above the floor to avoid the
+    # polar-grid z-fight, bordered for visibility if the texture fails).
     scene_root = urdf_scene.scene
     _state["scene_root"] = scene_root
 
-    # ``_state`` is a module-level dict that survives a browser refresh
-    # (the Python process keeps running). After a refresh, the per-tick
-    # raycast cache (``footprint_objects`` / ``footprint_last_q`` /
-    # ``footprint_last_mount``) still holds handles parented to the
-    # destroyed prior scene_root and joint values matching the current
-    # robot pose — so ``_footprint_inputs_changed`` returns False, the
-    # 5 Hz tick early-exits, and the dynamic centerline + footprint
-    # never render into the new scene. Clearing the cache here is the
-    # same pattern ``live_apply._redraw_frustum`` uses after intrinsic
-    # changes.
+    # ``_state`` survives browser refresh; clear stale handles + cached
+    # inputs so the next tick rebuilds into the new scene_root.
     _state["footprint_objects"] = []
     _state["footprint_last_q"] = None
     _state["footprint_last_mount"] = None
 
-    # All board-dependent overlays (board, tablet, hemisphere wireframe,
-    # reachability dots) are built through a single helper so initial build
-    # and post-localise refresh share one code path. Each child group's
-    # visibility honours the current ``_state['show_*']`` flag, which is
-    # initialised from persisted user preferences in ``add_control_panel``
-    # before this function is called (see ``add_control_panel``).
+    # All board-dependent overlays share a single builder so initial
+    # build and post-localise refresh use the same code path.
     _build_board_dependent_overlays(scene_root, png_url)
 
-    # Cancel any timers from a prior add_overlays call (live re-add path
-    # after teardown) so they don't accumulate. Each fresh call installs
-    # its own set tracked in ``_state["calib_timers"]``.
+    # Cancel prior timers so re-add doesn't stack them.
     for old_timer in _state.get("calib_timers", []) or []:
         try:
             old_timer.cancel()
@@ -426,35 +305,21 @@ def add_overlays(urdf_scene: Any) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    # Detection-overlay polling: repaints AABB boxes from the perception
-    # pipeline's last_detection.json snapshot when its mtime changes.
+    # Detection-overlay polling — repaints AABBs from
+    # ``last_detection.json`` on mtime change.
     _state["detection_overlay_timer"] = ui.timer(
         _DETECTION_POLL_INTERVAL_S, _poll_detection_json,
     )
 
-    # Calibration-driven scene timers. Installed here (during overlay setup,
-    # which happens once per page) instead of in the calibration panel
-    # builder so they keep running regardless of which side-tab is active.
-    # Both are no-ops while their preconditions don't hold:
-    #   - _post_calibration_tick (4 Hz): waits until calibration finishes
-    #     and ``_state['calibrated_mount']`` is set.
-    #   - _raycast_footprint_tick (5 Hz): waits until a mount is available
-    #     and the scene root + collision manager pair are populated; also
-    #     short-circuits when both ``show_footprint`` and ``show_centerline``
-    #     are off, or when the joint/mount inputs haven't changed since the
-    #     last frame (keeps the asyncio loop responsive during heavy CPU
-    #     spikes from the calibration thread + 50 Hz status broadcasts).
+    # Page-level scene timers. Both early-exit when their preconditions
+    # don't hold (see each function's docstring for gates).
     _state["calib_timers"] = [
         ui.timer(0.25, _post_calibration_tick, active=True),
         ui.timer(1.0 / _FOOTPRINT_TICK_HZ, _raycast_footprint_tick, active=True),
         ui.timer(0.5, _live_pose_indicator_tick, active=True),
     ]
 
-    # Click-on-dot popup: page-level fixed-position container + a
-    # scene click handler that opens the "Go to pose" tooltip when
-    # the user clicks one of the green reachability spheres. Both
-    # are idempotent: a re-run replaces any prior container +
-    # handler so we don't stack them across feature on/off cycles.
+    # Click-on-dot popup — idempotent container + handler.
     try:
         from . import pose_popup  # noqa: PLC0415
 
@@ -463,29 +328,13 @@ def add_overlays(urdf_scene: Any) -> None:
     except Exception as e:  # noqa: BLE001
         logger.debug("pose popup setup failed: %s", e)
 
-    # Marker for ``apply_calibration_state`` so it can tell whether the
-    # overlays are currently built (don't re-add) vs. previously torn
-    # down (need to call this function). Initial page-load gets the
-    # flag set here; live tear-down clears it.
+    # Flag for ``apply_calibration_state`` to detect built-vs-torn-down.
     _state["overlays_built"] = True
 
-    # Pre-build the FCL collision managers (full + gripper-only) on a
-    # worker thread so the first ``_raycast_footprint_tick`` and
-    # ``_live_pose_indicator_tick`` don't block the asyncio event loop
-    # for 2-5 s doing trimesh.load + FCL BVH builds (~10 link meshes +
-    # custom-tool body + 2 jaws + floor + tablet, EACH manager). Both
-    # ticks check ``collision_mgr_warming`` and skip until the warmup
-    # finishes; the next tick after that draws the footprint and
-    # updates the live-pose indicator normally.
-    #
-    # Without this, the synchronous build was hogging the loop long
-    # enough to trip Socket.IO's ping_timeout (~2 s) and NiceGUI's
-    # response_timeout (~3 s), surfacing in logs as
-    # "binding propagation for N active links took 3.886 s" and
-    # causing the browser to drop + auto-reload the page on cold
-    # start. Same mitigation precedent as
-    # ``_start_reachability_compute_async`` (reachability.py:488) —
-    # heavy first-pass work runs off the loop.
+    # Pre-build FCL managers off the loop. Synchronous builds (2-5 s
+    # each) trip Socket.IO ping_timeout and force a browser reload on
+    # cold start; ``_raycast_footprint_tick`` and
+    # ``_live_pose_indicator_tick`` skip while ``collision_mgr_warming``.
     _state["collision_mgr_warming"] = True
 
     async def _warm_managers_task() -> None:
@@ -503,50 +352,31 @@ def add_overlays(urdf_scene: Any) -> None:
 
 
 def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
-    """Build the ChArUco board scene group at the current ``_T_BOARD2BASE``.
-
-    Extracted from ``add_overlays`` so ``refresh_board_dependent_overlays``
-    can rebuild the group after auto-localise mutates ``_T_BOARD2BASE``.
-    Returns the group handle (call ``.delete()`` to remove).
+    """Build the ChArUco board scene group at ``_T_BOARD2BASE``. Returns
+    the group handle.
     """
     cfg = current_board_config()
     w_m = cfg.squares_x * cfg.square_length
     h_m = cfg.squares_y * cfg.square_length
 
     board_pos = _T_BOARD2BASE[:3, 3].copy()
-    board_pos[2] += 0.001  # nudge above the floor grid to avoid z-fight
+    board_pos[2] += 0.001  # avoid floor-grid z-fight
     board_group = scene_root.group().move(*board_pos.tolist())
-    # NiceGUI's group.rotate(rx, ry, rz) wraps three.js Object3D.rotation,
-    # which uses INTRINSIC XYZ (i.e. "xyz" in scipy convention — lowercase).
-    # _BOARD_RPY_RAD is documented as scipy XYZ-extrinsic (uppercase) so
-    # we round-trip through the rotation matrix and decompose with the
-    # intrinsic convention here. For single-axis rotations (e.g. yaw-only)
-    # both conventions give identical Euler angles; the difference only
-    # shows up for tilted boards (multiple non-zero axes).
+    # NiceGUI's rotate() uses three.js intrinsic XYZ ("xyz" lowercase in
+    # scipy); _BOARD_RPY_RAD is scipy-extrinsic so we round-trip the
+    # rotation matrix and re-decompose intrinsic.
     rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("xyz").tolist()
     if any(abs(a) > 1e-6 for a in rpy):
         board_group = board_group.rotate(*rpy)
     with board_group:
-        # Backing plane — gray (not white) so it's visually distinct from the
-        # texture's white squares. If the texture renders, you see distinct
-        # black-on-white markers ON TOP of a gray border / fallback. If the
-        # texture fails to load, the area shows as solid gray instead of
-        # white, which is an obvious diagnostic signal.
-        # Sits at local z ∈ [-0.0035, -0.0025], well below the texture, so
-        # there's no chance of z-fighting against the texture or the floor.
+        # Gray (not white) backing plane — solid-gray fallback signals
+        # texture-load failure clearly. Sits below the texture to avoid
+        # z-fighting.
         ui.scene.box(w_m, h_m, 0.001).move(w_m / 2, h_m / 2, -0.003).material(
             "#888888", opacity=1.0
         )
-        # ChArUco texture. Vertex rows are REVERSED (first row Y=h_m, second
-        # row Y=0) so the resulting triangle winding produces a +Z-facing
-        # surface normal. NiceGUI's Three.js material is MeshLambertMaterial
-        # with side=DoubleSide and transparent=true; in this combo the back
-        # face can render dim or blank, so we want the FRONT face to be the
-        # one users see when looking down at the board from above.
-        # UV mapping with this ordering: PNG top-left → world (0, h_m), so
-        # the printed PNG's "top" appears at the FAR edge of the board (Y=h_m)
-        # and its "bottom" appears at the NEAR edge (Y=0) — i.e. the board
-        # reads correctly when viewed from the robot side looking in +Y.
+        # Reversed vertex rows orient the triangle winding +Z; the front
+        # face is what reads correctly when viewed from the robot side.
         ui.scene.texture(
             png_url,
             [
@@ -565,13 +395,8 @@ def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
 
 
 def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
-    """Build a translucent box overlay matching the TABLET collision primitive.
-
-    Position, orientation, and dimensions match _build_collision_manager's
-    tablet exactly, so what you see in the GUI is what's being collision-
-    checked. Returns the group handle (``.delete()`` to remove), or None if
-    rendering is disabled. Driven by ``settings.surface_enabled`` +
-    ``settings.surface_show_overlay``.
+    """Translucent box overlay matching the TABLET collision primitive.
+    Returns the group handle, or None when overlay rendering is off.
     """
     if not (bool(settings.surface_enabled) and bool(settings.surface_show_overlay)):
         return None
@@ -581,10 +406,9 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
     t_w, t_l, t_h = settings.surface_dimensions_m
     t_off_x, t_off_y = settings.surface_offset_local_m
 
-    # Tablet centre in board-local frame, then push to world via _T_BOARD2BASE.
-    # Board pose is auto-lifted by t_h in _build_T_board2base, so placing the
-    # box centre at board-local z=-t_h/2 puts it between world z=0 (bench)
-    # and world z=+t_h (screen). Matches the collision primitive exactly.
+    # Tablet centre in board-local frame → world via _T_BOARD2BASE. The
+    # board pose is pre-lifted by t_h so box centre at z=-t_h/2 lands
+    # between bench and screen.
     tablet_centre_local = np.array(
         [
             _cfg.squares_x * _cfg.square_length / 2.0 + t_off_x,
@@ -595,17 +419,14 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
         dtype=np.float64,
     )
     centre_world = (_T_BOARD2BASE @ tablet_centre_local)[:3]
-    # Lowercase "xyz" = scipy intrinsic, matches three.js Object3D.rotation
-    # default. See note in _build_board_overlay_group for context.
+    # Lowercase "xyz" — see ``_build_board_overlay_group``.
     rpy = SciRotation.from_matrix(_T_BOARD2BASE[:3, :3]).as_euler("xyz").tolist()
 
     grp = scene_root.group().move(*centre_world.tolist()).with_name("calib:tablet")
     if any(abs(a) > 1e-6 for a in rpy):
         grp = grp.rotate(*rpy)
     with grp:
-        # Translucent rusty-orange box — distinct from the gray board backing
-        # so it's easy to tell where the modelled tablet body extends past
-        # the printed ChArUco area.
+        # Rusty-orange so it's distinct from the gray board backing.
         ui.scene.box(t_w, t_l, t_h).material("#cc7733", opacity=0.30)
 
     logger.info(
@@ -618,12 +439,9 @@ def _build_tablet_overlay_group(scene_root: Any) -> Any | None:
 
 
 def regenerate_board_png() -> None:
-    """Re-render the cached ChArUco PNG from the current board settings,
-    then refresh the URL with a cache-busting suffix so the browser loads
-    the new image. Called by ``live_apply`` whenever a board-geometry
-    setting changes (squares_x/y, square_length, marker_length, dictionary,
-    legacy_pattern). Caller is responsible for ``refresh_board_dependent_overlays``
-    afterwards.
+    """Re-render the cached ChArUco PNG and append a cache-buster to the
+    URL. Caller is responsible for calling
+    :func:`refresh_board_dependent_overlays` afterwards.
     """
     board_png = _state.get("board_png_path")
     if board_png is None:
@@ -640,9 +458,7 @@ def regenerate_board_png() -> None:
         )
         canonical_rgb = cv2.cvtColor(canonical, cv2.COLOR_GRAY2RGB)
         cv2.imwrite(str(board_png), canonical_rgb)
-        # Bust the browser cache by appending the file mtime — the static
-        # mount path doesn't change, so the same file on disk now served
-        # at a new URL forces a re-fetch.
+        # Cache-bust by appending the timestamp — same file on disk, new URL.
         cache_buster = int(time.time())
         _state["png_url"] = f"/calib_cache/{board_png.name}?v={cache_buster}"
         logger.info(
@@ -655,16 +471,10 @@ def regenerate_board_png() -> None:
 
 
 def refresh_board_dependent_overlays() -> None:
-    """Rebuild the board, hemisphere wireframe, reachability dots, and
-    tablet visual.
-
-    Call this after ``_T_BOARD2BASE`` is mutated (e.g. by auto-localise) so
-    the visualisation reflects the new board pose. Frustum stays correct
-    automatically (it's parented to ``tcp_anchor``).
-
-    Safe to call from a background thread: it schedules the actual scene
-    surgery on the asyncio loop captured during ``add_overlays``. Returns
-    immediately; the redraw happens at the next event-loop tick.
+    """Rebuild the board, tablet, hemisphere wireframe, and reachability
+    dots after ``_T_BOARD2BASE`` mutates. Frustum stays correct (parented
+    to ``tcp_anchor``). Safe from any thread — schedules onto the captured
+    asyncio loop.
     """
     scene_root = _state.get("scene_root")
     png_url = _state.get("png_url")
@@ -677,14 +487,13 @@ def refresh_board_dependent_overlays() -> None:
         _build_board_dependent_overlays(scene_root, png_url)
 
     if loop is None:
-        # No event loop captured — caller is on the main thread.
+        # No loop captured — caller is on the main thread.
         _do_refresh()
     else:
         try:
             loop.call_soon_threadsafe(_do_refresh)
         except RuntimeError as e:
-            # Event loop is closed (page torn down mid-localise). Nothing
-            # to refresh.
+            # Loop closed (page torn down mid-localise).
             logger.info(
                 "refresh_board_dependent_overlays: loop unavailable (%s); "
                 "skipping scene refresh",
@@ -693,22 +502,12 @@ def refresh_board_dependent_overlays() -> None:
 
 
 def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[np.float64]) -> None:
-    """Draw a 3D wireframe volume for the hemisphere search region inside ``scene_group``.
+    """Wireframe wedge for the hemisphere search region.
 
-    Volume bounds are an annular spherical sector defined by:
-        d ∈ [d_min, d_max]                      (radial)
-        elev ∈ [elev_min, elev_max]             (latitude)
-        az ∈ [az_center ± _HEMI_AZIMUTH_SPREAD]  (longitude)
-
-    We render it as a 6-surface wireframe wedge so the user perceives a
-    solid region (not just discrete sampling paths):
-        - inner spherical patch at d_min  (latitude × longitude grid)
-        - outer spherical patch at d_max  (same grid)
-        - 4 corner edges connecting the patches at the bounding corners
-
-    This matches what the pose generator actually does: it samples ANY pose
-    within this volume that's also reachable + IK-valid, not just along a
-    few discrete arcs.
+    The wedge is the annular spherical sector
+    ``d × elev × [az_center ± spread]``: inner shell, outer shell, four
+    corner edges. Wireframe (not arcs) so the user reads a solid volume
+    matching what the pose generator samples.
     """
     d_min, d_max = settings.hemi_distance_range_m
     ev_min, ev_max = settings.hemi_elevation_range_deg
@@ -730,10 +529,7 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
         )
 
     with scene_group:
-        # Wireframe lines live in their own sub-group so the panel's
-        # "Hemisphere wireframe" toggle hides them independently of the
-        # reachability dots (which live in a separate sub-group added by
-        # ``_add_reachability_points``).
+        # Sub-group so the wireframe toggles independently of the dots.
         wf_group = (
             ui.scene.group()
             .with_name("calib:hemisphere_wireframe")
@@ -741,19 +537,15 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
         )
         _state["hemisphere_wireframe_group"] = wf_group
         with wf_group:
-            # Two spherical shells (inner d_min, outer d_max). For each shell:
-            #   - latitude arcs: constant elev, varying az
-            #   - longitude arcs: constant az, varying elev
+            # Inner + outer shells (latitude × longitude arcs).
             for d, opacity in [(d_min, 0.55), (d_max, 0.30)]:
                 color = "#5599ff" if d == d_min else "#3366cc"
-                # Latitude arcs (one per elevation step).
                 for ev in elevations:
                     pts = [offset(d, ev, az) for az in azimuths]
                     for i in range(len(pts) - 1):
                         ui.scene.line(list(pts[i]), list(pts[i + 1])).material(
                             color, opacity=opacity
                         )
-                # Longitude arcs (one per azimuth step).
                 for az in azimuths:
                     pts = [offset(d, ev, az) for ev in elevations]
                     for i in range(len(pts) - 1):
@@ -761,7 +553,7 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
                             color, opacity=opacity
                         )
 
-            # Four corner edges connecting inner shell to outer shell.
+            # Corner edges connecting the shells.
             for ev, az in [
                 (ev_min, az_min), (ev_min, az_max),
                 (ev_max, az_min), (ev_max, az_max),
@@ -780,20 +572,11 @@ def _add_hemisphere_wireframe_to_group(scene_group: Any, target_world: NDArray[n
 
 
 def _build_board_dependent_overlays(scene_root: Any, png_url: str) -> None:
-    """Build (or rebuild) every overlay whose geometry depends on the current
-    ``_T_BOARD2BASE`` / hemisphere centre, and cache each group handle in
-    ``_state`` so the panel toggles can flip visibility at runtime.
-
-    Always creates every group — visibility is governed by ``_state['show_*']``
-    flags applied at creation time and updated thereafter via
-    :func:`_set_overlay_visible`. Always-creating keeps initial build and
-    post-localise refresh on a single code path; the runtime cost of hidden
-    Three.js objects is negligible compared to the multi-second IK sweep
-    that populates the reachability dots.
-
-    Call from the asyncio loop thread (NiceGUI scene API is not thread-safe).
+    """Build every board-dependent overlay group. Always creates each
+    group; ``_state['show_*']`` drives visibility via
+    :func:`_set_overlay_visible`. Run on the asyncio loop thread.
     """
-    # Tear down anything that already exists (post-localise rebuild path).
+    # Tear down anything that exists (post-localise rebuild).
     for key in ("board_group", "tablet_group", "hemisphere_group"):
         old = _state.get(key)
         if old is not None:
@@ -812,28 +595,16 @@ def _build_board_dependent_overlays(scene_root: Any, png_url: str) -> None:
     board_group.visible(show_board)
     _state["board_group"] = board_group
 
-    # Tablet (mounting-surface) overlay is OPTIONAL — disabled when the
-    # surface is turned off OR when the user has hidden the visual. Guard
-    # the .visible() call so a None return value (legitimate) doesn't
-    # raise and abort the rest of the board-dependent rebuild
-    # (hemisphere, reachability dots).
+    # Tablet overlay is optional; guard against the None return.
     tablet_group = _build_tablet_overlay_group(scene_root)
     if tablet_group is not None:
         tablet_group.visible(show_board)
     _state["tablet_group"] = tablet_group
 
-    # Hemisphere wireframe + reachability dots, parented to a common group
-    # whose origin sits at the hemisphere centre. The two children
-    # (wireframe / dots) get their own sub-groups inside their builders so
-    # they can be toggled independently. The OUTER ``hemisphere_group``
-    # stays visible whenever EITHER child should show — the per-child
-    # sub-groups carry the actual show/hide state.
-    #
-    # The reachability IK sweep is dispatched OFF the asyncio loop — see
-    # ``_start_reachability_compute_async``. The wireframe appears
-    # immediately; the green dots populate a moment later when the
-    # sweep finishes (typically <2 s). This keeps the loop responsive
-    # for websocket traffic during the sweep.
+    # Hemisphere wireframe + reachability dots share a parent at the
+    # hemisphere centre; each child has its own sub-group so they toggle
+    # independently. The IK sweep runs off the loop (see
+    # ``_start_reachability_compute_async``).
     target_world = _hemi_centre_world()
     grp = scene_root.group().move(*target_world.tolist()).with_name("calib:hemisphere")
     _state["hemisphere_group"] = grp
@@ -842,18 +613,11 @@ def _build_board_dependent_overlays(scene_root: Any, png_url: str) -> None:
 
 
 def _set_overlay_visible(name: str, visible: bool) -> None:
-    """Toggle one of the 3D overlay groups at runtime.
+    """Toggle a 3D overlay group at runtime.
 
-    ``name`` is one of: ``board`` (board + tablet), ``hemisphere``
-    (wireframe), ``reachability`` (green dots), ``near_cone`` (fixed
-    frustum lines), ``centerline`` (camera→hit yellow line),
-    ``footprint`` (projected magenta polygon).
-
-    Persists the new state in ``_state['show_<name>']`` so the per-tick
-    raycast loop and any future rebuild use the right flag. Best-effort
-    ``.visible()`` on the cached group handle for the static overlays
-    that have one — the dynamic centerline and footprint are recreated
-    every 100 ms in ``_raycast_footprint_tick`` and read the flag there.
+    ``name``: ``board``, ``hemisphere``, ``reachability``, ``near_cone``,
+    ``centerline``, ``footprint``, ``detections``. State persists in
+    ``_state['show_<name>']``; dynamic overlays read the flag every tick.
     """
     state_key = f"show_{name}"
     _state[state_key] = bool(visible)
@@ -872,8 +636,7 @@ def _set_overlay_visible(name: str, visible: bool) -> None:
         try:
             grp.visible(bool(visible))
         except Exception as e:  # noqa: BLE001
-            # Page-teardown / parent-slot races. Not fatal — the next
-            # rebuild will pick up the new state from ``_state``.
+            # Page-teardown / parent-slot race; next rebuild reads ``_state``.
             logger.debug(
                 "_set_overlay_visible(%s): %s: %s",
                 name, type(e).__name__, e,

@@ -31,26 +31,15 @@ def _compute_reachability_candidates(
     max_count: int,
     collision_config: Any = None,
 ) -> tuple[list[NDArray[np.float64]], list[Any]] | None:
-    """Run the hemisphere IK sweep with the supplied pre-resolved
-    ``cold_start`` mount + ``params``. Pure compute, safe to run off
-    the asyncio loop.
+    """Run the hemisphere IK sweep. Pure compute; safe off the loop.
 
-    All settings reads happen on the caller (main thread) so per-tool
-    overrides stored in ``app.storage.user`` are picked up correctly.
-    NiceGUI's ``app.storage.user`` is request-context-bound and raises
-    ``RuntimeError`` from worker threads, so doing the lookups here
-    would silently fall back to globals + miss the active tool's
-    calibrated values.
+    Settings must be pre-resolved by the caller because
+    ``app.storage.user`` is request-context-bound. ``collision_config``
+    enables an end-pose gripper-only filter so the dots match what the
+    click-to-go path will accept; pass ``None`` to skip.
 
-    ``collision_config`` (built by the caller on the main thread)
-    triggers an end-pose gripper-only collision filter — candidates
-    whose target joints would clip the floor / tablet are dropped.
-    Passing ``None`` skips the filter entirely (legacy behaviour;
-    user could see "reachable" dots that ``_go_to_pose_for_candidate``
-    would block at click time).
-
-    Returns ``(cam_positions_world, candidates)`` lined up
-    index-for-index, or ``None`` on Robot-instantiation failure.
+    Returns ``(cam_positions_world, candidates)`` paired index-for-index,
+    or ``None`` on Robot-instantiation failure.
     """
     try:
         from parol6 import Robot  # noqa: PLC0415
@@ -66,8 +55,7 @@ def _compute_reachability_candidates(
         logger.warning("could not instantiate Robot for reachability viz: %s", e)
         return None
 
-    # Lazy import to avoid pulling parol6_vision into the package-load
-    # path when calibration features are off.
+    # Lazy import — keeps parol6_vision off the package-load path.
     try:
         from parol6_vision.calibration.pose_generator import PoseGenerator  # noqa: PLC0415
     except ImportError:
@@ -79,11 +67,9 @@ def _compute_reachability_candidates(
     )
     cands, stats = gen.generate(max_count=max_count)
 
-    # Extract camera positions; final flange-hull check (PoseGenerator's
-    # workspace_xy/z bounds are rectangular; the hull is more accurate).
-    # When ``collision_config`` is supplied, ALSO drop candidates whose
-    # end pose collides with the floor / tablet — keeps the dots
-    # consistent with what the click-to-go path will accept at dispatch.
+    # Final flange-hull check (PoseGenerator's bounds are rectangular).
+    # ``collision_config`` triggers an end-pose floor/tablet filter so
+    # dots stay consistent with click-to-go dispatch.
     validate_core: Any = None
     if collision_config is not None:
         try:
@@ -105,10 +91,8 @@ def _compute_reachability_candidates(
             continue
         if validate_core is not None and collision_config is not None:
             try:
-                # End-pose-only check: pass the same q for from/to with
-                # n_samples=0 so only the static configuration is
-                # tested (no interior interpolation, no live current_q
-                # dependence — the dots are POSITIONS, not paths).
+                # End-pose only — same q for from/to with n_samples=0;
+                # dots are positions, not paths.
                 q_target_deg = np.degrees(
                     np.asarray(c.joint_angles_rad, dtype=np.float64),
                 ).tolist()
@@ -124,8 +108,7 @@ def _compute_reachability_candidates(
                     n_collision_dropped += 1
                     continue
             except Exception as e:  # noqa: BLE001
-                # Fail-open per candidate: if FCL hiccups, keep the
-                # dot rather than silently dropping it.
+                # Fail open — keep the dot on FCL hiccups.
                 logger.debug(
                     "reachability end-pose collision check failed: %s", e,
                 )
@@ -151,11 +134,8 @@ def _compute_reachability_candidates(
     )
 
     if reachable_cam_world:
-        # Pull the distance + elevation shell bounds back out of the
-        # params object so the diagnostic log can flag dots that fell
-        # outside the visualised shell. HemisphereParams supports both
-        # continuous (range tuples) and discrete (per-axis tuples)
-        # modes; cover both shapes.
+        # Pull shell bounds out of params for the diagnostic log. Covers
+        # both continuous and discrete HemisphereParams shapes.
         d_range = getattr(params, "distance_range_m", None) or (
             min(getattr(params, "distances_m", (0.0,))),
             max(getattr(params, "distances_m", (0.0,))),
@@ -187,10 +167,8 @@ def _compute_reachability_candidates(
                 int(out_of_shell),
             )
 
-    # Return the FULL reachable set; non-overlap thinning happens at
-    # render time via ``_select_visible_dots`` (where the user-set
-    # dot radius is available so the spread threshold matches the
-    # actual sphere size).
+    # Return the FULL set; non-overlap thinning happens at render time
+    # via ``_select_visible_dots`` where the user dot radius is in scope.
     return reachable_cam_world, reachable_candidates
 
 
@@ -200,24 +178,16 @@ def _select_visible_dots(
     radius_m: float,
     n_target: int,
 ) -> tuple[list[NDArray[np.float64]], list[Any]]:
-    """Pick a spread-out subset of the reachable set.
+    """Pick a spread-out subset via greedy farthest-first.
 
-    Greedy farthest-first selection up to ``n_target`` items. The
-    min-distance threshold ``2 * radius_m`` keeps spheres from
-    overlapping in the rendered scene. Stops when EITHER the target
-    count is reached OR no remaining candidate sits far enough from
-    every already-picked one (so we don't draw overlapping dots even
-    if the user asked for more than fit at this radius).
-
-    Returns ``(visible_points, visible_candidates)`` paired
-    index-for-index.
+    ``2 * radius_m`` keeps spheres from overlapping; stops early when no
+    remaining candidate sits far enough from every picked one.
     """
     n = len(points)
     if n == 0 or n_target <= 0:
         return [], []
     cap = min(n_target, n)
-    # Special case: no overlap constraint, just take the most
-    # spread-out ``cap`` items.
+    # No overlap constraint — take the most spread-out ``cap`` items.
     if radius_m <= 0.0:
         if n <= cap:
             return list(points), list(candidates)
@@ -250,38 +220,20 @@ def _render_reachability_dots(
     points_to_render: list[NDArray[np.float64]],
     visible_candidates: list[Any] | None = None,
 ) -> None:
-    """Create the green-sphere sub-group inside ``scene_group``. Scene
-    mutation only; must run on the asyncio loop (NiceGUI scene is not
-    thread-safe).
+    """Create the green-sphere sub-group inside ``scene_group``. Must
+    run on the asyncio loop (NiceGUI scene isn't thread-safe).
 
-    ``scene_group`` is already translated to ``target_world``, so each
-    sphere's local position is ``cam_pos - target_world``. Each sphere
-    is tagged with ``calib:reach_dot_<gen>_<i>`` so the panel-level
-    click handler can identify which candidate the user clicked on
-    (looked up by index against ``_state['reachable_candidates']``).
-
-    ``visible_candidates`` (when supplied) is written into
-    ``_state['reachable_candidates']`` ATOMICALLY with the generation
-    bump and the sphere creation. Worker callers should pass it
-    through; without that, the worker's separate write of
-    ``reachable_candidates`` race-windows past the gen bump leave
-    spheres tagged with the OLD gen but the candidates list pointing
-    at the NEW set, and a click landing in that window would dispatch
-    a candidate that doesn't correspond to the dot the user clicked.
+    ``scene_group`` is pre-translated to ``target_world``. Spheres tag
+    ``calib:reach_dot_<gen>_<i>`` for the click handler. Passing
+    ``visible_candidates`` writes ``_state['reachable_candidates']``
+    atomically with the gen bump — keeps dot indices in sync.
     """
     if scene_group is None:
         return
 
-    # Defer if NiceGUI's three.js scene hasn't reported 'init' yet —
-    # otherwise the create RPCs are silently dropped (scene.js:416).
-    # Re-schedule via a 0.1s timer; the same check on the next firing
-    # will succeed once init has landed.
-    #
-    # Single-slot defer: multiple pre-init renders all collapse onto
-    # the SAME pending payload, so when init lands we don't get N
-    # cascading renders each bumping the gen counter and creating
-    # stacked sphere groups (the now-fixed cause of "dots render but
-    # aren't clickable"). The latest payload wins.
+    # Three.js drops create RPCs before 'init'. Defer with a single-slot
+    # pending payload so cascaded pre-init renders don't multi-bump the
+    # gen counter when 'init' lands.
     if not _state.get("scene_initialized", False):
         _state["reachability_pending_payload"] = (
             scene_group, target_world, list(points_to_render),
@@ -300,18 +252,12 @@ def _render_reachability_dots(
     radius = float(settings.get("reachability_dot_radius_m"))
     if radius <= 0.0:
         radius = 0.003
-    # Cache the last-rendered points so a dot-radius-only change can
-    # re-render with the new size without re-running the IK sweep.
+    # Cache for dot-radius-only changes so re-render skips the IK sweep.
     _state["reachable_points_world"] = list(points_to_render)
     _state["reachable_target_world"] = target_world
-    # Idempotent: drop any prior reach_group (whether previous render or
-    # an orphan from a defer-race where multiple renders queued past the
-    # init gate). Without this, stacked sphere groups from different
-    # generations end up at identical world positions; the raycaster
-    # picks the older one first, the click handler sees a stale-gen
-    # mismatch, and dismisses the click. See Docs/STATE.md "Open bugs"
-    # entry for the post-9af9e5d "dots render but aren't clickable"
-    # symptom.
+    # Idempotent — drop any prior reach_group (current or orphan from a
+    # defer-race) so stacked sphere groups can't mask current dots from
+    # the raycaster. See Docs/STATE.md "Open bugs".
     old_reach_group = _state.get("reachability_group")
     if old_reach_group is not None:
         try:
@@ -319,18 +265,9 @@ def _render_reachability_dots(
         except Exception as e:  # noqa: BLE001
             logger.debug("reachability prior group cleanup failed: %s", e)
         _state["reachability_group"] = None
-    # Bump generation + write candidates list ATOMICALLY. Sphere
-    # names embed the gen so the click handler can detect a stale
-    # click (user clicked a sphere from a prior generation) and
-    # ignore it. Visible-candidates write is paired with the gen
-    # bump so the indices always reference the SAME list as the
-    # spheres were tagged from.
-    #
-    # Without the lock, a worker thread (localise) bumping gen +
-    # clearing candidates could interleave with this block — and
-    # the click handler's gen-then-candidates read could see the
-    # new gen with the old candidates list. ``_state_lock`` makes
-    # the pair appear atomic to readers using the same lock.
+    # Bump gen + write candidates atomically — sphere names embed the
+    # gen so the click handler can reject stale clicks. The lock pairs
+    # the writes against the click handler's paired read.
     with _state_lock:
         generation = int(_state.get("reach_generation", 0)) + 1
         _state["reach_generation"] = generation
@@ -354,36 +291,24 @@ def _render_reachability_dots(
                         .with_name(f"calib:reach_dot_{generation}_{i}")
                     )
     except Exception as e:  # noqa: BLE001
-        # Page-teardown / parent-slot races. Fine to swallow; next
-        # rebuild will populate the group.
+        # Page-teardown / parent-slot races — next rebuild repopulates.
         if "parent slot" not in str(e):
             logger.warning("reachability render failed: %s", e)
-        # Clear the partially-built group ref so the next render
-        # cycle's idempotent cleanup doesn't try to .delete() a
-        # half-populated handle (the delete itself is wrapped in
-        # try/except, but the resulting log noise is confusing —
-        # better to start clean).
+        # Clear so next cycle's idempotent cleanup starts from None.
         _state["reachability_group"] = None
-    # Refresh the settings-panel info label ("X / Y non-overlapping")
-    # so the user sees the post-render counts. Best-effort.
+    # Refresh the "X / Y non-overlapping" label, best-effort.
     _notify_reachability_info_changed()
 
 
 def _flush_pending_render() -> None:
-    """Defer-timer callback: re-attempt the pending render.
-
-    Reads the latest payload from ``_state["reachability_pending_payload"]``
-    and either renders (if scene_initialized has flipped) or re-arms
-    the timer for another 0.1s. Single pending payload + single
-    pending timer keep the gen counter from cascading — late-arriving
-    renders always overwrite the prior payload.
+    """Defer-timer callback — re-attempt the pending render. Renders if
+    'init' has landed; otherwise re-render arms a new timer.
     """
     _state["reachability_pending_timer"] = None
     payload = _state.get("reachability_pending_payload")
     if payload is None:
         return
-    # Don't drop the payload here — _render_reachability_dots will
-    # re-arm + re-store it if init still hasn't landed.
+    # ``_render_reachability_dots`` will re-arm + re-store if needed.
     _state["reachability_pending_payload"] = None
     scene_group, target_world, points_to_render, visible_candidates = payload
     _render_reachability_dots(
@@ -392,17 +317,10 @@ def _flush_pending_render() -> None:
 
 
 def re_render_reachability_dots() -> None:
-    """Re-run the non-overlap selection at the current dot radius and
-    redraw (no IK sweep).
+    """Re-run non-overlap selection at the current radius and redraw.
 
-    Used when the user changes ``reachability_dot_radius_m``: the
-    sphere size changes, so the min-distance threshold for the
-    spread filter changes too. Operates on the cached FULL reachable
-    set so the user can shrink the radius and reveal more dots, or
-    grow it and watch dense regions thin out, without re-running IK.
-
-    No-op if the previous sweep hasn't completed yet (cached list
-    missing).
+    No IK sweep — uses the cached full reachable set. No-op when the
+    cache is missing (previous sweep still in flight).
     """
     grp = _state.get("hemisphere_group")
     all_points = _state.get("reachable_points_all")
@@ -419,9 +337,7 @@ def re_render_reachability_dots() -> None:
     visible_points, visible_candidates = _select_visible_dots(
         all_points, all_candidates or [], radius, n_target,
     )
-    # Don't pre-write reachable_candidates here either — pass through
-    # to _render_reachability_dots where the gen bump pairs with the
-    # candidates write atomically.
+    # Defer the candidates write to the renderer (paired with gen bump).
     old = _state.get("reachability_group")
     if old is not None:
         try:
@@ -433,14 +349,8 @@ def re_render_reachability_dots() -> None:
 
 
 def refresh_reachability_for_active_tool() -> None:
-    """Re-run the IK sweep with the active tool's mount + intrinsics
-    and re-render the dots. Called when the user switches grippers
-    (the per-tool mount / camera-bearing shape changes which poses
-    are reachable) or when ``reachability_n_candidates`` changes.
-
-    Drops the cached candidates list before spawning so a stale list
-    can't be served to the click handler in the brief window before
-    the new sweep finishes.
+    """Re-run IK + re-render after a tool switch or n-candidates change.
+    Drops the cached candidates list before spawning to bar a stale list.
     """
     grp = _state.get("hemisphere_group")
     if grp is None:
@@ -452,10 +362,8 @@ def refresh_reachability_for_active_tool() -> None:
         except Exception:  # noqa: BLE001
             pass
         _state["reachability_group"] = None
-    # Bump ``reach_generation`` alongside the candidates clear under
-    # ``_state_lock`` so a click handler racing this refresh sees
-    # current spheres tagged with the OLD gen as stale (correct)
-    # rather than indexing into the now-empty candidates list.
+    # Bump gen + clear candidates under the lock so a racing click sees
+    # old spheres as stale rather than indexing the empty list.
     with _state_lock:
         _state["reach_generation"] = (
             int(_state.get("reach_generation", 0)) + 1
@@ -464,7 +372,7 @@ def refresh_reachability_for_active_tool() -> None:
         _state["reachable_candidates_all"] = []
     _state["reachable_points_all"] = None
     _state["reachable_points_world"] = None
-    # Lazy import; avoids a state.py / reachability.py import cycle.
+    # Lazy import — breaks the state.py / reachability.py cycle.
     from .state import _hemi_centre_world  # noqa: PLC0415
 
     target_world = _hemi_centre_world()
@@ -472,10 +380,7 @@ def refresh_reachability_for_active_tool() -> None:
 
 
 def _notify_reachability_info_changed() -> None:
-    """Fire the settings-UI info label refresh callback so the
-    "X / Y non-overlapping" text reflects the latest sweep result.
-    Called from ``_render_reachability_dots`` after the dots land.
-    """
+    """Refresh the "X / Y non-overlapping" info label after a render."""
     cb = _state.get("reachability_info_refresh")
     if cb is None:
         return
@@ -489,26 +394,14 @@ def _start_reachability_compute_async(
     scene_group: Any,
     target_world: NDArray[np.float64],
 ) -> None:
-    """Dispatch the (slow) IK sweep to a thread; render results on the
-    loop when it finishes.
+    """Dispatch the IK sweep to a thread; render results on the loop.
 
-    Without this, the sweep blocks the asyncio event loop for 1-3 s,
-    long enough that Socket.IO's outgoing buffer fills under load
-    (50 Hz URDF status broadcasts + 5 Hz frustum tick) and the
-    browser disconnects. Doing the IK in a thread keeps the loop
-    responsive; only the cheap scene-rendering step lands back on
-    the loop.
-
-    Settings reads happen on the calling thread so per-tool overrides
-    stored in ``app.storage.user`` (request-context-bound, not
-    accessible from worker threads) get picked up correctly. Pre-
-    resolved values are passed through to the worker as plain
-    arguments.
+    The sweep blocks the loop for 1-3 s otherwise — long enough to
+    saturate Socket.IO buffers and disconnect the browser. Settings
+    must be read on the request-context main thread because
+    ``app.storage.user`` is unreachable from workers.
     """
-    # All settings reads happen here (main thread = request context),
-    # so app.storage.user-backed per-tool overrides resolve to the
-    # active tool's values rather than silently falling back to
-    # globals from the worker thread.
+    # Resolve settings on the request-context thread for per-tool overrides.
     try:
         from parol6_vision.calibration.camera_mount import CameraMount  # noqa: PLC0415
         from parol6_vision.calibration.pose_generator import HemisphereParams  # noqa: PLC0415
@@ -530,16 +423,9 @@ def _start_reachability_compute_async(
         n_target = 8
 
     if _REACHABILITY_USE_CONTINUOUS:
-        # Sobol low-discrepancy sampling: provably uniform 3D coverage
-        # of the hemisphere volume. Discrete-grid sampling produces
-        # visible "ring" artefacts in the surviving set when IK
-        # feasibility correlates with grid axes.
-        #
-        # Sobol candidate count is bumped to the larger of the user
-        # target and a baseline 256 so the spread filter has a rich
-        # enough pre-filter pool to actually find n_target spread-out
-        # dots. The non-overlap selection in _select_visible_dots
-        # caps the rendered count at n_target.
+        # Sobol gives uniform 3D coverage; discrete grids leave ring
+        # artefacts when IK feasibility correlates with grid axes.
+        # Floor at 256 so the spread filter has a deep enough pool.
         sweep_count = max(n_target, 256)
         params = HemisphereParams(
             n_candidates=sweep_count,
@@ -569,20 +455,9 @@ def _start_reachability_compute_async(
     if radius <= 0.0:
         radius = 0.003
 
-    # Build the collision config on the MAIN THREAD where it has
-    # request context (settings reads + ``_T_BOARD2BASE`` access).
-    # Pass through to the worker so it can filter out candidates
-    # whose end pose collides with floor / tablet — without this
-    # filter, the user can click a "reachable" dot only to have
-    # the click-to-go check (collision.validate_joint_trajectory)
-    # reject it with "collides with TABLET" or "collides with
-    # FLOOR". The dot rendered as reachable but going to it is
-    # blocked, which is the user-reported "obviously not happen"
-    # mismatch. End-pose check (q_target → q_target with n_samples=0)
-    # is fast (~few ms) per candidate and matches what
-    # ``_go_to_pose_for_candidate`` runs at click time, modulo the
-    # trajectory-interior portion that depends on the live start
-    # pose.
+    # Build the collision config on the main thread (needs request
+    # context for settings + ``_T_BOARD2BASE``). Pre-filtering candidates
+    # keeps "reachable" dots aligned with what click-to-go will accept.
     collision_config: Any = None
     try:
         from .collision import _config_from_settings  # noqa: PLC0415
@@ -606,22 +481,16 @@ def _start_reachability_compute_async(
         if result is None:
             return
         all_points, all_candidates = result
-        # Cache the FULL reachable set so a dot-radius change can
-        # re-run the non-overlap selection without re-running IK.
-        # The board-localise sweep also reuses the full candidate set.
-        # These two slots are write-once-per-sweep (no race with the
-        # click handler, which only reads ``reachable_candidates``),
-        # so worker-thread writes are safe.
+        # Cache the full set so a radius-only change skips IK; the
+        # localise sweep reuses it too. Write-once per sweep — no race
+        # with the click handler.
         _state["reachable_points_all"] = all_points
         _state["reachable_candidates_all"] = all_candidates
         visible_points, visible_candidates = _select_visible_dots(
             all_points, all_candidates, radius, n_target,
         )
-        # NOTE: ``reachable_candidates`` is intentionally NOT written
-        # here — it must be set ATOMICALLY with the gen bump and
-        # sphere creation inside _render_reachability_dots, or the
-        # click handler can dereference candidates from one sweep
-        # against spheres tagged with the prior sweep's gen.
+        # ``reachable_candidates`` is set inside the renderer paired
+        # with the gen bump — don't write it here.
         logger.info(
             "reachability dots: %d reachable, %d drawn (target %d, %.1f mm radius)",
             len(all_points), len(visible_points), n_target, radius * 1000.0,
@@ -648,32 +517,23 @@ def _greedy_farthest_first(
     n_target: int,
     key: Callable[[Any], NDArray[np.float64]] = lambda x: x,  # type: ignore[assignment]
 ) -> list[Any]:
-    """Pick ``n_target`` items so their position-space minimum pairwise
-    distance is approximately maximised.
+    """Greedy farthest-first selection (k-center heuristic, O(N · n_target)).
 
-    Algorithm: start at the centroid-closest item (deterministic), then
-    repeatedly pick the next as the one with the LARGEST minimum distance
-    to the already-picked set. Greedy heuristic for the maxmin-distance /
-    k-center problem; produces uniform-looking spread without parameter
-    tuning. O(N × n_target).
-
-    ``key`` extracts a 3-vector position from each item, so this helper
-    works on raw points (key=identity) AND on PoseGenerator candidates
-    (key=lambda c: c.flange_pose[:3, 3]).
+    Seeds at the centroid-closest item, then picks the largest-minimum-
+    distance candidate each step. ``key`` extracts a 3-vector position so
+    this works on raw points or pose candidates.
     """
     if len(items) <= n_target:
         return list(items)
     pts = np.asarray([key(item) for item in items], dtype=np.float64)
-    # Start with the item closest to the centroid (deterministic seed).
     centroid = pts.mean(axis=0)
     first_idx = int(np.argmin(np.linalg.norm(pts - centroid, axis=1)))
     selected = [first_idx]
-    # Track min distance from each candidate to the selected set.
     min_dist = np.linalg.norm(pts - pts[first_idx], axis=1)
     while len(selected) < n_target:
         next_idx = int(np.argmax(min_dist))
         if min_dist[next_idx] <= 0:
-            break  # all remaining items coincide with already-selected
+            break  # remaining items coincide with already-selected
         selected.append(next_idx)
         new_dists = np.linalg.norm(pts - pts[next_idx], axis=1)
         min_dist = np.minimum(min_dist, new_dists)
