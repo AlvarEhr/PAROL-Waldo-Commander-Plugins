@@ -1073,6 +1073,18 @@ def register_all() -> list[str]:
     """Discover + register every custom tool. Returns the list of
     successfully-registered registry keys (``custom:<name>``).
     """
+    # Diagnostic: log the caller's stack so we can see who fires
+    # register_all on cold-start. We've observed register_all firing
+    # multiple times per startup and want to attribute each call to
+    # a specific call site. The mtime-guarded bake_one (added in the
+    # same batch) makes redundant calls cheap, but we'd still like
+    # to eliminate the duplicate caller for cleanliness.
+    import traceback  # noqa: PLC0415
+    stack_frames = traceback.format_stack()
+    # Skip the last frame (this function itself); keep the previous
+    # 6 frames which capture the call chain up to ~3 levels back.
+    caller_summary = "".join(stack_frames[-7:-1]).strip()
+    logger.info("custom_tools: register_all called — caller stack:\n%s", caller_summary)
     ensure_root()
     registered: list[str] = []
     for cfg in list_configs():
