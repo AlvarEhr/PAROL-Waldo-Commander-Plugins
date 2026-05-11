@@ -400,7 +400,7 @@ _LOCALISE_SWEEP_SPEED: float = 0.10
 # avoiding the full 3-seed × 18-second motion when the board is found
 # quickly. Set to a large number (e.g. 999) to disable early stop and
 # always run all seeds for the densest possible consensus sample set.
-_LOCALISE_EARLY_STOP_DETECTIONS: int = 6
+_LOCALISE_EARLY_STOP_DETECTIONS: int = 10
 # Chunk size for the J0 sweep in degrees. The full sweep is broken into
 # back-to-back move_j commands of this size so that halt() (used both by
 # early-stop AND the user's Stop / E-Stop button) interrupts within at
@@ -470,8 +470,8 @@ _LOCALISE_MIN_DETECTIONS: int = 1
 # Combined: best case the first sweep hits the TARGET quickly and we
 # halt early. Medium case the sweep ends with ≥ MIN inliers and we move
 # on to stage 2. Worst case (<MIN inliers) we try the next seed.
-_LOCALISE_EARLY_STOP_INLIERS: int = 4
-_LOCALISE_MIN_INLIERS_TO_PROCEED: int = 2
+_LOCALISE_EARLY_STOP_INLIERS: int = 7
+_LOCALISE_MIN_INLIERS_TO_PROCEED: int = 4
 # RANSAC inlier threshold (metres) — detections within this distance of the
 # inlier-set median count as agreeing on the board location. 5 cm is generous
 # enough that the cold-start mount's ~2 mm / 2° error doesn't reject good

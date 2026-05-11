@@ -21,12 +21,91 @@ from .constants import (
     _LOCALISE_SCAN_TARGETS_M,
     _LOCALISE_SEED_DISTANCE_RANGE_M,
     _LOCALISE_SEED_ELEVATION_RANGE_DEG,
-    _LOCALISE_SEED_TARGETS_XY,
     _SETTLE_TIME_REAL_S,
     _SETTLE_TIME_SIM_S,
 )
 from .overlays import refresh_board_dependent_overlays
-from .state import _T_BOARD2BASE, _state, _state_lock, current_board_config
+from .state import (
+    _T_BOARD2BASE,
+    _hemi_centre_world,
+    _state,
+    _state_lock,
+    current_board_config,
+    save_recovered_board_pose,
+)
+
+
+def _build_localise_seed_targets_xy(
+    spread_m: float = 0.12,
+) -> list[tuple[float, float]]:
+    """Return XY seed targets for the localise J0 sweep, centred on the
+    currently-believed board centre (``_hemi_centre_world()``).
+
+    The believed centre is the user's a-priori knowledge of where the
+    board is placed: either the configured ``_BOARD_TRANSLATE_M`` (first
+    run) or the value left by the previous successful localise (re-run).
+    The primary seed is at the centre itself, with four additional seeds
+    offset diagonally to cover up to ~``spread_m`` of XY uncertainty.
+
+    Hardcoded seeds along ``Y=0`` are a sim-era assumption that breaks as
+    soon as the user places the physical board at non-zero Y. The board
+    can be anywhere in the reachable workspace; the seeds need to follow.
+    """
+    centre = np.asarray(_hemi_centre_world(), dtype=np.float64)
+    cx, cy = float(centre[0]), float(centre[1])
+    # Diagonal offsets (sin/cos at 45 deg) so each seed contributes a
+    # different X AND Y component — that maximises workspace coverage
+    # from N seeds. Five seeds total: centre + 4 corners of a square.
+    d = float(spread_m) * float(np.cos(np.radians(45)))
+    return [
+        (cx, cy),
+        (cx + d, cy + d),
+        (cx + d, cy - d),
+        (cx - d, cy + d),
+        (cx - d, cy - d),
+    ]
+
+
+def _has_rotation_diversity(
+    pose_pairs: list[tuple[NDArray[np.float64], NDArray[np.float64]]],
+    min_axis_spread_deg: float = 8.6,  # match solver.solve_localise_joint's default
+) -> bool:
+    """Return True iff the accumulated ``(T_flange2base, T_board2cam)``
+    samples have enough rotational diversity for the joint AX = YB solve.
+
+    Counts samples as diverse when the relative rotations between flange
+    poses include at least one pair whose rotation axes are non-parallel
+    (max pairwise axis angle exceeds ``min_axis_spread_deg``). A J0-only
+    sweep produces all relative rotations about base Z, which is
+    degenerate — this check correctly fails on that.
+    """
+    if len(pose_pairs) < 3:
+        return False
+    try:
+        import cv2  # noqa: PLC0415
+
+        axes: list[np.ndarray] = []
+        R_list = [pp[0][:3, :3].astype(np.float64) for pp in pose_pairs]
+        for i in range(len(R_list)):
+            for j in range(i + 1, len(R_list)):
+                R_rel = R_list[i] @ R_list[j].T
+                rvec, _ = cv2.Rodrigues(R_rel)
+                r = rvec.flatten()
+                theta = float(np.linalg.norm(r))
+                if theta < 1e-6:
+                    continue
+                axes.append(r / theta)
+        if len(axes) < 2:
+            return False
+        a = np.asarray(axes, dtype=np.float64)
+        dots = np.clip(a @ a.T, -1.0, 1.0)
+        np.fill_diagonal(dots, 1.0)
+        # collapse antiparallel = parallel
+        angles_deg = np.degrees(np.arccos(np.abs(dots)))
+        iu = np.triu_indices(len(axes), k=1)
+        return float(np.max(angles_deg[iu])) >= min_axis_spread_deg
+    except Exception:  # noqa: BLE001
+        return False
 
 logger = logging.getLogger(__name__)
 
@@ -179,9 +258,21 @@ def _localise_board_thread() -> None:
         # the pose generator found a reachable look-down candidate. Used by
         # both continuous-sweep and discrete-J0-sweep branches below; the
         # multi-target legacy path bypasses this entirely.
+        #
+        # The seed XY targets are now CENTRED on the currently-believed
+        # board centre (``_hemi_centre_world()``) rather than hardcoded
+        # workspace points along Y=0. The user's physical board can be
+        # anywhere; this lets each localise run aim its J0 sweeps at the
+        # most-likely location (configured on first run, refined from
+        # the previous successful localise on subsequent runs).
+        seed_targets_xy = _build_localise_seed_targets_xy()
+        logger.info(
+            "localise seed targets (centred on believed board centre): %s",
+            [(round(x, 3), round(y, 3)) for x, y in seed_targets_xy],
+        )
         seed_q_list: list[tuple[tuple[float, float], NDArray[np.float64]]] = []
         if bool(settings.localise_use_j0_sweep):
-            for seed_xy in _LOCALISE_SEED_TARGETS_XY:
+            for seed_xy in seed_targets_xy:
                 seed_target = np.array(
                     [seed_xy[0], seed_xy[1], scan_z], dtype=np.float64,
                 )
@@ -232,10 +323,11 @@ def _localise_board_thread() -> None:
             if not seed_q_list:
                 _post_status(
                     "Localise: no reachable seed pose at any of "
-                    f"{len(_LOCALISE_SEED_TARGETS_XY)} configured targets "
-                    f"({_LOCALISE_SEED_TARGETS_XY}). Try widening "
+                    f"{len(seed_targets_xy)} candidate targets "
+                    f"around believed centre. Try widening "
                     "_LOCALISE_SEED_DISTANCE_RANGE_M / "
-                    "_LOCALISE_SEED_ELEVATION_RANGE_DEG."
+                    "_LOCALISE_SEED_ELEVATION_RANGE_DEG, or update the "
+                    "configured board location."
                 )
                 return
             _localise_skip_multitarget = True
@@ -326,7 +418,7 @@ def _localise_board_thread() -> None:
         else:
             logger.info(
                 "localise (J0-sweep): %d/%d seed targets reachable",
-                len(seed_q_list), len(_LOCALISE_SEED_TARGETS_XY),
+                len(seed_q_list), len(seed_targets_xy),
             )
 
         # Mode dispatch: same as _calibration_thread — pick VirtualCamera vs
@@ -339,6 +431,22 @@ def _localise_board_thread() -> None:
 
         raw_client = RobotClient(host="127.0.0.1", port=5001)
         _state["client"] = raw_client
+
+        # A prior run's STOP / early-stop sent halt() to the controller,
+        # which latches it into the disabled state. Subsequent move_j
+        # calls then fail with "Controller disabled (User requested halt)".
+        # Resume at the start of every run so consecutive Localise clicks
+        # work without the user manually re-enabling. Stage 1->2 has its
+        # own resume() at line 1137 for the same reason; this one covers
+        # the leading edge.
+        try:
+            raw_client.resume()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "localise start: resume() raised %s: %s "
+                "- first move may fail if controller is in disabled state",
+                type(e).__name__, e,
+            )
 
         # client.pose("WRF") returns the TCP pose, which has the tool offset
         # subtracted from the flange — verified empirically: a 105 mm Z
@@ -440,6 +548,15 @@ def _localise_board_thread() -> None:
         detected_centres: list[NDArray[np.float64]] = []
         detected_poses: list[NDArray[np.float64]] = []
         detected_qualities: list[int] = []  # corner count, for picking best rotation
+        # Raw pose pairs for joint AX = YB hand-eye solve. Each entry is
+        # (T_flange2base_from_FK, T_board2cam_from_detection). After Stage 2,
+        # if we have enough rotation diversity, ``solve_localise_joint``
+        # recovers BOTH the board pose and the camera mount simultaneously,
+        # without trusting the cold-start mount. Cold-start is only used as
+        # a fallback if the joint solve declines (insufficient diversity /
+        # sanity check fails) — then we drop to the legacy median path
+        # against the cold-start-projected centres.
+        pose_pair_samples: list[tuple[NDArray[np.float64], NDArray[np.float64]]] = []
 
         # Diagnostic state: counts of frame-level outcomes per sweep so the
         # post-sweep summary can tell us WHERE detection is breaking down
@@ -584,6 +701,12 @@ def _localise_board_thread() -> None:
             detected_centres.append(board_centre_obs)
             detected_poses.append(T_board2base_obs)
             detected_qualities.append(int(detection.num_corners_detected))
+            # Stash the raw (T_flange2base, T_board2cam) pair for the
+            # joint solve. Copies because solvePnP can mutate detection
+            # internals and FK output is reused across captures.
+            pose_pair_samples.append(
+                (T_flange2base.copy(), T_board2cam.copy())
+            )
             _diag["detected"] += 1
             return True
 
@@ -1008,99 +1131,153 @@ def _localise_board_thread() -> None:
                 f"from {attempted} captures across "
                 f"{len(seed_q_list) if bool(settings.localise_use_j0_sweep) else len(candidates)} "
                 "scan path(s) (need "
-                f"≥{int(settings.localise_min_detections)}). Board may be outside the "
-                f"workspace scan region — check _LOCALISE_SEED_TARGETS_XY "
-                "(or _LOCALISE_SCAN_TARGETS_M for legacy mode)."
+                f"≥{int(settings.localise_min_detections)}). Board may be outside "
+                f"the scanned region — update the configured board location "
+                "so the seed targets centre on the actual placement, or "
+                "widen _LOCALISE_SEED_DISTANCE_RANGE_M / "
+                "_LOCALISE_SEED_ELEVATION_RANGE_DEG."
             )
             return
 
-        # ---- Stage 2: refinement pass around the rough board centre ----
-        # Median of Stage-1 detections gives a rough board location. Drive
-        # to N high-quality overhead poses centred on that median: gaze
-        # straight down at the rough centre, distances/elevations chosen
-        # so the board fully fits the FOV. From these poses ChArUco gets
-        # the full board in view → 10-20 corners interpolated → much
-        # higher-precision detections than the off-axis sweep frames.
+        # ---- Stage 2: refinement pass around the recovered board centre ----
+        # The whole point of localise is to find the board WHEREVER the user
+        # has placed it. So Stage 2's aim point must come from the
+        # detections, not from the configured (sim) board centre.
+        #
+        # Selection priority for the refinement target:
+        #   1. If Stage 1 collected enough rotation diversity, run an
+        #      INTERMEDIATE joint solve right here on Stage-1 data alone.
+        #      That recovers a rough (T_cam2flange, T_board2base) pair
+        #      that is unbiased by the wrong cold-start mount — and the
+        #      board centre from THAT is what Stage 2 should aim at.
+        #   2. Otherwise fall back to the median of detected centres
+        #      (the legacy behaviour). This is biased when cold-start is
+        #      wrong, but it's the best we can do without joint solve.
+        #
+        # Either way, the refinement poses go to where the data says the
+        # board is, NEVER to a hard-coded location.
         if int(settings.localise_refine_n_poses) > 0 and len(detected_centres) >= 1:
             stage1_count = len(detected_centres)
-            rough_centre = np.median(
-                np.asarray(detected_centres, dtype=np.float64), axis=0,
-            )
-            _post_status(
-                f"Localise: stage 1 found {stage1_count} detections, "
-                f"refining around ({rough_centre[0]:.2f}, {rough_centre[1]:.2f})"
-            )
-            logger.info(
-                "localise stage 2: rough centre = %s, generating %d refinement poses",
-                rough_centre.tolist(), int(settings.localise_refine_n_poses),
-            )
-            refine_target = rough_centre.copy()
 
-            # Sobol-search for IK-feasible refinement candidates around
-            # the rough centre. Wider candidate pool than we need so we
-            # can pick spatially-diverse picks.
-            # Refinement search ranges are wide enough to find SOMETHING
-            # reachable for almost any rough_centre in the workspace —
-            # narrow ranges fail outright at e.g. (0.16, 0) where
-            # PAROL6's wrist-flip kinematics are tight. Wide elevation
-            # band (50°-85°) gives the IK enough freedom; wide distance
-            # band (0.22-0.36) covers near-base AND far-base targets.
-            refine_params = HemisphereParams(
-                n_candidates=256,
-                distance_range_m=(
-                    max(0.20, float(settings.localise_refine_distance_m) - 0.10),
-                    float(settings.localise_refine_distance_m) + 0.06,
-                ),
-                elevation_range_deg=(
-                    max(40.0, float(settings.localise_refine_elevation_deg) - 30.0),
-                    min(85.0, float(settings.localise_refine_elevation_deg) + 5.0),
-                ),
-                azimuth_range_deg=(-180.0, 180.0),
-                workspace_xy_max_m=0.55,
-                max_joint_change_deg=180.0,
-            )
-            refine_gen = PoseGenerator(
-                robot=scan_robot, mount=cold_start,
-                target_world=refine_target, params=refine_params,
-            )
-            try:
-                refine_cands, _ = refine_gen.generate(max_count=None)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "localise stage 2: pose generation raised %s: %s — "
-                    "skipping refinement", type(e).__name__, e,
+            refine_target: NDArray[np.float64] | None = None
+            stage1_joint_result = None
+            # Joint solve is now safe in sim too (VirtualCamera Y-flip bug
+            # fixed at the source — see virtual_camera.py corner-correspondence
+            # comment). Sim and real-hardware paths are identical.
+            if (
+                len(pose_pair_samples) >= 4
+                and _has_rotation_diversity(pose_pair_samples)
+            ):
+                try:
+                    from parol6_vision.calibration.solver import (  # noqa: PLC0415
+                        solve_localise_joint,
+                    )
+
+                    stage1_joint_result = solve_localise_joint(pose_pair_samples)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Stage-1 intermediate joint solve raised %s: %s",
+                        type(e).__name__, e,
+                    )
+
+            if stage1_joint_result is not None:
+                # Recovered board centre, in base frame.
+                cx, cy, cz = (
+                    stage1_joint_result.T_board2base @ center_local
+                )[:3]
+                refine_target = np.asarray([cx, cy, cz], dtype=np.float64)
+                logger.info(
+                    "localise stage 2: aim point from intermediate joint solve = %s "
+                    "(residual t=%.1fmm)",
+                    refine_target.tolist(),
+                    stage1_joint_result.residual_translation_spread_m * 1000.0,
                 )
-                refine_cands = []
+                _post_status(
+                    f"Localise: stage 1 found {stage1_count} detections, "
+                    f"joint solve recovered board at "
+                    f"({refine_target[0]:.2f}, {refine_target[1]:.2f}); refining"
+                )
+            else:
+                rough_centre = np.median(
+                    np.asarray(detected_centres, dtype=np.float64), axis=0,
+                )
+                refine_target = rough_centre.copy()
+                logger.info(
+                    "localise stage 2: aim point = median of detections %s "
+                    "(joint solve not yet viable; rotation diversity insufficient)",
+                    refine_target.tolist(),
+                )
+                _post_status(
+                    f"Localise: stage 1 found {stage1_count} detections, "
+                    f"refining around median "
+                    f"({refine_target[0]:.2f}, {refine_target[1]:.2f})"
+                )
 
-            if refine_cands:
-                # Greedy farthest-first thinning by camera azimuth around
-                # rough_centre, so the picks are spread across viewpoints
-                # rather than clustered.
+            # ---- Stage 2 inner: helper closure for a single refinement pass ----
+            # Each pass generates ``settings.localise_refine_n_poses`` azimuth-
+            # diverse poses around ``target_world``, drives the robot to each
+            # one, and captures a frame at each. Returns the count of new
+            # detections accumulated during this pass.
+            def _run_refinement_pass(
+                target_world: NDArray[np.float64], label: str,
+            ) -> int:
+                n_before = len(detected_centres)
+
+                refine_params = HemisphereParams(
+                    n_candidates=256,
+                    distance_range_m=(
+                        max(0.20, float(settings.localise_refine_distance_m) - 0.10),
+                        float(settings.localise_refine_distance_m) + 0.06,
+                    ),
+                    elevation_range_deg=(
+                        max(40.0, float(settings.localise_refine_elevation_deg) - 30.0),
+                        min(85.0, float(settings.localise_refine_elevation_deg) + 5.0),
+                    ),
+                    azimuth_range_deg=(-180.0, 180.0),
+                    workspace_xy_max_m=0.55,
+                    max_joint_change_deg=180.0,
+                )
+                refine_gen = PoseGenerator(
+                    robot=scan_robot, mount=cold_start,
+                    target_world=target_world, params=refine_params,
+                )
+                try:
+                    refine_cands, _ = refine_gen.generate(max_count=None)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "localise stage 2 (%s): pose generation raised %s: %s",
+                        label, type(e).__name__, e,
+                    )
+                    return 0
+
+                if not refine_cands:
+                    logger.info(
+                        "localise stage 2 (%s): no reachable poses at target %s",
+                        label, np.round(target_world, 3).tolist(),
+                    )
+                    return 0
+
                 def _refine_score(c) -> float:
                     cam_pos = cold_start.cam_pose_for_flange_pose(
                         np.asarray(c.flange_pose),
                     )[:3, 3]
-                    forward = refine_target - cam_pos
+                    forward = target_world - cam_pos
                     fn = float(np.linalg.norm(forward))
                     return float(-(forward / fn)[2]) if fn > 1e-6 else 0.0
 
-                # Sort all by vertical-score, take top half, then thin by
-                # azimuth diversity to pick int(settings.localise_refine_n_poses).
                 refine_cands.sort(key=_refine_score, reverse=True)
-                top_half = refine_cands[: max(int(settings.localise_refine_n_poses) * 4, 8)]
+                top_half = refine_cands[
+                    : max(int(settings.localise_refine_n_poses) * 4, 8)
+                ]
 
                 def _cam_azimuth_deg(c) -> float:
                     cam_pos = cold_start.cam_pose_for_flange_pose(
                         np.asarray(c.flange_pose),
                     )[:3, 3]
-                    rel = cam_pos[:2] - refine_target[:2]
+                    rel = cam_pos[:2] - target_world[:2]
                     return float(np.degrees(np.arctan2(rel[1], rel[0])))
 
-                # Greedy: pick first, then iteratively pick the one
-                # whose azimuth is farthest from the picks-so-far.
-                # Track picks by INDEX into top_half — `c in picks` would
-                # try element-wise equality on the candidate's numpy
-                # fields and raise "truth value of array is ambiguous".
+                # Greedy farthest-first by azimuth.
                 picked_indices: list[int] = [0]
                 while (
                     len(picked_indices) < int(settings.localise_refine_n_poses)
@@ -1109,52 +1286,55 @@ def _localise_board_thread() -> None:
                     pick_azs = [
                         _cam_azimuth_deg(top_half[i]) for i in picked_indices
                     ]
-                    def _min_az_dist(idx: int, refs: list[float] = pick_azs) -> float:
+
+                    def _min_az_dist(
+                        idx: int, refs: list[float] = pick_azs,
+                    ) -> float:
                         a = _cam_azimuth_deg(top_half[idx])
                         return min(
                             min(abs(a - r), 360 - abs(a - r)) for r in refs
                         )
+
                     remaining_indices = [
                         i for i in range(len(top_half)) if i not in picked_indices
                     ]
                     if not remaining_indices:
                         break
-                    picked_indices.append(max(remaining_indices, key=_min_az_dist))
+                    picked_indices.append(
+                        max(remaining_indices, key=_min_az_dist)
+                    )
                 picks = [top_half[i] for i in picked_indices]
 
                 logger.info(
-                    "localise stage 2: %d refinement poses selected (azimuths %s)",
-                    len(picks),
+                    "localise stage 2 (%s): %d poses at target %s, azimuths %s",
+                    label, len(picks), np.round(target_world, 3).tolist(),
                     ["%.0f" % _cam_azimuth_deg(p) for p in picks],
                 )
 
-                # halt() during stage-1 early-stop ALSO disabled the
-                # controller; subsequent move_j calls fail with
-                # "Controller disabled". resume() re-enables it before
-                # we send refinement moves. Without this, all 4
-                # refinement move_j calls return error code 50.
+                # Resume controller in case a prior halt left it disabled.
                 try:
                     raw_client.resume()
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
-                        "localise refine: resume() raised %s: %s "
-                        "— refinement moves may fail",
-                        type(e).__name__, e,
+                        "localise refine (%s): resume() raised %s: %s",
+                        label, type(e).__name__, e,
                     )
 
-                # Drive to each refinement pose, capture 1 frame.
+                # Drive to each refinement pose, capture one frame.
                 for ri, c in enumerate(picks):
                     if _state.get("stop_requested"):
                         raw_client.halt()
                         _post_status("Localise stopped by user")
-                        return
-                    refine_q_deg = list(np.degrees(c.joint_angles_rad).tolist())
+                        return len(detected_centres) - n_before
+                    refine_q_deg = list(
+                        np.degrees(c.joint_angles_rad).tolist()
+                    )
                     _post_status(
-                        f"Localise refine: pose {ri + 1}/{len(picks)} — moving"
+                        f"Localise refine ({label}): pose {ri + 1}/{len(picks)} - moving"
                     )
                     if not _check_collision_or_warn(
                         refine_q_deg,
-                        f"refine pose {ri + 1}/{len(picks)}",
+                        f"refine ({label}) pose {ri + 1}/{len(picks)}",
                     ):
                         continue
                     try:
@@ -1164,7 +1344,8 @@ def _localise_board_thread() -> None:
                         )
                     except Exception as e:  # noqa: BLE001
                         logger.warning(
-                            "localise refine pose %d move_j failed: %s", ri, e,
+                            "localise refine (%s) pose %d move_j failed: %s",
+                            label, ri, e,
                         )
                         continue
                     if rc < 0:
@@ -1172,21 +1353,256 @@ def _localise_board_thread() -> None:
                     time.sleep(
                         _SETTLE_TIME_SIM_S if is_sim_mode else _SETTLE_TIME_REAL_S,
                     )
-                    _capture_and_record(f"refine pose {ri + 1}/{len(picks)}")
+                    _capture_and_record(
+                        f"refine ({label}) pose {ri + 1}/{len(picks)}"
+                    )
 
-                stage2_count = len(detected_centres) - stage1_count
+                added = len(detected_centres) - n_before
                 logger.info(
-                    "localise stage 2: gathered %d additional detections "
-                    "(total %d)",
-                    stage2_count, len(detected_centres),
+                    "localise stage 2 (%s): %d new detections (total %d)",
+                    label, added, len(detected_centres),
                 )
-            else:
-                logger.info(
-                    "localise stage 2: no reachable refinement poses — "
-                    "proceeding with %d stage-1 detections",
-                    stage1_count,
+                return added
+
+            # ---- Stage 2 orchestration: iterative retry ----
+            # Pass A: aim at the chosen primary target (rough centre or
+            # intermediate-joint-solve centre).
+            # Pass B: if Pass A produced 0 new detections, retry at each of
+            # the Stage 1 seed locations. The seeds are real workspace
+            # XY points pose-gen tried to aim the camera at during Stage 1
+            # — likely-board-bearing regions even when the apparent-centre
+            # estimate from Stage 1 is biased by a wrong cold-start mount.
+            # Pass C: confidence-building pass around the joint-solved
+            # centre, if joint solve is viable after A/B and the recovered
+            # centre has shifted meaningfully from the primary target.
+            #
+            # Capped at ``max_passes`` total so a stuck localise can't run
+            # indefinitely on real hardware.
+            max_passes = 5
+            passes_done = 0
+
+            added_primary = _run_refinement_pass(refine_target, "primary")
+            passes_done += 1
+
+            if added_primary == 0 and not _state.get("stop_requested"):
+                z_for_alts = float(refine_target[2])
+                # Reuse the Stage 1 seed XY pattern as alternative aim points
+                # — they're centred on the believed board location (see
+                # ``_build_localise_seed_targets_xy``), so each is a
+                # workspace-coherent candidate even when Pass A missed.
+                for seed_xy in seed_targets_xy:
+                    if (
+                        _state.get("stop_requested")
+                        or passes_done >= max_passes
+                    ):
+                        break
+                    alt_target = np.array(
+                        [seed_xy[0], seed_xy[1], z_for_alts],
+                        dtype=np.float64,
+                    )
+                    # Skip alternatives too close to a target we already swept.
+                    if np.linalg.norm(
+                        alt_target[:2] - refine_target[:2]
+                    ) < 0.05:
+                        continue
+                    passes_done += 1
+                    added_alt = _run_refinement_pass(
+                        alt_target,
+                        f"retry seed ({seed_xy[0]:.2f}, {seed_xy[1]:.2f})",
+                    )
+                    if added_alt >= 1:
+                        break
+
+            # Pass C: confidence refinement around the joint-solved centre.
+            if (
+                passes_done < max_passes
+                and not _state.get("stop_requested")
+                and _has_rotation_diversity(pose_pair_samples)
+            ):
+                try:
+                    from parol6_vision.calibration.solver import (  # noqa: PLC0415
+                        solve_localise_joint,
+                    )
+
+                    intermediate = solve_localise_joint(pose_pair_samples)
+                except Exception as e:  # noqa: BLE001
+                    logger.warning(
+                        "Stage-2 confidence intermediate joint solve raised "
+                        "%s: %s", type(e).__name__, e,
+                    )
+                    intermediate = None
+                if intermediate is not None:
+                    solved_centre = np.asarray(
+                        (intermediate.T_board2base @ center_local)[:3],
+                        dtype=np.float64,
+                    )
+                    shift_mm = float(
+                        np.linalg.norm(solved_centre - refine_target)
+                    ) * 1000.0
+                    if shift_mm > 30.0:
+                        logger.info(
+                            "localise stage 2: joint-solve recovered "
+                            "centre %s (%.0fmm from primary target) — "
+                            "running confidence refinement pass",
+                            solved_centre.tolist(), shift_mm,
+                        )
+                        passes_done += 1
+                        _run_refinement_pass(
+                            solved_centre, "joint-solve refine",
+                        )
+                    else:
+                        logger.info(
+                            "localise stage 2: joint-solve centre stable "
+                            "(shift %.0fmm) - no extra refinement needed",
+                            shift_mm,
+                        )
+
+            stage2_total = len(detected_centres) - stage1_count
+            logger.info(
+                "localise stage 2: %d passes total, %d new detections "
+                "(grand total %d)",
+                passes_done, stage2_total, len(detected_centres),
+            )
+
+        # If the user pressed STOP at any point during the Stage 2 retry
+        # loop (or before), the motion has been halted. Do NOT commit any
+        # localise result — neither the joint-solve recovered mount nor
+        # the median consensus board pose — because the user explicitly
+        # asked to abort. Persisting partial data would surprise them
+        # (their next session would silently start with whatever the
+        # incomplete localise had managed to compute).
+        if _state.get("stop_requested"):
+            logger.info(
+                "Localise: stop_requested set after Stage 2; skipping "
+                "joint solve and state commit",
+            )
+            _post_status("Localise stopped by user")
+            return
+
+        # =====================================================================
+        # Joint AX = YB hand-eye solve — recover BOTH T_cam2flange and
+        # T_board2base from the accumulated pose pairs, without needing a
+        # good cold-start mount. When rotation diversity is sufficient
+        # (Stage 2 refinement contributes most of it), this replaces the
+        # legacy median consensus. The legacy path remains as a fallback
+        # for degenerate pose sets.
+        # =====================================================================
+        joint_result = None
+        if len(pose_pair_samples) >= 4:
+            # Joint solve runs in both sim and real-hardware modes — the
+            # VirtualCamera Y-flip bug that previously corrupted recovered
+            # rotations in sim has been properly fixed at the source
+            # (see virtual_camera.py's corner-correspondence comment).
+            try:
+                from parol6_vision.calibration.solver import (  # noqa: PLC0415
+                    solve_localise_joint,
                 )
 
+                joint_result = solve_localise_joint(pose_pair_samples)
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Joint solve raised %s: %s", type(e).__name__, e)
+                joint_result = None
+
+        if joint_result is not None:
+            # Path A: joint solve succeeded. Use BOTH outputs — write the
+            # calibrated mount to per-tool storage (frustum + future
+            # localise/calibration runs will read it from there) AND
+            # update _T_BOARD2BASE from the recovered board pose.
+            from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
+                CameraMount,
+            )
+            from scipy.spatial.transform import Rotation as _SciR  # noqa: PLC0415
+
+            T_cam2flange_solved = joint_result.T_cam2flange
+            T_board2base_solved = joint_result.T_board2base
+
+            old_origin = _T_BOARD2BASE[:3, 3].copy()
+            old_R = _T_BOARD2BASE[:3, :3].copy()
+            _T_BOARD2BASE[:] = T_board2base_solved
+            # Persist for restoration on browser refresh AND waldo-commander
+            # restart (mode-tagged so a real-mode pose isn't applied in sim
+            # and vice versa). Without this, ``add_overlays``'s rebuild on
+            # the next page load would reset _T_BOARD2BASE to the configured
+            # pose.
+            save_recovered_board_pose(T_board2base_solved)
+
+            # Hand the new mount to the frustum-update tick. Setting
+            # ``_state["calibrated_mount"]`` triggers ``frustum._post_calibration_tick``
+            # at 4 Hz to re-draw the frustum cone at the recovered apex.
+            mount_obj = CameraMount(T_cam2flange=T_cam2flange_solved.copy())
+            _state["calibrated_mount"] = mount_obj
+
+            # Persist to per-tool storage so the new mount survives across
+            # restarts. Mirrors calibration_thread.py:686-704.
+            try:
+                from . import custom_tools as _ct  # noqa: PLC0415
+
+                translate_mm = tuple(
+                    float(v) * 1000.0 for v in T_cam2flange_solved[:3, 3]
+                )
+                # CameraMount.from_eyeball_estimate reconstructs the
+                # rotation as R = Rz @ Ry @ Rx (extrinsic xyz, scipy
+                # lowercase "xyz"). Decomposing with uppercase "XYZ"
+                # gives intrinsic XYZ which does NOT round-trip through
+                # from_eyeball_estimate — silently corrupting any
+                # persisted tilt across restarts. Lowercase "xyz" matches.
+                tilt_deg = tuple(
+                    float(v) for v in _SciR.from_matrix(
+                        T_cam2flange_solved[:3, :3]
+                    ).as_euler("xyz", degrees=True)
+                )
+                _ct.update_active_tool_calibrated_mount(
+                    cam_mount_translate_mm=translate_mm,
+                    cam_mount_tilt_deg=tilt_deg,
+                )
+                logger.info(
+                    "Localise: persisted calibrated mount: translate=%s mm, tilt=%s deg",
+                    [round(v, 1) for v in translate_mm],
+                    [round(v, 2) for v in tilt_deg],
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "Localise: persisting calibrated mount to custom tool failed: %s",
+                    e,
+                )
+
+            new_centre = (T_board2base_solved @ center_local)[:3]
+            delta_mm = float(
+                np.linalg.norm(T_board2base_solved[:3, 3] - old_origin)
+            ) * 1000.0
+            rot_frob = float(
+                np.linalg.norm(T_board2base_solved[:3, :3] - old_R, ord="fro")
+            )
+            rot_delta_deg = float(np.degrees(
+                2.0 * np.arcsin(min(1.0, rot_frob / (2.0 * np.sqrt(2))))
+            ))
+            cam_mm = T_cam2flange_solved[:3, 3] * 1000.0
+            _post_status(
+                f"Localise OK (joint): {joint_result.n_samples_used} samples, "
+                f"board centre ({new_centre[0]:.3f}, {new_centre[1]:.3f}, "
+                f"{new_centre[2]:.3f}) m (shift {delta_mm:.1f} mm / "
+                f"{rot_delta_deg:.1f} deg), camera mount "
+                f"({cam_mm[0]:.1f}, {cam_mm[1]:.1f}, {cam_mm[2]:.1f}) mm"
+            )
+
+            with _state_lock:
+                _state["trajectory_collision_mgr_pair"] = None
+                _state["reach_generation"] = (
+                    int(_state.get("reach_generation", 0)) + 1
+                )
+                _state["reachable_candidates"] = []
+
+            _state["last_localise_ok_at"] = time.time()
+            refresh_board_dependent_overlays()
+            return
+
+        # Path B: joint solve unavailable or declined — fall back to the
+        # legacy median consensus against the cold-start mount. This path
+        # is correct only when the cold-start mount is roughly right;
+        # otherwise the median will scatter (the bug that motivated the
+        # joint solver). Fires now only when pose set is too small or
+        # too co-linear for AX = YB to be well-conditioned.
+        logger.info("Localise: falling back to median consensus (joint solve declined)")
         # Median-then-inlier-mean on CENTRES: robust to a single outlier
         # without needing full RANSAC. Mirrors the orchestrator's own
         # bootstrap consensus (parol6_vision.calibration.refinement.board_position_ransac).
@@ -1215,61 +1631,22 @@ def _localise_board_thread() -> None:
         inlier_indices = np.where(inlier_mask)[0]
         best_inlier_idx = int(max(inlier_indices, key=lambda j: detected_qualities[j]))
         R_detected = np.asarray(detected_poses[best_inlier_idx], dtype=np.float64)[:3, :3]
-
-        # SIM-MODE workaround for the VirtualCamera Y-flip pose artefact.
-        # virtual_camera.py Y-flips the canonical board image before the
-        # 4-corner homography warp — that flip is REQUIRED for ArUco to
-        # decode the marker bit patterns (verified: removing the flip
-        # drops detection from 16 markers to 2, rejected as undecodable).
-        # Side effect: the resulting solvePnP pose has the board's local
-        # frame Y-mirrored relative to the standard ChArUco convention,
-        # which in world frame manifests as the board's +Z axis flipped
-        # (pointing world DOWN instead of UP) AND a corresponding shift
-        # in the X/Y axes. Detected translation (board CENTRE in base
-        # frame) stays accurate because both the canonical and the
-        # 4-corner homography are consistent with each other; only the
-        # rotation is corrupted by the convention mismatch.
-        #
-        # On REAL hardware there's no Y-flip (live camera produces a
-        # real image of a real board), so the rotation is also correct
-        # and we use it. In sim, fall back to the configured RPY which
-        # represents the user's known board orientation.
-        if is_sim_mode:
-            R_to_use = old_R = _T_BOARD2BASE[:3, :3].copy()
+        old_R = _T_BOARD2BASE[:3, :3].copy()
+        # Adopt the detected rotation as-is. The user is allowed to place
+        # the physical board at ANY orientation — not just the configured
+        # ``_BOARD_RPY_RAD``. Sim and real-hardware modes now use the same
+        # math (the old ``VirtualCamera`` Y-flip workaround that motivated
+        # a sim-mode branch here has been properly fixed by re-pairing the
+        # 4-corner homography correspondence in ``virtual_camera.py``).
+        R_to_use = R_detected
+        z_align = float(R_detected[:, 2] @ old_R[:, 2])
+        if z_align < 0.5:  # cos(60 deg) — flag big flips but don't reject
             logger.info(
-                "localise (sim): using configured board rotation (sim-mode "
-                "VirtualCamera Y-flip corrupts detected R); detected R[2, 2] "
-                "would have been %+.3f",
-                float(R_detected[2, 2]),
+                "localise: detected board rotation R[:,2] dot "
+                "previous R[:,2] = %+.3f (board rotation "
+                "significantly differs from previous orientation)",
+                z_align,
             )
-        else:
-            old_R = _T_BOARD2BASE[:3, :3].copy()
-            # Sanity-check the detected rotation against the configured
-            # one before adopting it. solvePnP can converge to a
-            # mirror solution on a planar target with poor conditioning
-            # (low-corner detections at oblique angles); a single bad
-            # convergence would otherwise rotate _T_BOARD2BASE wildly
-            # and poison every subsequent calibration / hover read. We
-            # keep the rotation only when its +Z axis aligns with the
-            # configured one's +Z within ~30 deg; otherwise fall back
-            # to the configured rotation and warn the user.
-            z_align = float(R_detected[:, 2] @ old_R[:, 2])
-            if z_align >= 0.866:  # cos(30 deg)
-                R_to_use = R_detected
-            else:
-                R_to_use = old_R
-                logger.warning(
-                    "localise: detected rotation R[:,2] dot configured "
-                    "R[:,2] = %.3f (< 0.866); detected R is wildly "
-                    "different from configured. Keeping configured "
-                    "rotation; check the physical board orientation.",
-                    z_align,
-                )
-                _post_status(
-                    "Localise WARNING: detected board orientation "
-                    "doesn't match configured; keeping configured "
-                    "rotation. Translation update applied."
-                )
 
         # Build the new full 4x4 transform first, then assign atomically. The
         # previous in-memory rotation/translation are snapshotted for the
@@ -1290,6 +1667,9 @@ def _localise_board_thread() -> None:
         # but in practice no Python statement interleaves between the two
         # halves of a 4x4 copy.
         _T_BOARD2BASE[:] = new_T
+        # Persist for browser-refresh + waldo-commander-restart restoration
+        # (mode-tagged).
+        save_recovered_board_pose(new_T)
 
         delta_mm = float(np.linalg.norm(new_origin - old_origin)) * 1000.0
         # ‖R_a − R_b‖_F = 2√2 sin(θ/2) is the exact identity (not approximate),

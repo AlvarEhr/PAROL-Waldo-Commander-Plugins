@@ -30,8 +30,11 @@ from .state import (
     _hemi_azimuth_world_range_deg,
     _hemi_centre_world,
     _state,
+    _state_lock,
     current_board_config,
+    save_recovered_board_pose,
 )
+from .overlays import refresh_board_dependent_overlays
 from .workspace import _ensure_workspace_envelope, envelope_contains
 
 logger = logging.getLogger(__name__)
@@ -167,6 +170,19 @@ def _calibration_thread() -> None:
         client = _HaltableClient(raw_client)
         # Stash the raw client so the STOP button can call halt() directly.
         _state["client"] = raw_client
+
+        # A prior run's STOP / Localise / Hover sent halt() and latched the
+        # controller into the disabled state. Resume at the start so the
+        # first move_j of this run doesn't fail with "Controller disabled
+        # (User requested halt)". Same fix as localise.py applies here.
+        try:
+            raw_client.resume()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "calibration start: resume() raised %s: %s "
+                "- first move may fail if controller is in disabled state",
+                type(e).__name__, e,
+            )
 
         # Same FK-based flange pose query as the localise thread —
         # client.pose("WRF") returns TCP (with the gripper's 105 mm tool
@@ -676,9 +692,17 @@ def _calibration_thread() -> None:
 
                 T_cf = output.mount.T_cam2flange
                 translate_mm = tuple(float(v) * 1000.0 for v in T_cf[:3, 3])
+                # CameraMount.from_eyeball_estimate reconstructs the
+                # rotation as R = Rz @ Ry @ Rx (extrinsic xyz =
+                # scipy lowercase "xyz"). Decomposing with uppercase
+                # "XYZ" gives intrinsic XYZ angles (R = Rx @ Ry @ Rz)
+                # which do NOT round-trip through from_eyeball_estimate
+                # for non-trivial angles — silently corrupting any
+                # persisted tilt across restarts. Use lowercase "xyz"
+                # to match.
                 tilt_deg = tuple(
                     float(v) for v in _SciR.from_matrix(T_cf[:3, :3])
-                    .as_euler("XYZ", degrees=True)
+                    .as_euler("xyz", degrees=True)
                 )
                 _calib_ct.update_active_tool_calibrated_mount(
                     cam_mount_translate_mm=translate_mm,
@@ -687,6 +711,98 @@ def _calibration_thread() -> None:
             except Exception as _e:  # noqa: BLE001
                 logger.debug(
                     "calibrated mount auto-save to custom tool failed: %s",
+                    _e,
+                )
+
+            # Apply the calibration's refined board FULL POSE (translation
+            # AND rotation) back to the GUI's ``_T_BOARD2BASE`` so the
+            # board overlay reflects what the calibration's running
+            # estimator actually converged on.
+            #
+            # The estimator integrates the bootstrap RANSAC inliers AND
+            # every subsequent hemisphere sample, tracking both 3D
+            # position (Kalman-weighted updates) and orientation
+            # (quaternion-averaged with a 45° outlier gate for mirror-
+            # flipped solvePnP samples). Pass 2 samples are back-projected
+            # through the refined first_mount, so the final pose is
+            # significantly tighter than localise can produce.
+            #
+            # The board's ORIGIN (corner-anchored, OpenCV ChArUco convention)
+            # is what _T_BOARD2BASE stores; the estimator tracks the board
+            # CENTRE. To convert: origin = centre - R @ center_local where
+            # center_local is the half-board offset in board-local frame.
+            try:
+                if output.board_pose_world is not None:
+                    new_pose = np.asarray(
+                        output.board_pose_world, dtype=np.float64,
+                    )
+                    new_R = new_pose[:3, :3]
+                    new_centre = new_pose[:3, 3]
+
+                    _cfg = current_board_config()
+                    center_local = np.array(
+                        [
+                            _cfg.squares_x * _cfg.square_length / 2.0,
+                            _cfg.squares_y * _cfg.square_length / 2.0,
+                            0.0,
+                        ],
+                        dtype=np.float64,
+                    )
+                    # Origin in world = centre - R @ centre-in-board-local
+                    new_origin = new_centre - new_R @ center_local
+
+                    old_R = _T_BOARD2BASE[:3, :3].copy()
+                    old_origin = _T_BOARD2BASE[:3, 3].copy()
+                    old_centre = old_origin + old_R @ center_local
+
+                    pos_shift_mm = float(
+                        np.linalg.norm(new_centre - old_centre)
+                    ) * 1000.0
+                    # Rotation delta (geodesic angle).
+                    R_diff = new_R @ old_R.T
+                    cos_theta = float(
+                        np.clip((np.trace(R_diff) - 1.0) / 2.0, -1.0, 1.0)
+                    )
+                    rot_shift_deg = float(np.degrees(np.arccos(cos_theta)))
+
+                    # Apply unconditionally on calibration success — the
+                    # estimator's data is much stronger evidence than the
+                    # localise-set _T_BOARD2BASE. Tiny shifts still get
+                    # applied; we log at debug-level when shift is small.
+                    new_T = np.eye(4, dtype=np.float64)
+                    new_T[:3, :3] = new_R
+                    new_T[:3, 3] = new_origin
+                    _T_BOARD2BASE[:] = new_T
+                    # Persist for browser-refresh + waldo-commander-restart
+                    # restoration (mode-tagged).
+                    save_recovered_board_pose(new_T)
+
+                    with _state_lock:
+                        _state["trajectory_collision_mgr_pair"] = None
+                        _state["reach_generation"] = (
+                            int(_state.get("reach_generation", 0)) + 1
+                        )
+                        _state["reachable_candidates"] = []
+                    refresh_board_dependent_overlays()
+
+                    log_fn = (
+                        logger.info
+                        if pos_shift_mm > 0.5 or rot_shift_deg > 0.1
+                        else logger.debug
+                    )
+                    log_fn(
+                        "Calibration: applied refined board pose to "
+                        "_T_BOARD2BASE — centre (%.3f, %.3f, %.3f) m, "
+                        "shift %.1f mm / %.2f deg from previous",
+                        float(new_centre[0]),
+                        float(new_centre[1]),
+                        float(new_centre[2]),
+                        pos_shift_mm,
+                        rot_shift_deg,
+                    )
+            except Exception as _e:  # noqa: BLE001
+                logger.warning(
+                    "Calibration: applying refined board pose to overlay failed: %s",
                     _e,
                 )
 
