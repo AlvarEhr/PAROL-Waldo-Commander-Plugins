@@ -253,3 +253,166 @@ def rebuild_T_board2base() -> None:
     """
     new_T = _build_T_board2base()
     _T_BOARD2BASE[:] = new_T
+
+
+# ----------------------------------------------------------------------
+# Recovered-board-pose persistence (survives browser refresh + restart)
+# ----------------------------------------------------------------------
+
+
+def save_recovered_board_pose(T_board2base: NDArray[np.float64]) -> None:
+    """Persist a localise/calibration-recovered board pose.
+
+    Writes to BOTH:
+      * ``_state["recovered_board_pose"]`` — in-memory, survives a browser
+        refresh within the same waldo-commander process.
+      * ``app.storage.general["recovered_board_pose"]`` — persisted to
+        ``storage-general.json`` on disk, survives waldo-commander
+        restarts.
+
+    Tagged with the current sim/real mode so that switching modes after
+    a restart doesn't apply an inappropriate pose (a real-mode recovered
+    pose isn't valid in sim mode and vice versa). Mode tag check happens
+    on ``restore_recovered_board_pose``.
+    """
+    import logging  # noqa: PLC0415
+
+    _log = logging.getLogger(__name__)
+    arr = np.asarray(T_board2base, dtype=np.float64).reshape(4, 4).copy()
+    _state["recovered_board_pose"] = arr
+
+    try:
+        import time as _time  # noqa: PLC0415
+
+        from nicegui import app as _ng_app  # noqa: PLC0415
+        from waldo_commander.state import robot_state as _rs  # noqa: PLC0415
+
+        _ng_app.storage.general["recovered_board_pose"] = {
+            "pose": arr.flatten().tolist(),
+            "saved_sim_mode": bool(_rs.simulator_active),
+            "saved_at_ts": _time.time(),
+        }
+        _log.debug(
+            "save_recovered_board_pose: wrote storage entry (sim_mode=%s)",
+            bool(_rs.simulator_active),
+        )
+    except Exception as e:  # noqa: BLE001
+        _log.debug(
+            "save_recovered_board_pose: storage write skipped (%s: %s)",
+            type(e).__name__, e,
+        )
+
+
+def restore_recovered_board_pose() -> NDArray[np.float64] | None:
+    """Find a previously-recovered board pose, if any applies.
+
+    Checks in-memory ``_state["recovered_board_pose"]`` first (browser
+    refresh path: same process kept the value). Falls back to
+    ``app.storage.general["recovered_board_pose"]`` (waldo-commander
+    restart path: storage persisted to disk).
+
+    For storage hits, the saved sim/real mode flag must match the
+    current ``robot_state.simulator_active``; otherwise the pose is
+    discarded with a log line so the user knows the stale entry exists
+    and can re-localise.
+
+    Returns:
+        4x4 SE(3) pose if a valid one is found, else None. On a storage
+        hit, ``_state["recovered_board_pose"]`` is also re-populated so
+        subsequent calls take the in-memory fast path.
+    """
+    import logging  # noqa: PLC0415
+
+    _log = logging.getLogger(__name__)
+
+    in_memory = _state.get("recovered_board_pose")
+    if in_memory is not None:
+        return np.asarray(in_memory, dtype=np.float64).reshape(4, 4)
+
+    try:
+        from nicegui import app as _ng_app  # noqa: PLC0415
+        from waldo_commander.state import robot_state as _rs  # noqa: PLC0415
+
+        stored = _ng_app.storage.general.get("recovered_board_pose")
+    except Exception as e:  # noqa: BLE001
+        _log.debug(
+            "restore_recovered_board_pose: storage read skipped (%s: %s)",
+            type(e).__name__, e,
+        )
+        return None
+
+    if not stored or not isinstance(stored, dict):
+        return None
+
+    pose_list = stored.get("pose")
+    if not isinstance(pose_list, list) or len(pose_list) != 16:
+        _log.warning(
+            "restore_recovered_board_pose: storage entry malformed; ignoring",
+        )
+        return None
+
+    saved_sim = stored.get("saved_sim_mode")
+    try:
+        current_sim = bool(_rs.simulator_active)
+    except Exception:  # noqa: BLE001
+        current_sim = True
+    if saved_sim is not None and bool(saved_sim) != current_sim:
+        _log.info(
+            "Board overlay: stored recovered pose was saved in %s mode but "
+            "current mode is %s — keeping configured pose. Run Localise to "
+            "refresh.",
+            "sim" if saved_sim else "real",
+            "sim" if current_sim else "real",
+        )
+        return None
+
+    arr = np.asarray(pose_list, dtype=np.float64).reshape(4, 4)
+    _state["recovered_board_pose"] = arr.copy()
+
+    saved_at = stored.get("saved_at_ts", 0.0)
+    age_str = ""
+    if saved_at:
+        import time as _time  # noqa: PLC0415
+
+        age_s = _time.time() - float(saved_at)
+        if age_s < 120:
+            age_str = f", saved {age_s:.0f}s ago"
+        elif age_s < 7200:
+            age_str = f", saved {age_s / 60.0:.1f} min ago"
+        else:
+            age_str = f", saved {age_s / 3600.0:.1f} h ago"
+    _log.info(
+        "Board overlay: restored pose from storage — origin (%.3f, %.3f, %.3f) m "
+        "in %s mode%s",
+        float(arr[0, 3]),
+        float(arr[1, 3]),
+        float(arr[2, 3]),
+        "sim" if saved_sim else "real",
+        age_str,
+    )
+    return arr
+
+
+def clear_recovered_board_pose() -> None:
+    """Wipe the recovered-pose state. Next ``add_overlays`` will fall back
+    to the configured ``_BOARD_TRANSLATE_M`` / ``_BOARD_RPY_RAD``.
+
+    Use when the user has physically moved the board between sessions
+    and doesn't want the stale recovered pose to override the configured
+    one. Currently no UI entry point — call from a Python shell or edit
+    ``storage-general.json`` manually if needed. See DEFERRED_FEATURES.md
+    for a planned reset-button + sim/real pose-swap UI.
+    """
+    import logging  # noqa: PLC0415
+
+    _log = logging.getLogger(__name__)
+    _state["recovered_board_pose"] = None
+    try:
+        from nicegui import app as _ng_app  # noqa: PLC0415
+
+        _ng_app.storage.general.pop("recovered_board_pose", None)
+    except Exception as e:  # noqa: BLE001
+        _log.debug(
+            "clear_recovered_board_pose: storage clear skipped (%s: %s)",
+            type(e).__name__, e,
+        )

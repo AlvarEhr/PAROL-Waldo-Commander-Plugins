@@ -169,8 +169,22 @@ def add_overlays(urdf_scene: Any) -> None:
     # Settings load may have shifted board placement / surface thickness
     # vs. the initial _T_BOARD2BASE built at module import time. Rebuild
     # before any consumer reads it.
-    from .state import rebuild_T_board2base  # noqa: PLC0415
+    from .state import (  # noqa: PLC0415
+        _T_BOARD2BASE,
+        rebuild_T_board2base,
+        restore_recovered_board_pose,
+    )
+
     rebuild_T_board2base()
+
+    # Look for a previously-recovered board pose (in-memory first for
+    # browser refresh, then storage for waldo-commander restart). If
+    # found and the saved sim/real mode matches the current mode, apply
+    # it on top of the configured pose. ``restore_recovered_board_pose``
+    # logs an info line on hit so the user can see the restore happened.
+    recovered_T = restore_recovered_board_pose()
+    if recovered_T is not None:
+        _T_BOARD2BASE[:] = recovered_T
 
     # Lazy import — keep parol6-vision out of the main load path so
     # Waldo-Commander still imports cleanly without it.
