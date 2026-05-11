@@ -192,10 +192,28 @@ def _teardown_overlays() -> None:
     # threads; if no thread is active, this is a no-op.
     _client = _state.get("client")
     if _client is not None:
-        try:
-            _client.halt()
-        except Exception as e:  # noqa: BLE001
-            logger.debug("teardown halt() raised: %s", e)
+        # Dispatch halt() on a fresh background thread. Mirrors the pattern
+        # used by _on_stop (see further below in this file) for the same
+        # reason: ``_client.halt()`` is the sync wrapper around
+        # ``AsyncRobotClient.halt``, whose inbox queue was constructed on
+        # the sync client's private background event loop. Scheduling the
+        # async coroutine on the NiceGUI main loop hits a queue-loop
+        # binding mismatch ("queue bound to different loop"). A fresh
+        # thread has no running loop, so the sync wrapper can re-use its
+        # own thread-bound loop and the queue binding stays correct.
+        import threading  # noqa: PLC0415
+
+        def _halt_in_thread() -> None:
+            try:
+                _client.halt()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("teardown halt() in thread raised: %s", e)
+
+        threading.Thread(
+            target=_halt_in_thread,
+            daemon=True,
+            name="calib-teardown-halt",
+        ).start()
     for key in (
         "frustum_group", "board_group", "tablet_group",
         "hemisphere_group", "near_cone_group",

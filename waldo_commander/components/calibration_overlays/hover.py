@@ -156,6 +156,20 @@ def _drive_hover_pose_thread(
         client = RobotClient(host=_CONTROLLER_HOST, port=_CONTROLLER_PORT)
         _state["client"] = client
 
+        # A prior run's STOP / halt() left the controller in disabled state;
+        # subsequent move_j calls would fail with "Controller disabled".
+        # Resume at the start of every run so consecutive Hover clicks work
+        # without the user manually re-enabling. Same fix as localise.py
+        # and calibration_thread.py.
+        try:
+            client.resume()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "hover start: resume() raised %s: %s "
+                "- first move may fail if controller is in disabled state",
+                type(e).__name__, e,
+            )
+
         if mode == "camera":
             mount = _state.get("current_mount")
             if mount is None:

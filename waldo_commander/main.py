@@ -1272,8 +1272,32 @@ def _register_handlers() -> None:
         try:
             saved_tool = ng_app.storage.general.get("selected_tool", "")
             if saved_tool:
-                await client.select_tool(saved_tool)
-                logger.debug("startup: set tool to %s", saved_tool)
+                # Custom tools (``custom:<name>``) are not in the controller's
+                # built-in registry; route through their ``proxy_tool_key`` so
+                # the controller selects the underlying built-in tool. Mirrors
+                # the translation in ``initialize_urdf_scene``.
+                controller_tool = saved_tool
+                if isinstance(saved_tool, str) and saved_tool.startswith("custom:"):
+                    from waldo_commander.components.calibration_overlays import (  # noqa: PLC0415
+                        custom_tools as _ct,
+                    )
+
+                    cfg = _ct.load_config(saved_tool[len("custom:"):])
+                    if cfg is not None and cfg.proxy_tool_key:
+                        controller_tool = str(cfg.proxy_tool_key)
+                    else:
+                        controller_tool = ""
+                if controller_tool:
+                    saved_variant = ng_app.storage.general.get(
+                        f"tool_variant_{saved_tool}", ""
+                    )
+                    await client.select_tool(
+                        controller_tool, variant_key=saved_variant or "",
+                    )
+                    logger.debug(
+                        "startup: set tool to %s (controller: %s)",
+                        saved_tool, controller_tool,
+                    )
         except Exception as e:
             logger.warning("startup: select_tool failed: %s", e)
 
@@ -1842,6 +1866,18 @@ def main():
     # Pre-compile numba functions to avoid JIT lag during hot path
     warmup_pipelines()
 
+    # NiceGUI's ``app.storage.user`` requires a ``storage_secret`` for the
+    # per-browser-session HMAC; without it, every write silently fails (the
+    # calibration-overlays per-tool layer was hitting this and losing
+    # calibrated mounts on shutdown). Pull from env so production deploys
+    # can rotate the secret without code changes; fall back to a fixed
+    # constant for the local dev case. The exact value doesn't matter for
+    # correctness — only that it stays the same across restarts (otherwise
+    # existing user-storage files won't decrypt).
+    storage_secret = os.environ.get(
+        "WALDO_STORAGE_SECRET",
+        "waldo-commander-local-dev-storage-secret",
+    )
     try:
         ui.run(
             title="PAROL6 NiceGUI Commander",
@@ -1853,6 +1889,7 @@ def main():
             loop="uvloop" if sys.platform != "win32" else "asyncio",
             http="httptools",
             binding_refresh_interval=0.05,
+            storage_secret=storage_secret,
         )
     except KeyboardInterrupt:
         # The NiceGUI on_shutdown hook already cleaned up child processes,
