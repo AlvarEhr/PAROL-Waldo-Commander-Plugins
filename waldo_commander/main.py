@@ -308,13 +308,48 @@ async def initialize_urdf_scene() -> None:
         background_color=scene_config.background_color,
     )
 
-    # Align TCP and load tool mesh from controller's active tool
+    # Align TCP and load tool mesh from controller's active tool —
+    # only when the GUI has no stored tool preference. The stored-
+    # tool block further down is the authoritative source when one
+    # exists; pre-applying the controller's tool here causes a
+    # workspace-hull cache thrash on cold start.
+    #
+    # Concrete failure mode (custom tool with non-zero TCP offset):
+    #
+    #   1. ``register_all`` above fires ``_notify_tool_registry_changed``
+    #      synchronously, which invokes the SettingsContent callback
+    #      that updates the gripper dropdown's value. That schedules
+    #      an async ``_on_tool_change`` task (NiceGUI dispatches
+    #      async on_change handlers via ``asyncio.create_task``).
+    #   2. The ``await client.tools()`` below yields to the loop, and
+    #      the scheduled ``_on_tool_change`` runs: it correctly
+    #      applies the GUI's selected tool (e.g.
+    #      ``custom:ssg48_realsense`` with offset -0.105) and the
+    #      workspace-hull cache HITS for that offset.
+    #   3. ``client.tools()`` then resolves with ``result.tool="NONE"``
+    #      (controller's default — it has no idea about the GUI's
+    #      custom-tool selection; custom tools are GUI-only).
+    #   4. The branch below USED to fire ``apply_tool("NONE")`` →
+    #      offset 0.0 → cache MISS → 6 s background hull regen.
+    #   5. The stored-tool block further down then fires
+    #      ``apply_tool("custom:ssg48_realsense")`` → offset -0.105
+    #      → ANOTHER cache miss against the just-saved 0.0-offset
+    #      hull → ANOTHER 6 s regen.
+    #
+    # Total wasted: ~12 s of background CPU per cold start.
+    # Skipping this branch when stored_tool is set eliminates the
+    # entire thrash; the stored-tool block does everything this
+    # would have done anyway (set_active_tool + apply_tool, plus
+    # the controller-side select_tool via proxy_tool_key).
     try:
-        result = await client.tools()
-        if result and result.tool:
-            vk = ng_app.storage.general.get(f"tool_variant_{result.tool}")
-            ui_state.active_robot.set_active_tool(result.tool, variant_key=vk)
-            ui_state.urdf_scene.apply_tool(result.tool, variant_key=vk)
+        stored_tool_pref = ng_app.storage.general.get("selected_tool", "")
+        has_stored_pref = bool(stored_tool_pref) and stored_tool_pref != "NONE"
+        if not has_stored_pref:
+            result = await client.tools()
+            if result and result.tool:
+                vk = ng_app.storage.general.get(f"tool_variant_{result.tool}")
+                ui_state.active_robot.set_active_tool(result.tool, variant_key=vk)
+                ui_state.urdf_scene.apply_tool(result.tool, variant_key=vk)
     except Exception as e:
         logger.error("Failed to sync TCP tool pose: %s", e)
 

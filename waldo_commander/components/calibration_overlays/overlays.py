@@ -142,7 +142,19 @@ def add_overlays(urdf_scene: Any) -> None:
 
     Call this AFTER ``urdf_scene.show()`` has built the scene — typically right
     after the world-axes lines are drawn in ``main.build_page_content``.
+
+    Idempotent: re-entrant calls during cold start (one from the
+    reentrant ``_on_tool_change`` chain via ``apply_calibration_state``,
+    one from ``initialize_urdf_scene`` line ~352) used to render every
+    overlay group twice — a wasted ~50 ms of WebSocket churn and a
+    duplicate set of board/frustum/hemisphere/reachability geometry
+    that the next ``_teardown_overlays`` would have to clean up. The
+    ``overlays_built`` flag is cleared by teardown, so a legitimate
+    toggle-off → toggle-on cycle still rebuilds correctly.
     """
+    if _state.get("overlays_built", False):
+        logger.debug("add_overlays: already built; skipping duplicate call")
+        return
     if urdf_scene is None or urdf_scene.scene is None:
         logger.warning("add_overlays called before UrdfScene is ready; skipping")
         return
