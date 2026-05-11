@@ -1143,6 +1143,23 @@ def _quiet_shutdown_exception_handler(
             exc, (asyncio.CancelledError, ConnectionResetError, BrokenPipeError)
         ):
             return
+        # Parol6 client's ``AsyncRobotClient.halt()`` task scheduled by
+        # ``_teardown_overlays`` (or any other pre-shutdown halt path)
+        # binds its inbox queue to the sync ``RobotClient``'s private
+        # thread-loop at construction. When the scheduled task runs on
+        # the main NiceGUI loop the queue-loop mismatch raises
+        # ``RuntimeError: <Queue ...> is bound to a different event
+        # loop``. The actual UDP HALT packet has already gone out
+        # synchronously (``sendto`` happens before the response
+        # wait), so the controller correctly halts — only the
+        # Python-side response wait fails. Filtering this trace
+        # during shutdown removes a chunk of ugly noise the user
+        # otherwise sees on every Ctrl+C; the underlying queue-loop
+        # binding fragility belongs upstream in parol6's client.
+        if isinstance(exc, RuntimeError) and (
+            "bound to a different event loop" in str(exc)
+        ):
+            return
         msg = str(context.get("message", ""))
         if (
             "was destroyed but it is pending" in msg
