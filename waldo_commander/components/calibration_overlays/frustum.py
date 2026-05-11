@@ -400,6 +400,13 @@ def _raycast_footprint_tick() -> None:
 
         pair = _state.get("trajectory_collision_mgr_pair")
         if pair is None:
+            # If the cold-start warmup is still running, skip this
+            # tick rather than synchronously building the FCL manager
+            # on the event loop. The warmup finishes within ~2 s of
+            # page render and stashes the full pair into ``_state``;
+            # the next tick after that proceeds normally.
+            if _state.get("collision_mgr_warming", False):
+                return
             pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
             if pair is None:
                 return

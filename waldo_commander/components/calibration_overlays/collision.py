@@ -293,3 +293,38 @@ def _refresh_state_cache_pair() -> None:
     """
     pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
     _state["trajectory_collision_mgr_pair"] = pair
+
+
+def _warm_collision_managers_blocking() -> None:
+    """Pre-build both collision managers (full + gripper-only) so the
+    first ``_raycast_footprint_tick`` and ``_live_pose_indicator_tick``
+    don't block the asyncio loop doing trimesh.load + FCL BVH build.
+
+    Each manager build costs 2-5 s on cold start (10+ STL loads, BVH
+    construction for every link + gripper body + jaws + floor + tablet),
+    and the two ticks use DIFFERENT configs (``gripper_only=False`` vs
+    ``True``), so the collision_core keyed cache doesn't share them —
+    both get built independently on first hit.
+
+    Intended to be invoked via ``asyncio.to_thread`` from
+    ``add_overlays`` so the heavy work runs on a worker thread while
+    the page renders. The full pair is stashed into the legacy
+    ``_state`` slot that ``_raycast_footprint_tick`` reads; the
+    gripper-only manager is left in the collision_core cache for
+    ``validate_joint_trajectory`` to find on its next call.
+    """
+    from parol6_vision.calibration.collision_core import (  # noqa: PLC0415
+        build_collision_manager as _core_build,
+    )
+
+    # Full manager for trajectory checks (frustum tick + path-preview).
+    full_pair = _build_collision_manager(tablet_T_board2base=_T_BOARD2BASE)
+    if full_pair is not None:
+        _state["trajectory_collision_mgr_pair"] = full_pair
+
+    # Gripper-only manager for the live-pose collision indicator.
+    # Not stashed in _state; collision_core's keyed cache serves
+    # subsequent ``validate_joint_trajectory`` calls.
+    gripper_cfg = _config_from_settings(gripper_only=True, include_tablet=True)
+    if gripper_cfg is not None:
+        _core_build(gripper_cfg)

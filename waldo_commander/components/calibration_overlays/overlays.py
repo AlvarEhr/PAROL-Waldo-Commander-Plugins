@@ -55,6 +55,16 @@ def _live_pose_indicator_tick() -> None:
     label = _state.get("live_pose_label")
     if label is None:
         return  # panel hasn't built yet
+
+    # Skip while the cold-start collision-manager warmup is in
+    # progress. Running ``validate_joint_trajectory`` here would
+    # synchronously build the gripper-only FCL manager on the event
+    # loop, undoing the entire point of the off-loop warmup. The
+    # warmup finishes within ~2 s of page render; this tick fires
+    # again 500 ms later and updates the chip with real state.
+    if _state.get("collision_mgr_warming", False):
+        return
+
     try:
         from waldo_commander.state import robot_state  # noqa: PLC0415
 
@@ -432,6 +442,38 @@ def add_overlays(urdf_scene: Any) -> None:
     # down (need to call this function). Initial page-load gets the
     # flag set here; live tear-down clears it.
     _state["overlays_built"] = True
+
+    # Pre-build the FCL collision managers (full + gripper-only) on a
+    # worker thread so the first ``_raycast_footprint_tick`` and
+    # ``_live_pose_indicator_tick`` don't block the asyncio event loop
+    # for 2-5 s doing trimesh.load + FCL BVH builds (~10 link meshes +
+    # custom-tool body + 2 jaws + floor + tablet, EACH manager). Both
+    # ticks check ``collision_mgr_warming`` and skip until the warmup
+    # finishes; the next tick after that draws the footprint and
+    # updates the live-pose indicator normally.
+    #
+    # Without this, the synchronous build was hogging the loop long
+    # enough to trip Socket.IO's ping_timeout (~2 s) and NiceGUI's
+    # response_timeout (~3 s), surfacing in logs as
+    # "binding propagation for N active links took 3.886 s" and
+    # causing the browser to drop + auto-reload the page on cold
+    # start. Same mitigation precedent as
+    # ``_start_reachability_compute_async`` (reachability.py:488) —
+    # heavy first-pass work runs off the loop.
+    _state["collision_mgr_warming"] = True
+
+    async def _warm_managers_task() -> None:
+        try:
+            from .collision import _warm_collision_managers_blocking  # noqa: PLC0415
+
+            await asyncio.to_thread(_warm_collision_managers_blocking)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("collision manager warmup failed: %s", e)
+        finally:
+            _state["collision_mgr_warming"] = False
+            logger.debug("collision manager warmup complete")
+
+    asyncio.create_task(_warm_managers_task())
 
 
 def _build_board_overlay_group(scene_root: Any, png_url: str) -> Any:
