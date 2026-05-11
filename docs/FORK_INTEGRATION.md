@@ -302,6 +302,26 @@ The remaining yellow / minor items not addressed are:
   Batch 7.
 * Various log-message / formatting / phrasing nits.
 
+## Comment-style normalization
+
+Fork-introduced code initially carried multi-paragraph rationale walks
+(numbered failure-mode enumerations, commit hashes, benchmarks, "we/our"
+framing). After all functional work landed, four Opus 1M agents in
+parallel trimmed comments back to upstream Jepson's terse, code-first
+style — one-line declarative headers above each block, 3-line max for
+non-obvious *why*, 8-line ceiling reserved for genuine gotchas.
+
+| Commit | Scope | Net lines removed |
+|---|---|---|
+| `78e25ba` | `calibration_overlays/` UI subset (10 files) | -918 |
+| `c839c72` | `calibration_overlays/` runtime subset (12 files) | -1,511 |
+| `fc3187a` | `main.py` + `components/{control,editor,settings}` + `services/` + tests (13 files) | -581 |
+| `69c9a44` (parol6-vision) | `parol6_vision/**` (25 files) | -2,374 |
+
+Total: ~5,400 lines of comment removed across 60 files. No code
+modified; all files parse via `ast.parse`. Convention is captured in
+`CLAUDE.md` under `## Code Style` so future work doesn't drift back.
+
 ## Testing strategy
 
 ### What's covered by automated tests

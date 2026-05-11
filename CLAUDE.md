@@ -135,7 +135,7 @@ Robot communication goes through a `waldoctl.RobotClient` ABC. Each backend (e.g
 
 ## Code Style
 
-- **Comments**: Describe the final implementation, not what changed. Avoid "changed X to Y" or "added this because..." comments.
+- **Comments**: terse and code-first, matching Jepson's existing style. Default to one declarative line above each block (`# Apply initial tool selection from script`). 3-line max for the *why* behind a non-obvious workaround; 8-line ceiling reserved for a genuine gotcha the code can't show. Drop commit-message-style rationale walks, numbered failure-mode enumerations, hashes/dates, benchmarks (`~500ms`, `~12s on cold start`), user-specific names, "we"/"our" framing, and any comment that just restates the code. Describe the final implementation, not what changed. When in doubt keep more text — easier to shorten in review.
 - **Tests**: Use deterministic waits (polling for conditions) rather than blind sleeps. Exception: very small sleeps (~0.1s) for debouncing are acceptable.
 - **Exception handling**: Never use `except Exception: pass`. Either catch specific exceptions with `pass`, or if catching broad exceptions, log or handle the error meaningfully.
 
