@@ -864,30 +864,50 @@ print(f"Robot status: {{status}}")
         # Update scrub bar segments to match the new paths
         self.playback.update_scrub_segments()
 
-        # Apply initial tool selection from script to scene and controller
+        # Apply initial tool selection from script to scene and controller.
+        # Skip the apply when the GUI's active tool already matches what
+        # the script's header selects — re-applying the same tool would
+        # re-trigger ``_update_envelope_for_tool_change`` which, when the
+        # tool's TCP offset differs from the current cached hull, kicks
+        # off a 6-second workspace-hull regeneration. On cold start with
+        # an active custom tool (TCP offset != 0), the debounced auto-sim
+        # used to flip the GUI's tool transiently and cause two hull
+        # regenerations to thrash back-to-back (~12 s wasted on the
+        # asyncio loop). Comparing against ``urdf_scene._current_tool``
+        # (the canonical "what's currently applied") avoids that.
         if simulation_state.tool_selections and ui_state.urdf_scene:
             first_sel = simulation_state.tool_selections[0]
             if first_sel.segment_index < 0:
                 tool_key = first_sel.tool_key
                 variant_key = first_sel.variant_key or None
-                ui_state.active_robot.set_active_tool(
-                    tool_key,
-                    variant_key=variant_key,
+                current_key = getattr(ui_state.urdf_scene, "_current_tool", None)
+                current_vk = getattr(robot_state, "tool_variant_key", "") or None
+                # Case-insensitive compare on the key so NONE/none/"" all
+                # treat as the same no-tool state — urdf_scene normalises
+                # to "none" when tool is empty, but scripts and storage
+                # both use the uppercase "NONE" form.
+                keys_match = (
+                    (tool_key or "").lower() == (current_key or "").lower()
                 )
-                ui_state.urdf_scene.apply_tool(
-                    tool_key,
-                    variant_key=variant_key,
-                )
-                ui_state.urdf_scene._update_tcp_ball_position()
-                # Sync to controller so readout reflects tool TCP
-                if ui_state.control_panel and ui_state.control_panel.client:
-                    try:
-                        await ui_state.control_panel.client.select_tool(
-                            tool_key,
-                            variant_key=variant_key or "",
-                        )
-                    except Exception as e:
-                        logger.debug("select_tool sync failed: %s", e)
+                if not keys_match or variant_key != current_vk:
+                    ui_state.active_robot.set_active_tool(
+                        tool_key,
+                        variant_key=variant_key,
+                    )
+                    ui_state.urdf_scene.apply_tool(
+                        tool_key,
+                        variant_key=variant_key,
+                    )
+                    ui_state.urdf_scene._update_tcp_ball_position()
+                    # Sync to controller so readout reflects tool TCP
+                    if ui_state.control_panel and ui_state.control_panel.client:
+                        try:
+                            await ui_state.control_panel.client.select_tool(
+                                tool_key,
+                                variant_key=variant_key or "",
+                            )
+                        except Exception as e:
+                            logger.debug("select_tool sync failed: %s", e)
 
         # Show error in program log
         if error and self.program_log:
