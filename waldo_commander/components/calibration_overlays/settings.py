@@ -1,24 +1,16 @@
 """User-tunable calibration settings, persisted via ``app.storage.user``.
 
-Each value below was previously a module-level constant in :mod:`constants`.
-The constants stay around as DEFAULTS — they keep the package working out of
-the box with no preset configured. UI edits in the calibration panel
-override defaults at runtime via ``set_value`` and persist across page
-reloads via NiceGUI's per-user cookie storage.
+Values default to the constants in :mod:`constants`; UI edits override at
+runtime via :func:`set_value` and persist across page reloads.
 
-Two ways to read a setting from a consumer module:
+Read APIs::
 
-    from . import settings
-    settings.board_translate_m            # attribute access — recommended
+    settings.board_translate_m            # attribute access
     settings.get("board_translate_m")     # dict-style lookup
 
-Tuples round-trip through JSON as lists; the read path coerces them back
-so consumers always see Python tuples regardless of whether the value was
-loaded from storage or sourced from the default.
-
-Presets are named snapshots stored under ``calib_presets`` in user storage.
-None ship with the code — the upstream-friendly choice — so a new user
-sees the defaults until they configure their setup and click Save.
+Tuples round-trip through JSON as lists and are coerced back on read.
+Presets are named snapshots under ``calib_presets``; none ship with the
+code.
 """
 
 from __future__ import annotations
@@ -36,8 +28,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-# Each setting is stored under ``calib_setting_<key>`` so we can list them
-# without colliding with other components' ``app.storage.user`` keys.
+# Storage keys are namespaced under ``calib_setting_<key>``.
 _STORAGE_PREFIX = "calib_setting_"
 _PRESETS_KEY = "calib_presets"  # dict[name, dict[key, value]]
 _ACTIVE_PRESET_KEY = "calib_active_preset"  # name | None
@@ -85,15 +76,10 @@ DEFAULTS: dict[str, Any] = {
     "hemi_azimuth_spread_deg": _c._HEMI_AZIMUTH_SPREAD_DEG,
     "hemi_centre_override_m": _c._HEMI_CENTRE_OVERRIDE_M,
     # ---- Reachability dots (visualization-only) -------------------------
-    # Number of Sobol candidates the IK sweep tries; survivors render as
-    # green dots after a non-overlap spread filter. Lower = faster
-    # sweep, fewer dots; higher = slower sweep, denser pre-filter pool.
-    # The dots actually drawn are typically far fewer than this number
-    # because the spread filter discards dots that would overlap.
+    # Sobol candidates for the IK sweep; survivors pass through a
+    # non-overlap spread filter, so the drawn count is usually lower.
     "reachability_n_candidates": 64,
-    # Sphere radius for each green dot (metres). Doubles as the
-    # min-distance threshold for the non-overlap selector, so larger
-    # radius means fewer but more spaced-out dots.
+    # Doubles as the min-distance threshold for the non-overlap selector.
     "reachability_dot_radius_m": 0.005,
     # ---- Localise sweep -------------------------------------------------
     "localise_use_j0_sweep": _c._LOCALISE_USE_J0_SWEEP,
@@ -121,16 +107,14 @@ DEFAULTS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-# Keys whose default is a tuple — JSON storage flattens these to lists, so
-# the read path converts them back.
+# Tuple defaults get flattened to lists in JSON; coerce back on read.
 _TUPLE_KEYS: frozenset[str] = frozenset(
     k for k, v in DEFAULTS.items() if isinstance(v, tuple)
 )
 
 
 def _coerce(key: str, raw: Any) -> Any:
-    """Best-effort restore of the original Python type after a round-trip
-    through JSON storage. Tuples become lists in JSON; we convert back."""
+    """Restore the original Python type after a round-trip through JSON."""
     if raw is None:
         return None
     if key in _TUPLE_KEYS and isinstance(raw, list):
@@ -152,35 +136,23 @@ def _to_storage(key: str, value: Any) -> Any:
 # ---------------------------------------------------------------------------
 
 
-# Empty until ``load_from_storage()`` runs. Keys absent here read from DEFAULTS.
+# Populated by ``load_from_storage()``; absent keys read DEFAULTS.
 _runtime: dict[str, Any] = {}
 
 
 def get(key: str) -> Any:
-    """Return the current value of ``key`` from the highest-priority
-    layer that defines it:
+    """Return ``key``'s value from the highest-priority layer:
 
-    1. Active-tool override (per-tool ``CustomToolConfig`` field) —
-       only for keys in ``custom_tools._PER_TOOL_OVERRIDABLE_KEYS``
-       (camera intrinsics + cold-start mount). Lets each camera-
-       bearing custom tool carry its own values.
-    2. Runtime override (set via ``set_value`` from the global
-       Calibration settings panel; persisted in app.storage.user).
-    3. Module default (the constants imported from ``constants.py``).
+    1. Active-tool override (camera intrinsics + cold-start mount only).
+    2. Runtime override (set via :func:`set_value`).
+    3. Module default.
 
-    Workspace-properties (board placement, hemisphere search, localise
-    tunables, etc.) skip layer 1 — those are properties of the user's
-    setup, not the tool.
+    Workspace properties (board, hemisphere, localise) skip layer 1.
     """
     if key not in DEFAULTS:
         raise KeyError(f"Unknown calibration setting: {key}")
-    # Layer 1: per-tool override.
-    # ImportError: parol6_vision tooling not installed (headless tests).
-    # RuntimeError: NiceGUI app.storage not in a request context (worker
-    #     threads, very-early init).
-    # AttributeError: ``active_tool_override`` shape changed upstream.
-    # Anything else escapes — broad ``except Exception`` would mask real
-    # bugs in the per-tool override path (e.g. a typo in a key name).
+    # Layer 1: per-tool override. Specific exceptions only so a typo in
+    # the override path doesn't get swallowed.
     try:
         from . import custom_tools  # noqa: PLC0415
 
@@ -197,14 +169,9 @@ def get(key: str) -> Any:
 
 
 def get_global(key: str) -> Any:
-    """Like :func:`get` but skips Layer 1 (the active-tool override)
-    so the returned value reflects the GLOBAL setting (runtime
-    override or shipped default).
-
-    Use this when seeding an editor for a NON-active tool's per-tool
-    override panel — the seed should come from the global, not from
-    whatever the currently-active tool happens to override the
-    global with.
+    """Like :func:`get` but skips the per-tool override layer. Use when
+    seeding an editor for a NON-active tool, where the global default is
+    the right seed.
     """
     if key not in DEFAULTS:
         raise KeyError(f"Unknown calibration setting: {key}")
@@ -226,20 +193,14 @@ def set_value(key: str, value: Any, *, persist: bool = True) -> None:
 
 
 def reset_to_defaults() -> None:
-    """Drop every runtime override and clear persisted values from storage.
-
-    Clears BOTH the global ``calib_setting_*`` keys (runtime overrides
-    set via the global Calibration settings panel) AND the per-tool
-    ``calib_tool_*`` keys (camera intrinsics / cold-start mount
-    overrides for each tool). Without the per-tool sweep, a "Reset to
-    defaults" button left orphaned per-tool overrides — confusing if
-    the user expected a clean slate.
+    """Drop every runtime override + clear ``calib_setting_*`` and
+    ``calib_tool_*`` from storage. Also clears the per-tool runtime cache.
     """
     _runtime.clear()
     try:
         from nicegui import app  # noqa: PLC0415
         store = app.storage.user
-        # Snapshot keys before mutating; storage mutates via __setitem__.
+        # Snapshot keys before mutating.
         keys_to_drop = [
             k for k in list(store.keys())
             if isinstance(k, str) and (
@@ -252,8 +213,7 @@ def reset_to_defaults() -> None:
         store[_ACTIVE_PRESET_KEY] = None
     except Exception as e:  # noqa: BLE001
         logger.debug("settings.reset_to_defaults: storage unavailable (%s)", e)
-    # Drop the per-tool runtime cache so worker threads don't keep
-    # serving stale overrides until the next prime.
+    # Drop the per-tool runtime cache so worker threads see the reset.
     try:
         from . import custom_tools  # noqa: PLC0415
         custom_tools._per_tool_runtime_cache.clear()
@@ -264,10 +224,7 @@ def reset_to_defaults() -> None:
 
 
 def __getattr__(name: str) -> Any:
-    """Module-level attribute access — ``settings.board_translate_m`` ≡
-    ``settings.get("board_translate_m")``. Raises ``AttributeError`` for
-    unknown names so ``hasattr`` works normally.
-    """
+    """``settings.board_translate_m`` ≡ ``settings.get("board_translate_m")``."""
     if name in DEFAULTS:
         return get(name)
     raise AttributeError(
@@ -281,11 +238,8 @@ def __getattr__(name: str) -> Any:
 
 
 def load_from_storage() -> None:
-    """Populate ``_runtime`` from ``app.storage.user``. No-op when the
-    storage isn't available (e.g. called outside a NiceGUI request context).
-
-    Safe to call repeatedly — each call refreshes the in-memory cache from
-    storage. Existing runtime entries for keys NOT in storage are kept.
+    """Populate ``_runtime`` from ``app.storage.user``. Idempotent.
+    Existing runtime entries for keys not in storage are kept.
     """
     try:
         from nicegui import app  # noqa: PLC0415
@@ -362,9 +316,8 @@ def _set_active_preset(name: str | None) -> None:
 
 def save_preset(name: str) -> None:
     """Snapshot every key (runtime override else default) under ``name``.
-
-    Overwrites if the name already exists. Uses a complete snapshot so
-    older presets keep working when new keys are added in future releases.
+    Overwrites if the name exists; complete snapshot survives future
+    additions to DEFAULTS.
     """
     if not name:
         raise ValueError("preset name cannot be empty")
@@ -379,9 +332,8 @@ def save_preset(name: str) -> None:
 
 
 def load_preset(name: str) -> None:
-    """Apply the named preset: every key from the preset replaces its
-    runtime override, missing keys fall back to the default. Persists
-    bulk to storage. Raises KeyError when the preset doesn't exist.
+    """Apply the named preset; missing keys fall back to the default.
+    Persists bulk to storage. Raises KeyError when the preset is missing.
     """
     presets = _load_presets()
     if name not in presets:
@@ -409,10 +361,8 @@ def delete_preset(name: str) -> None:
 
 
 def export_preset_json(name: str | None = None) -> str:
-    """Return a JSON string of the named preset (or the current runtime
-    state when ``name`` is None). Useful for exporting a configuration
-    out-of-band, e.g. saving it as a project file or sharing with a
-    collaborator.
+    """JSON snapshot of the named preset (or the current runtime state
+    when ``name`` is None).
     """
     import json  # noqa: PLC0415
     if name is None:
@@ -426,8 +376,8 @@ def export_preset_json(name: str | None = None) -> str:
 
 
 def import_preset_json(name: str, payload: str) -> None:
-    """Parse ``payload`` (a JSON string) and save it as a preset under
-    ``name``. Raises ``ValueError`` for unparseable input.
+    """Parse JSON ``payload`` and save it as a preset under ``name``.
+    Raises ``ValueError`` for unparseable input.
     """
     import json  # noqa: PLC0415
     try:

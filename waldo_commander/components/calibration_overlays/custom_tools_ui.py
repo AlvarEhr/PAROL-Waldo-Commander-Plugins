@@ -1,21 +1,9 @@
 """UI for the calibration panel's "Custom tools" expansion.
 
-Lists every tool found under ``~/.waldo-commander/custom_tools/`` and
-provides per-tool transform inputs (translate, RPY, scale), STL upload
-slots (body + optional jaws), TCP transform inputs, and snap helpers
-(bbox centre, flange-face plane align, hole-detection).
-
-Each transform edit:
-1. updates the on-disk ``config.json``,
-2. rebakes the STL into parol6's mesh dir with the new transform,
-3. notifies the user that switching the active tool in the gripper
-   panel (or restarting waldo-commander) will pick up the new mesh.
-
-Live-updating the URDF scene's already-loaded mesh in place is non-
-trivial — it requires touching waldo-commander's UrdfScene internals,
-which is out of scope for Phase 1B. For iteration, the workflow is
-"edit → save → switch the gripper dropdown back-and-forth → see the
-update". We surface this in a notice on every save.
+Lists every tool under ``~/.waldo-commander/custom_tools/`` with per-tool
+transform inputs, STL upload slots, TCP inputs, and snap helpers
+(bbox / flange face / hole). Each edit rewrites ``config.json`` and
+re-bakes the STL into parol6's mesh dir.
 """
 
 from __future__ import annotations
@@ -39,10 +27,8 @@ logger = logging.getLogger(__name__)
 
 
 def _open_folder_in_os(path: Path) -> bool:
-    """Open ``path`` in the OS's native file browser. NiceGUI server-side
-    runs on the user's machine (waldo-commander is a local app, not
-    hosted), so this opens the folder on the user's desktop. Returns
-    True on success.
+    """Open ``path`` in the OS file browser. waldo-commander runs on the
+    user's machine so this targets their desktop. Returns True on success.
     """
     path.mkdir(parents=True, exist_ok=True)
     try:
@@ -72,7 +58,7 @@ def _tuple3_inputs(
     step: float = 0.1,
     on_change: Callable[[tuple[float, float, float]], None] | None = None,
 ) -> list[ui.number]:
-    """Three numeric inputs in a row, scaled for display (storage × scale)."""
+    """Three numeric inputs in a row; display = storage × scale."""
     inputs: list[ui.number] = []
 
     def _emit(_e: Any = None) -> None:
@@ -107,10 +93,8 @@ def _tuple3_inputs(
 def _build_intrinsics_override(
     cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
 ) -> None:
-    """Per-tool intrinsics override section. Toggle-on to override the
-    globals; off resets every per-tool intrinsics field to None
-    (inherit). When on, the six fields are pre-populated with the
-    current global values so the user has a starting point.
+    """Per-tool intrinsics override toggle + six fields. Toggle-on
+    pre-populates with globals; off resets every field to None (inherit).
     """
     from . import settings  # noqa: PLC0415
 
@@ -128,12 +112,9 @@ def _build_intrinsics_override(
         v = getattr(cfg, attr)
         if v is not None:
             return float(v)
-        # Read the GLOBAL setting (runtime override or shipped default),
-        # not ``settings.get()`` — that one returns the ACTIVE tool's
-        # per-tool override first, which is wrong here: when the user
-        # opens this editor for a non-active tool, the seed would
-        # show the currently-active tool's intrinsics instead of the
-        # global default. Misleading UX.
+        # ``get_global`` skips the active-tool override layer; using
+        # ``get`` would leak the active tool's overrides into a non-
+        # active tool's editor.
         return float(settings.get_global(fallback_key))
 
     fx = _seed_value("intr_fx", "intr_fx")
@@ -214,11 +195,8 @@ def _build_intrinsics_override(
 def _build_cam_mount_override(
     cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
 ) -> None:
-    """Per-tool camera-mount override (translate + tilt). Same pattern
-    as the intrinsics override — toggle-on populates from globals,
-    toggle-off resets to None. Also displays a "Save calibrated mount
-    here" button — when calibration writes a result via the calibration
-    panel, this is where it lands automatically.
+    """Per-tool camera-mount override (translate + tilt). Same toggle
+    pattern as :func:`_build_intrinsics_override`.
     """
     import math  # noqa: PLC0415
 
@@ -233,11 +211,8 @@ def _build_cam_mount_override(
         f"display: {'block' if has_override else 'none'};",
     )
 
-    # Same global-vs-active-tool concern as _build_intrinsics_override
-    # — when this editor opens for a NON-active tool, ``settings.get``
-    # returns the currently-active tool's per-tool override, which
-    # silently leaks the wrong cam-mount values into the seed.
-    # ``settings.get_global`` skips the active-tool override layer.
+    # ``get_global`` skips the active-tool override layer; see
+    # ``_build_intrinsics_override._seed_value`` for rationale.
     seed_translate = (
         cfg.cam_mount_translate_mm
         if cfg.cam_mount_translate_mm is not None
@@ -327,13 +302,8 @@ def _build_cam_mount_override(
 def _build_variants_section(
     cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None],
 ) -> None:
-    """Per-tool variants editor. Each variant ships its own jaw STL pair
-    + jaw motion and gets a ``ToolVariant`` entry in the parol6 registry
-    so the gripper panel's variant dropdown can swap among them.
-
-    Default tool jaws (jaw_left.stl / jaw_right.stl) stay around — they
-    apply when the user picks the tool with no variant selected. The
-    per-variant jaws override at variant-pick time.
+    """Variants editor. Each variant gets a ``ToolVariant`` entry; default
+    jaws apply when no variant is picked.
     """
     ui.label(
         "Each variant has its own jaw STL pair and jaw motion.",
@@ -403,7 +373,7 @@ def _build_variant_card(
     variant: custom_tools.CustomToolVariant,
     refresh: Callable[[], None],
 ) -> None:
-    """Editor for one variant — STL upload slots + jaw motion params."""
+    """Editor for one variant: STL slots + jaw motion."""
     with ui.card().classes("w-full q-mt-xs bg-blue-grey-9"):
         with ui.row().classes("w-full items-center"):
             ui.label(variant.display_name or variant.key).classes(
@@ -421,12 +391,8 @@ def _build_variant_card(
 
             def _on_delete_variant(v=variant) -> None:
                 cfg.variants = [x for x in cfg.variants if x.key != v.key]
-                # Best-effort delete the on-disk variant STLs too —
-                # both the user-uploaded source under ``CUSTOM_TOOLS_ROOT``
-                # and the baked transformed copy in parol6's mesh dir.
-                # Without the baked-copy unlink, deleting a variant left
-                # an orphan ``custom_<name>_variant_<key>_jaw_<side>.stl``
-                # in parol6's mesh dir for the lifetime of the install.
+                # Delete both the user source STL and the baked copy so
+                # parol6's mesh dir doesn't accumulate orphans.
                 for side in ("left", "right"):
                     p = cfg.variant_jaw_path(v.key, side)
                     try:
@@ -436,7 +402,7 @@ def _build_variant_card(
                         logger.debug(
                             "couldn't delete variant STL %s: %s", p, e,
                         )
-                # Sweep baked variant copies out of parol6's mesh dir.
+                # Sweep baked variant copies.
                 mesh_dir = custom_tools._parol6_mesh_dir()
                 if mesh_dir is not None:
                     for side in ("left", "right"):
@@ -528,8 +494,8 @@ def _build_variant_card(
 
 
 def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], None]) -> None:
-    """Render the editor for one custom tool. ``refresh`` rebuilds the
-    list view after a structural change (delete, rename, etc.).
+    """Editor for one custom tool. ``refresh`` rebuilds the list view
+    after a structural change.
     """
     is_active = custom_tools.is_active_tool(cfg.name)
 
@@ -555,14 +521,9 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 if not cfg.has_body:
                     ui.notify("Upload a body STL first", color="warning")
                     return
-                # Bake first — registry mutation should be in place
-                # before the local apply queries meshes. ``register_one``
-                # returns False when the bake itself fails (corrupt STL,
-                # trimesh import error, etc.); without checking the
-                # return, we'd fall through to ``select_as_active`` and
-                # parol6's apply_tool would fail because the canonical
-                # mesh entries don't exist in the registry. Surface the
-                # bake failure to the user and bail.
+                # Bake before local apply: ``select_as_active``'s
+                # ``apply_tool`` reads mesh entries that don't exist
+                # until ``register_one`` succeeds.
                 if not custom_tools.register_one(cfg):
                     ui.notify(
                         f"Bake failed for custom:{cfg.name}; check the "
@@ -579,11 +540,8 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                     if cfg.proxy_tool_key:
                         msg += f" (motor proxied to {cfg.proxy_tool_key})"
                     ui.notify(msg, color="positive", position="top")
-                    # Live-apply calibration overlays + panel for the
-                    # new tool: re-evaluates camera-bearing gating,
-                    # picks up per-tool intrinsic / mount overrides,
-                    # builds or tears down scene overlays as needed.
-                    # No page reload required.
+                    # Live-apply for the new tool (re-evaluates gating,
+                    # picks up overrides, rebuilds overlays).
                     try:
                         from .panel import apply_calibration_state  # noqa: PLC0415
 
@@ -650,8 +608,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                         f"Uploaded {role} STL ({e.name})",
                         color="positive",
                     )
-                    # Auto-detect units on first body upload — just
-                    # report; user decides whether to apply.
+                    # Report a unit guess for the body upload; user applies.
                     if role == "body":
                         scale, label = custom_tools.detect_mesh_unit_scale(
                             cfg.body_path,
@@ -694,12 +651,8 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
             custom_tools.save_config(cfg)
 
         def _save_and_rebake() -> None:
-            """Save config + rebake STL + reregister in tool registry +
-            (when this tool is active) live-refresh the URDF scene so
-            the user sees the change immediately. No-op refresh when
-            this isn't the active tool — the user sees the update once
-            they switch to this tool via the gripper panel or the
-            "Use this tool" button.
+            """Save config + rebake + re-register, live-refresh the URDF
+            scene when this tool is active.
             """
             custom_tools.save_config(cfg)
             ok = custom_tools.register_one(cfg)
@@ -711,12 +664,10 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
                 return
             refreshed = custom_tools.live_refresh_active_tool(cfg.name)
             if refreshed:
-                # Active tool — silent live update; no notify needed.
-                # Each transform-input keystroke shouldn't pop a toast.
+                # Active tool — silent live update.
                 pass
             else:
-                # User is editing a non-active tool. Quiet info-level
-                # toast so they remember to switch when they're done.
+                # Non-active tool — quiet info toast.
                 ui.notify(
                     f"Re-baked custom:{cfg.name}. Click \"Use this tool\" to view.",
                     color="info", position="top", timeout=2000,
@@ -785,7 +736,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
         ui.label("Snap helpers").classes("text-xs opacity-70 q-mt-sm")
 
         def _apply_translate(t: tuple[float, float, float]) -> None:
-            # Update both the inputs (visually) AND the stored config.
+            # Update both the inputs (display) and the stored config.
             for i, inp in enumerate(translate_inputs):
                 inp.value = float(t[i]) * 1000.0
             cfg.mesh_translate_m = t
@@ -805,9 +756,8 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
             if t is None:
                 ui.notify("Bbox-centre snap failed", color="warning")
                 return
-            # The mesh transform is applied as scale * mesh + translate;
-            # the bbox centroid is in raw STL units, so scale it before
-            # using as a translate.
+            # bbox centroid is in raw STL units; scale to match the
+            # ``scale * mesh + translate`` order the bake applies.
             t_scaled = tuple(v * cfg.mesh_scale for v in t)
             _apply_translate(t_scaled)
             ui.notify("Snapped to bbox centre", color="positive")
@@ -986,15 +936,7 @@ def _build_tool_card(cfg: custom_tools.CustomToolConfig, refresh: Callable[[], N
 
 
 def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
-    """Dialog to fork an existing registered tool into a new custom tool.
-
-    The picker lists every entry in ``parol6.tools._TOOL_REGISTRY`` —
-    that includes built-ins (SSG-48, MSG, PNEUMATIC, VACUUM) AND any
-    other custom tools already registered. Picking SSG-48 after the
-    SSG-48 mesh hijack has run gives you a custom tool whose body is
-    the merged camera-bracket STL — exactly the test target for this
-    workflow.
-    """
+    """Dialog to fork any registered tool into a new custom tool."""
     available = custom_tools.list_registered_tools()
     if not available:
         ui.notify(
@@ -1041,8 +983,7 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
                     color="warning",
                 )
                 return
-            # Bake + register so it's picked up by the gripper dropdown
-            # without a restart.
+            # Register so the gripper dropdown picks it up.
             custom_tools.register_one(cfg)
             ui.notify(
                 f"Imported {source_key} as custom:{target}.",
@@ -1060,9 +1001,7 @@ def _import_existing_tool_dialog(refresh: Callable[[], None]) -> None:
 
 
 def _add_tool_dialog(refresh: Callable[[], None]) -> None:
-    """Open a dialog to create a new custom tool: name + description +
-    optional immediate body STL upload.
-    """
+    """Create-tool dialog: name + description; STLs uploaded later."""
     with ui.dialog() as dialog, ui.card().classes("w-full max-w-md"):
         ui.label("Add custom tool").classes("text-base font-semibold")
         ui.label(
@@ -1124,7 +1063,7 @@ def _add_tool_dialog(refresh: Callable[[], None]) -> None:
 
 
 def build_custom_tools_expansion() -> None:
-    """Render the "Custom tools" expansion: list + add button."""
+    """"Custom tools" expansion: list + add / import buttons."""
     custom_tools.ensure_root()
 
     @ui.refreshable

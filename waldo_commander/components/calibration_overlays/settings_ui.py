@@ -1,14 +1,10 @@
 """UI builders for the calibration settings panel.
 
-Each ``build_*_section`` function renders one sub-expansion's worth of
-inputs. Inputs read their initial value from :mod:`settings`, persist on
-edit (via ``settings.set_value``), and trigger live-apply side effects
-where applicable.
+Each ``build_*_section`` renders one sub-expansion. Inputs persist via
+``settings.set_value`` and trigger live-apply side effects.
 
-Unit handling: settings store SI internally (metres + radians) for
-geometry; the UI exposes the more ergonomic mm + degrees by passing a
-``scale`` factor to ``_tuple_input`` / ``_number_input`` (display = storage
-× scale). On read the inputs reverse the scale.
+Settings store SI internally; inputs convert to mm + degrees for display
+via a ``scale`` factor (display = storage × scale).
 """
 
 from __future__ import annotations
@@ -30,10 +26,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-# Common ArUco dictionaries available across OpenCV ≥4.10. Listed in
-# decreasing usefulness for ChArUco — 4x4_50 is the default for tablet
-# boards because it offers the smallest markers (more squares per board)
-# while keeping decoding robust.
+# ArUco dictionaries available in OpenCV ≥4.10, listed by decreasing
+# usefulness for ChArUco; 4x4_50 is the tablet-board default.
 ARUCO_DICTIONARIES: tuple[str, ...] = (
     "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
     "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
@@ -46,13 +40,9 @@ JAW_VARIANTS: tuple[str, ...] = ("finger", "pinch")
 
 
 def _on_setting_change(key: str, value: Any) -> None:
-    """Persist + live-apply a single setting. Used by every input handler.
-
-    For board geometry keys (square_length / marker_length), we surface a
-    warning when the marker/square invariant is violated. The setting
-    still applies — ``current_board_config`` clamps marker_length to a
-    valid value at consumer-read time so the scene keeps rendering — but
-    the user gets a visible nudge to fix the inconsistency.
+    """Persist + live-apply a single setting. Surfaces a warning when the
+    marker/square invariant is violated (``current_board_config`` clamps
+    at consumer-read time so the scene keeps rendering).
     """
     try:
         settings.set_value(key, value)
@@ -60,8 +50,7 @@ def _on_setting_change(key: str, value: Any) -> None:
         logger.warning("settings.set_value(%s, %r) failed: %s", key, value, e)
         return
 
-    # Marker/square invariant — surface a warning so the user knows the
-    # value they typed is being clamped at consumer-read time.
+    # Marker/square invariant warning.
     if key in ("board_square_length_m", "board_marker_length_m"):
         sl = float(settings.get("board_square_length_m"))
         ml = float(settings.get("board_marker_length_m"))
@@ -100,12 +89,8 @@ def _number_input(
     width: str = "w-32",
     debounce_ms: int = 500,
 ) -> ui.number:
-    """Render a single-number input bound to ``settings[key]``.
-
-    ``debounce_ms`` delays the on-change handler so rapid typing doesn't
-    flood the asyncio loop with live-apply events. Quasar's q-input
-    debounce prop holds back v-model emit until input has been idle for
-    that long, which is when ``update:model-value`` fires.
+    """Single-number input bound to ``settings[key]``. ``debounce_ms`` holds
+    back v-model emit so rapid typing doesn't flood live-apply.
     """
     current = float(settings.get(key))
     inp = (
@@ -156,8 +141,7 @@ def _tuple_input(
     width: str = "w-24",
     debounce_ms: int = 500,
 ) -> list[ui.number]:
-    """Render an N-element tuple as N number inputs in a single row, all
-    persisting+applying ``key`` together on any field change."""
+    """N number inputs in a row; all persist+apply ``key`` on any change."""
     current = settings.get(key)
     inputs: list[ui.number] = []
 
@@ -193,15 +177,11 @@ def _tuple_input(
 
 
 def _switch_input(key: str, label: str) -> ui.switch:
-    """Render a bool setting as a NiceGUI switch."""
+    """Bool setting as a NiceGUI switch."""
     sw = ui.switch(label, value=bool(settings.get(key))).props("dense")
 
     def _on_change(_e: Any = None) -> None:
-        # Read from the event payload, not ``sw.value``. Per the
-        # comment in panel.py:484, ``sw.value`` may still hold the
-        # PREVIOUS state when ``update:model-value`` fires on the
-        # underlying Quasar component, so we'd persist the wrong
-        # value on the first toggle.
+        # Read e.value, not sw.value — Quasar may not have propagated.
         _on_setting_change(key, bool(getattr(_e, "value", False)))
 
     sw.on("update:model-value", _on_change)
@@ -215,7 +195,7 @@ def _select_input(
     *,
     width: str = "w-48",
 ) -> ui.select:
-    """Render a string setting as a dropdown."""
+    """String setting as a dropdown."""
     current = str(settings.get(key))
     sel = ui.select(
         list(options), value=current if current in options else options[0],
@@ -236,8 +216,7 @@ def _optional_xyz_input(
     scale: float = 1000.0,
     fmt: str = "%.1f",
 ) -> None:
-    """Render a ``tuple[float, float, float] | None`` setting with a
-    "use default" toggle and X/Y/Z fields underneath. Used for
+    """Optional XYZ setting: toggle + X/Y/Z fields. Used for
     ``hemi_centre_override_m``.
     """
     current = settings.get(key)
@@ -249,14 +228,8 @@ def _optional_xyz_input(
     inputs: list[ui.number] = []
 
     def _on_xyz_change(_e: Any = None, *, force_enabled: bool = False) -> None:
-        # The xyz inputs aren't switches; they fire on user-typing,
-        # at which point the toggle event has long settled and
-        # reading ``sw.value`` is safe. But ``_on_switch`` calls
-        # this function directly during the OFF->ON transition,
-        # WHILE Quasar's update:model-value is still in flight —
-        # ``sw.value`` may hold the previous (OFF) state on that
-        # call. ``force_enabled=True`` bypasses the gate when the
-        # caller already knows the switch went ON.
+        # ``force_enabled`` bypasses the ``sw.value`` gate during the
+        # OFF->ON transition (Quasar may not have propagated yet).
         if not force_enabled and not bool(sw.value):
             return
         try:
@@ -270,16 +243,11 @@ def _optional_xyz_input(
         _on_setting_change(key, new_storage)
 
     def _on_switch(_e: Any = None) -> None:
-        # Read from the event payload — see _switch_input for the
-        # rationale. ``sw.value`` may hold the previous state when
-        # update:model-value fires.
+        # Read e.value — see ``_switch_input`` for the rationale.
         new_value = bool(getattr(_e, "value", False))
         if new_value:
-            # Switch ON: persist whatever's in the inputs as the
-            # initial override value. ``force_enabled=True`` bypasses
-            # the ``sw.value`` gate which would otherwise reject this
-            # call because Quasar hasn't yet propagated the new value
-            # to the python-side ``sw.value`` property.
+            # Persist whatever's in the inputs as the initial value;
+            # ``force_enabled`` bypasses the not-yet-propagated sw.value.
             _on_xyz_change(force_enabled=True)
             for inp in inputs:
                 inp.set_enabled(True)
@@ -313,13 +281,8 @@ def _optional_xyz_input(
 
 
 def _render_charuco_png_dialog() -> None:
-    """Open a dialog that renders the current board to PNG at a chosen
-    physical scale, then offers it as a download.
-
-    The user picks display PPI (pixels-per-inch) — for a Samsung Galaxy
-    Tab S9 Ultra that's 240, for a typical printer ~300, for a high-DPI
-    monitor 96-150. We compute pixels-per-metre = ppi / 0.0254 and call
-    ``parol6_vision.calibration.board.render_board_png`` with it.
+    """Render the current board to PNG at user-chosen DPI, then download.
+    Converts DPI → pixels-per-metre via ``ppi / 0.0254``.
     """
     try:
         from .state import current_board_config  # noqa: PLC0415
@@ -419,7 +382,6 @@ def build_board_section() -> None:
         ("Rx (deg)", "Ry (deg)", "Rz (deg)"),
         scale=180.0 / math.pi, fmt="%.2f", step=0.5,
     )
-    # Hint annotation under RPY — XYZ-extrinsic (scipy "XYZ").
     ui.label("Rotation order: scipy XYZ-extrinsic.").classes(
         "text-xs opacity-60",
     )
@@ -540,10 +502,9 @@ def _per_tool_number_input(
     cast: Callable[[Any], Any] = float,
     width: str = "w-32",
 ) -> ui.number:
-    """Number input bound to ``app.storage.user[calib_tool_<key>_<setting>]``
-    for ``tool_key``. Initial value: per-tool override if set, otherwise
-    the current global value (from ``settings.get``). Editing
-    auto-writes to per-tool storage."""
+    """Number input bound to the per-tool override for ``tool_key``.
+    Initial value: override if set, else the global. Edits auto-write.
+    """
     from . import custom_tools  # noqa: PLC0415
 
     override = custom_tools.get_per_tool_override(tool_key, setting_key)
@@ -552,9 +513,7 @@ def _per_tool_number_input(
     else:
         current = float(override)
     def _on_change(e: Any = None) -> None:
-        # Read e.value over inp.value so the post-debounce model-value
-        # commit doesn't race against Quasar's underlying updates.
-        # Same pattern the master-toggle / force-show switches use.
+        # Read e.value over inp.value to avoid the post-debounce race.
         raw = getattr(e, "value", None)
         if raw is None:
             raw = inp.value if inp is not None else current * scale
@@ -564,10 +523,7 @@ def _per_tool_number_input(
             return
         new_storage = cast(display / scale)
         custom_tools.set_per_tool_override(tool_key, setting_key, new_storage)
-        # Live-apply: rebuild camera mount / redraw frustum so the
-        # running scene picks up the new value. Same dispatcher the
-        # global settings panel uses (intrinsic keys redraw the
-        # frustum, cam_mount keys rebuild the CameraMount + redraw).
+        # Live-apply: rebuild mount / redraw frustum.
         try:
             from . import live_apply  # noqa: PLC0415
 
@@ -606,10 +562,7 @@ def _per_tool_tuple_input(
     inputs: list[ui.number] = []
 
     def _on_change(_e: Any = None) -> None:
-        # Read every input's current value to build the tuple. Bound
-        # to ``on_change=`` (kwarg) instead of ``.on("update:model-value")``
-        # to avoid the post-debounce read race the switch-handler fix
-        # established as the right pattern.
+        # Bound via ``on_change=`` kwarg to avoid the post-debounce race.
         try:
             new_display = tuple(
                 float(inp.value if inp.value is not None else 0.0)
@@ -619,9 +572,7 @@ def _per_tool_tuple_input(
             return
         new_storage = tuple(v / scale for v in new_display)
         custom_tools.set_per_tool_override(tool_key, setting_key, new_storage)
-        # Live-apply: rebuild camera mount / redraw frustum so the
-        # running scene picks up the new value. Sibling function
-        # ``_per_tool_number_input`` covers the per-key dispatch.
+        # Live-apply: rebuild mount / redraw frustum.
         try:
             from . import live_apply  # noqa: PLC0415
 
@@ -650,20 +601,9 @@ def _per_tool_tuple_input(
 
 
 def build_per_tool_camera_section() -> None:
-    """Per-tool camera intrinsics + cold-start mount override editor for
-    the GUI's currently-active tool.
-
-    Where: a sub-expansion in the global Calibration settings panel.
-    Why separate from the global Camera intrinsics + Camera mount
-    sections above: those edit GLOBAL DEFAULTS (apply to any tool that
-    doesn't have a per-tool override). This section writes to
-    ``app.storage.user[calib_tool_<tool_key>_<setting>]`` so each
-    camera-bearing tool can carry its own values — when the user
-    switches between tools (Alvar's SSG-48 + bracket vs MSG AI), the
-    intrinsics + mount auto-swap.
-
-    Page-reload required after switching tools to refresh the inputs
-    + the overlays — same pattern as the master switch.
+    """Per-tool camera intrinsics + cold-start mount override for the
+    active tool. Writes to ``app.storage.user[calib_tool_<key>_*]`` so
+    each camera-bearing tool carries its own values.
     """
     from . import custom_tools  # noqa: PLC0415
 
@@ -777,9 +717,8 @@ def build_hemisphere_section() -> None:
 
 
 def build_reachability_section() -> None:
-    """Reachability dot count + size. Live-applied via ``live_apply``:
-    count change re-runs the IK sweep; radius change just re-runs the
-    non-overlap selection at the new size.
+    """Reachability dot count + size. Count changes re-run the IK sweep;
+    radius changes only re-run the non-overlap selection.
     """
     ui.label("Sphere radius (mm)").classes("text-xs opacity-70")
     _number_input(
@@ -797,9 +736,7 @@ def build_reachability_section() -> None:
         "usually lower.",
     ).classes("text-xs opacity-60 q-mt-xs")
 
-    # Live count info: total reachable + drawn (non-overlapping) updated
-    # after each sweep / re-render via the callback registered into
-    # ``_state['reachability_info_refresh']``.
+    # Refreshed via ``_state['reachability_info_refresh']`` after each sweep.
     @ui.refreshable
     def _info_label() -> None:
         from .state import _state as _s  # noqa: PLC0415
@@ -844,10 +781,8 @@ def build_reachability_section() -> None:
             ).classes("text-xs opacity-70 q-mt-xs")
 
     _info_label()
-    # Register the refresh callback so reachability.py can poke it
-    # after each sweep / re-render. Idempotent: a previous callback
-    # gets replaced. The callback is best-effort, so a stale one
-    # (from an older panel render) won't crash the render path.
+    # Register the refresh callback for reachability.py to invoke after
+    # each sweep. Idempotent; stale callbacks don't crash the render.
     from .state import _state as _s_module  # noqa: PLC0415
 
     _s_module["reachability_info_refresh"] = _info_label.refresh
@@ -919,10 +854,7 @@ def build_localise_section() -> None:
 
 
 def build_gripper_section() -> None:
-    """Gripper notice — tool selection lives in the bottom-right
-    waldo-commander gripper panel, not here. This space is reserved for
-    Phase 1B (custom tool registration / drop-in STL configuration).
-    """
+    """Gripper notice; tool selection lives in the bottom-right panel."""
     ui.label(
         "Tool and jaw variant are configured via the bottom-right gripper panel.",
     ).classes("text-xs opacity-70")
@@ -934,7 +866,7 @@ def build_gripper_section() -> None:
 
 
 def build_calibration_settings_expansion() -> None:
-    """Render the full "Calibration settings" expansion with all sub-sections."""
+    """Render the "Calibration settings" expansion with all sub-sections."""
     with ui.expansion("Calibration settings", icon="tune").classes("w-full"):
         with ui.expansion("Calibration board", icon="grid_4x4").classes("w-full"):
             build_board_section()
@@ -971,10 +903,8 @@ def build_calibration_settings_expansion() -> None:
 
 
 def build_preset_bar(refresh_panel: Callable[[], None]) -> None:
-    """Render the preset dropdown + Save / Save as / Delete / Reset / Export.
-
-    ``refresh_panel`` is called after a preset is loaded or after Reset so
-    the panel rebuilds with the new values shown in every input.
+    """Preset dropdown + Save / Save as / Delete / Reset / Export.
+    ``refresh_panel`` rebuilds inputs after load / reset.
     """
     presets = settings.list_presets()
     active = settings.get_active_preset()
@@ -991,7 +921,7 @@ def build_preset_bar(refresh_panel: Callable[[], None]) -> None:
             choice = str(sel.value or "(Defaults)")
             if choice == "(Defaults)":
                 settings.reset_to_defaults()
-                # Re-apply every key's side effects so the scene rebuilds.
+                # Re-run side effects so the scene rebuilds.
                 for key in settings.DEFAULTS:
                     try:
                         live_apply.apply_setting_change(key)
@@ -1055,7 +985,7 @@ def build_preset_bar(refresh_panel: Callable[[], None]) -> None:
             except KeyError:
                 ui.notify(f"Preset {choice!r} not found", color="warning")
                 return
-            # Show in a dialog so the user can copy-paste it.
+            # Show in a dialog for copy-paste.
             with ui.dialog() as dialog, ui.card().classes("w-full max-w-2xl"):
                 ui.label(f"Preset JSON ({choice})").classes(
                     "text-base font-semibold",

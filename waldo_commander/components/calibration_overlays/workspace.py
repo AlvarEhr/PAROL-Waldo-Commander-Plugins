@@ -18,16 +18,9 @@ logger = logging.getLogger(__name__)
 
 
 def _ensure_workspace_envelope() -> bool:
-    """Load and cache waldo-commander's workspace hull STL.
-
-    The hull is a scipy.spatial.ConvexHull computed by waldo-commander from
-    sampled FK over joint limits, then exported to STL at
-    ``~/.waldo-commander/workspace_hull.stl``. We reload the half-space
-    representation (``Ax + b <= 0`` for each face) so we can do fast
-    point-in-hull tests for calibration candidates.
-
-    Returns True if the envelope is available, False if anything went wrong.
-    Logs once on success / failure.
+    """Load + cache the workspace hull STL into a half-space representation
+    (``Ax + b <= 0`` per face) for fast point-in-hull tests. Returns True
+    when the envelope is available.
     """
     if _state["envelope_loaded"]:
         return _state["envelope_planes_A"] is not None
@@ -64,19 +57,12 @@ def _ensure_workspace_envelope() -> bool:
 
 
 def envelope_contains(points: NDArray[np.float64]) -> NDArray[np.bool_]:
-    """Vectorised point-in-hull test against waldo-commander's envelope.
-
-    Args:
-        points: (N, 3) world-frame positions, or a single (3,).
-
-    Returns:
-        (N,) bool array, True = inside the workspace hull. Returns all-True
-        if the envelope hasn't been loaded (e.g. no waldo-commander cache yet).
+    """Vectorised point-in-hull test. ``points`` is (N, 3) or (3,); returns
+    an (N,) bool array. All-True when the envelope isn't loaded.
     """
     pts = np.atleast_2d(np.asarray(points, dtype=np.float64))
     A = _state.get("envelope_planes_A")
     b = _state.get("envelope_planes_b")
     if A is None or b is None:
         return np.ones(len(pts), dtype=bool)
-    # A point is inside iff it satisfies every face's half-space inequality.
     return np.all(pts @ A.T + b <= 1e-9, axis=1)

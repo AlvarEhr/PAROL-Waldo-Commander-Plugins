@@ -1,21 +1,8 @@
 """DEPRECATED — superseded by ``custom_tools.auto_migrate_ssg48_with_bracket``.
 
-Tool-registry hijack — replaces SSG-48 body mesh with user's merged STL.
-
-This module's :func:`hijack_ssg48_body_mesh` was the original integration
-path for the calibration package. Commit ee8674e migrated the use case
-into a custom-tool registration (see ``custom_tools.py`` +
-``main.py:initialize_urdf_scene``), which is more flexible (supports
-any tool, not just SSG-48) and survives upstream tool-registry edits
-without colliding with the stock entry.
-
-The hijack helper is kept here, behaviourally unchanged, for any
-out-of-tree script that imports it directly. New integrations should
-use ``custom_tools.register_one`` / ``custom_tools.register_all``
-instead. The module is no longer imported from ``main.py`` and the
-``hijack_ssg48_body_mesh`` name is no longer re-exported from the
-package's ``__init__.py`` — it remains accessible only via direct
-``from ...ssg48_hijack import hijack_ssg48_body_mesh``.
+Replaces SSG-48 body mesh with the user's merged STL. Kept for any
+out-of-tree code that imports :func:`hijack_ssg48_body_mesh` directly;
+not wired into ``main.py`` and not re-exported from the package.
 """
 
 from __future__ import annotations
@@ -70,13 +57,10 @@ def _bake_merged_stl_to_parol6_mesh_dir() -> Path | None:
 
         dst = mesh_dir / "ssg48_body_realsense.stl"
 
-        # ALWAYS rebake. Earlier versions skipped when dst.mtime >= src.mtime,
-        # but that ignored edits to the placement constants below — when the
-        # python constants change the source STL's mtime stays the same, so
-        # the cached bake silently kept the OLD transform. Bake takes <1 s.
+        # Always rebake — placement constants below change without bumping
+        # the source STL's mtime, so any mtime-based skip would miss edits.
         mesh = trimesh.load(src, force="mesh")
-        # Step 1: fit transform — scale + translate to align the merged mesh
-        # with the flange. These are the calibrated values; do not edit.
+        # Step 1: fit transform — scale + translate to align with the flange.
         T_fit = np.eye(4, dtype=np.float64)
         T_fit[:3, :3] = np.eye(3) * _MERGED_STL_FIT_SCALE
         T_fit[:3, 3] = _MERGED_STL_FIT_TRANSLATE_M
@@ -133,11 +117,8 @@ def hijack_ssg48_body_mesh(active_robot: Any | None = None) -> bool:
             logger.warning("SSG-48 tool not in parol6 registry; nothing to hijack")
             return False
 
-        # Cache-busting query string: ?v=<mtime>. The static-file server ignores
-        # query strings, but Three.js' STLLoader treats different URLs as
-        # different resources, so this guarantees the browser refetches whenever
-        # the bake produces new bytes (which is on EVERY waldo-commander
-        # restart since the bake-skip logic was removed).
+        # Cache-bust ?v=<mtime> so Three.js' STLLoader refetches on rebake;
+        # the static-file server ignores the query string.
         baked_versioned = f"{baked.name}?v={int(baked.stat().st_mtime)}"
 
         if not _state["ssg48_hijacked"]:
@@ -160,8 +141,7 @@ def hijack_ssg48_body_mesh(active_robot: Any | None = None) -> bool:
                         out.append(m)
                 return tuple(out)
 
-            # Construct a new ToolConfig with replaced top-level meshes + variant meshes.
-            # ToolConfig is a frozen dataclass; ``dataclasses.replace`` builds a copy.
+            # ToolConfig is frozen; build a copy via dataclasses.replace.
             import dataclasses  # noqa: PLC0415
 
             new_variants = tuple(
@@ -180,9 +160,8 @@ def hijack_ssg48_body_mesh(active_robot: Any | None = None) -> bool:
                 baked.name,
             )
 
-        # If the robot is already constructed, its ``_tools`` collection is a
-        # stale snapshot — rebuild it from the now-mutated registry so
-        # ``apply_tool("SSG-48")`` sees the new BODY mesh.
+        # Robot's ``_tools`` is a stale snapshot if already constructed —
+        # rebuild from the mutated registry so apply_tool sees the new BODY.
         if active_robot is not None:
             try:
                 from parol6.robot import _build_tools  # noqa: PLC0415

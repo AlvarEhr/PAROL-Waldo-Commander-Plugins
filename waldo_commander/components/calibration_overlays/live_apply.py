@@ -1,21 +1,10 @@
 """Live-apply side effects for settings changes.
 
-Each setting key maps to a side effect that propagates the new value into
-the running scene. Settings reads themselves go through ``settings.get`` /
-attribute access so consumers always see the current value — these
-functions handle the cases where a setting *also* needs to invalidate a
-cache or rebuild a derived structure (e.g. ``_T_BOARD2BASE``, the cached
-collision manager, the camera mount used for the live frustum).
-
-The dispatch is intentionally coarse: most settings affect either
-``_T_BOARD2BASE`` (board-placement / surface-thickness), the cached
-collision manager, or the live ``CameraMount``. Calling
-``apply_setting_change(key)`` figures out which side effects are needed
-for that key and runs them in the right order.
-
-UI changes that don't need a side effect (every other setting) just call
-``settings.set_value`` and read the current value on the next consumer
-tick — no wiring required here.
+Setting reads go through ``settings.get``; these functions cover the cases
+where a key change also needs to invalidate a cache or rebuild a derived
+structure (``_T_BOARD2BASE``, the collision manager, the live
+``CameraMount``). Call :func:`apply_setting_change` after any
+``settings.set_value``.
 """
 
 from __future__ import annotations
@@ -32,9 +21,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-# Settings whose change requires rebuilding ``_T_BOARD2BASE`` and the
-# board-dependent overlays (board, tablet, hemisphere wireframe,
-# reachability dots).
+# Rebuild ``_T_BOARD2BASE`` + board-dependent overlays.
 _BOARD_PLACEMENT_KEYS: frozenset[str] = frozenset({
     "board_translate_m",
     "board_rpy_rad",
@@ -55,9 +42,7 @@ _BOARD_PLACEMENT_KEYS: frozenset[str] = frozenset({
 })
 
 
-# Settings whose change requires re-rendering the cached board PNG so the
-# texture in the 3D scene shows the right marker layout / count. (The
-# texture URL gets a cache-bust suffix; same on-disk path.)
+# Re-render the cached ChArUco PNG (URL gets a cache-bust suffix).
 _BOARD_PNG_KEYS: frozenset[str] = frozenset({
     "board_squares_x",
     "board_squares_y",
@@ -68,8 +53,7 @@ _BOARD_PNG_KEYS: frozenset[str] = frozenset({
 })
 
 
-# Settings whose change requires redrawing the camera frustum (intrinsics
-# determine the cone angles + image dimensions of the wireframe pyramid).
+# Redraw the camera frustum (intrinsics → cone angles + image dimensions).
 _FRUSTUM_KEYS: frozenset[str] = frozenset({
     "intr_fx",
     "intr_fy",
@@ -80,9 +64,7 @@ _FRUSTUM_KEYS: frozenset[str] = frozenset({
 })
 
 
-# Settings whose change invalidates the cached collision manager
-# (``_state['trajectory_collision_mgr_pair']``). Re-built lazily on next
-# use, so we only need to drop the cache.
+# Drop the cached collision manager; rebuilt lazily on next use.
 _COLLISION_KEYS: frozenset[str] = frozenset({
     "surface_enabled",
     "surface_dimensions_m",
@@ -98,23 +80,20 @@ _COLLISION_KEYS: frozenset[str] = frozenset({
 })
 
 
-# Settings whose change requires updating the live ``CameraMount``
-# (used by the frustum + hemisphere visualisations until calibration runs).
+# Update the live ``CameraMount`` (used by frustum + hemisphere viz).
 _CAM_MOUNT_KEYS: frozenset[str] = frozenset({
     "cam_mount_translate_mm",
     "cam_mount_tilt_deg",
 })
 
 
-# Settings whose change requires re-running the reachability IK sweep
-# (the candidate count changes the sweep itself).
+# Re-run the reachability IK sweep (changes sweep input itself).
 _REACHABILITY_RESWEEP_KEYS: frozenset[str] = frozenset({
     "reachability_n_candidates",
 })
 
 
-# Settings whose change only requires re-rendering the existing
-# reachability dots (no IK sweep, just new sphere geometry).
+# Re-render existing reachability dots at new sphere geometry; no IK sweep.
 _REACHABILITY_RERENDER_KEYS: frozenset[str] = frozenset({
     "reachability_dot_radius_m",
 })
@@ -126,8 +105,7 @@ _REACHABILITY_RERENDER_KEYS: frozenset[str] = frozenset({
 
 
 def _rebuild_camera_mount() -> None:
-    """Replace ``_state['current_mount']`` with a fresh CameraMount built
-    from the current settings, then redraw the frustum."""
+    """Rebuild ``_state['current_mount']`` from settings + redraw frustum."""
     try:
         from parol6_vision.calibration.camera_mount import CameraMount  # noqa: PLC0415
     except ImportError:
@@ -153,30 +131,24 @@ def _rebuild_camera_mount() -> None:
 
 
 def _drop_collision_cache() -> None:
-    """Invalidate the cached collision manager so the next request rebuilds
-    it from the current surface / safety-margin / jaw settings."""
+    """Invalidate the cached collision manager."""
     _state["trajectory_collision_mgr_pair"] = None
 
 
 def _refresh_overlays() -> None:
-    """Rebuild every board-dependent overlay (board, tablet visual,
-    hemisphere wireframe, reachability dots) at the current ``_T_BOARD2BASE``."""
+    """Rebuild board-dependent overlays at the current ``_T_BOARD2BASE``."""
     from .overlays import refresh_board_dependent_overlays  # noqa: PLC0415
     refresh_board_dependent_overlays()
 
 
 def _regenerate_board_png() -> None:
-    """Re-render the cached ChArUco PNG when board geometry changes."""
+    """Re-render the cached ChArUco PNG."""
     from .overlays import regenerate_board_png  # noqa: PLC0415
     regenerate_board_png()
 
 
 def _redraw_frustum() -> None:
-    """Force a frustum rebuild from the current cam-mount + intrinsics.
-
-    Used when intrinsics change without a mount change — the existing
-    frustum lines are based on stale fx/fy/cx/cy and need replacing.
-    """
+    """Rebuild the frustum from current cam-mount + intrinsics."""
     from .frustum import update_frustum  # noqa: PLC0415
     mount = _state.get("current_mount")
     if mount is None:
@@ -185,8 +157,7 @@ def _redraw_frustum() -> None:
         update_frustum(mount.T_cam2flange)
     except Exception as e:  # noqa: BLE001
         logger.debug("frustum redraw failed (%s) — will refresh on next tick", e)
-    # Also invalidate the dynamic-footprint cache so the next tick
-    # rebuilds the centerline + footprint with the new intrinsics.
+    # Invalidate the dynamic-footprint cache so the next tick rebuilds it.
     _state["footprint_last_q"] = None
     _state["footprint_last_mount"] = None
 
@@ -197,13 +168,8 @@ def _redraw_frustum() -> None:
 
 
 def apply_setting_change(key: str) -> None:
-    """Run the side effects associated with ``key`` having just changed.
-
-    Idempotent: calling this twice for the same key is harmless. Order
-    matters: rebuild ``_T_BOARD2BASE`` first, then the camera mount (so
-    the frustum redraw uses the new mount), then regenerate the board
-    PNG, then drop caches, then refresh overlays (so they pick up the
-    new T_BOARD2BASE + caches + PNG URL).
+    """Run side effects for a setting change. Idempotent. Order: T_board2base
+    → mount → PNG → frustum → cache drop → overlay refresh.
     """
     needs_t_rebuild = key in _BOARD_PLACEMENT_KEYS
     needs_mount = key in _CAM_MOUNT_KEYS

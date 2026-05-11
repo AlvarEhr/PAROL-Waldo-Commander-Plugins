@@ -1,26 +1,19 @@
 """Custom tool ingestion — drop-in STLs become user-defined tools.
 
-A user with a custom gripper / camera bracket / end-effector drops their
-STLs into ``~/.waldo-commander/custom_tools/<name>/`` along with a
-``config.json`` describing the placement transform + TCP transform +
-optional jaw motion. On waldo-commander startup we:
+Drop STLs + ``config.json`` into ``~/.waldo-commander/custom_tools/<name>/``;
+startup scans the directory, applies the placement transform per STL,
+bakes into parol6's mesh dir, and registers a new entry in
+``parol6.tools._TOOL_REGISTRY``.
 
-1. Scan the directory for ``config.json`` files.
-2. For each, apply the placement transform to the user's STL and bake
-   the result into parol6's mesh dir under a unique filename
-   (``custom_<name>_body.stl``, ``custom_<name>_jaw_left.stl``, ...).
-3. Register a new entry in ``parol6.tools._TOOL_REGISTRY`` so the
-   gripper dropdown picks it up alongside the built-in tools.
-
-Folder layout:
+Folder layout::
 
     ~/.waldo-commander/custom_tools/<name>/
       config.json          # placement + TCP + jaw motion + meta
-      body.stl             # required — gripper body / bracket
-      jaw_left.stl         # optional — left jaw if the tool has fingers
-      jaw_right.stl        # optional — right jaw
+      body.stl             # required
+      jaw_left.stl         # optional
+      jaw_right.stl        # optional
 
-config.json schema (every numeric field optional, defaults shown):
+config.json schema (every numeric field optional, defaults shown)::
 
     {
       "display_name": "My Custom Gripper",
@@ -34,11 +27,6 @@ config.json schema (every numeric field optional, defaults shown):
       "jaw_axis":         [0, 1, 0],
       "jaw_symmetric":    true
     }
-
-The placement transform fields (translate / rpy / scale) are what the
-calibration panel's "Custom tools" UI iterates on — they shift the STL
-relative to the flange origin until the mesh visually aligns with the
-URDF arm.
 """
 
 from __future__ import annotations
@@ -59,24 +47,13 @@ from scipy.spatial.transform import Rotation as SciRot
 logger = logging.getLogger(__name__)
 
 
-# Defense-in-depth: validate ``name`` / ``variant_key`` so user-supplied
-# strings can't escape ``CUSTOM_TOOLS_ROOT`` or ``parol6_mesh_dir``.
-# pathlib's ``/`` operator resets when the right side is absolute, and
-# ``..`` traversal is not blocked by Path semantics — both would let a
-# crafted name escape the intended folder. Today the only callers are
-# UI handlers that already alphanumeric+underscore-validate their
-# inputs, but enforcing the constraint at the data-layer boundary
-# means a future caller can't accidentally regress.
+# Path-traversal defence: pathlib's ``/`` resets on absolute RHS and
+# doesn't block ``..``, so a crafted name could escape ``CUSTOM_TOOLS_ROOT``.
 _VALID_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 
 def _validate_safe_name(value: str, kind: str = "name") -> None:
-    """Reject names that could escape the tool / mesh folders.
-
-    Allowed: non-empty strings made of ASCII alphanumerics + underscore.
-    Anything else (path separators, ``..``, dots, spaces, unicode)
-    raises ``ValueError``.
-    """
+    """Reject anything that isn't ASCII alphanumerics + underscore."""
     if not isinstance(value, str) or not value:
         raise ValueError(f"empty / non-string {kind}: {value!r}")
     if not _VALID_NAME_RE.match(value):
@@ -86,19 +63,12 @@ def _validate_safe_name(value: str, kind: str = "name") -> None:
         )
 
 
-# STL load size cap. trimesh.load happily ingests arbitrarily large
-# meshes; a 5 GB STL would OOM the server before parsing even
-# completes. 200 MB is comfortably above any realistic CAD-exported
-# end-effector (typical gripper STLs are 1–20 MB) but small enough
-# to keep memory bounded on shared hardware.
+# Caps trimesh.load against OOM on arbitrarily large user uploads.
 _STL_MAX_SIZE_MB: int = 200
 
 
 def _stl_size_check(stl_path: Path) -> bool:
-    """Return True iff ``stl_path`` exists and is within the size cap.
-    Logs a warning (not an exception) on rejection so the calling
-    bake / load path can fail-soft without crashing the page.
-    """
+    """True iff ``stl_path`` exists and is within ``_STL_MAX_SIZE_MB``."""
     try:
         size_bytes = stl_path.stat().st_size
     except OSError as e:
@@ -115,13 +85,7 @@ def _stl_size_check(stl_path: Path) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Tool-registry callback registry
-#
-# Subscribers are notified whenever a custom tool is registered, deleted,
-# or otherwise added/removed from ``parol6.tools._TOOL_REGISTRY`` from this
-# module. Used by the bottom-right Settings panel's gripper dropdown to
-# refresh its options when a user adds / deletes a tool, without requiring
-# a page reload.
+# Tool-registry callback registry — drives gripper-dropdown live refresh.
 # ---------------------------------------------------------------------------
 
 
@@ -129,17 +93,14 @@ _registry_changed_callbacks: list[Callable[[], None]] = []
 
 
 def subscribe_tool_registry_changed(cb: Callable[[], None]) -> None:
-    """Register a callback fired after register_one / delete_tool /
-    register_all completes. Idempotent — adding the same callback twice
-    only registers it once. Best-effort dispatch (failures swallowed)
-    so a buggy subscriber can't break tool registration."""
+    """Register a callback fired after registry mutations. Idempotent.
+    Failures dispatched best-effort so a buggy subscriber can't break it."""
     if cb not in _registry_changed_callbacks:
         _registry_changed_callbacks.append(cb)
 
 
 def unsubscribe_tool_registry_changed(cb: Callable[[], None]) -> None:
-    """Remove ``cb`` from the registered callback list (no-op if not
-    present)."""
+    """Remove ``cb`` from the callback list (no-op if not present)."""
     try:
         _registry_changed_callbacks.remove(cb)
     except ValueError:
@@ -147,8 +108,7 @@ def unsubscribe_tool_registry_changed(cb: Callable[[], None]) -> None:
 
 
 def _notify_tool_registry_changed() -> None:
-    """Fire every registered callback. Best-effort — a failing
-    subscriber doesn't block the others or fail the caller."""
+    """Fire every registered callback. Best-effort dispatch."""
     for cb in list(_registry_changed_callbacks):
         try:
             cb()
@@ -160,11 +120,8 @@ def _notify_tool_registry_changed() -> None:
 
 
 def _refresh_active_robot_tools() -> None:
-    """Rebuild ``ui_state.active_robot._tools`` from parol6's current
-    registry so any newly-registered custom tools are visible to
-    consumers that read ``Robot.tools`` (the gripper dropdown options
-    list, the URDF scene's ``apply_tool``, etc.). Called by
-    ``register_one`` / ``delete_tool`` after the registry mutation.
+    """Rebuild ``ui_state.active_robot._tools`` from parol6's registry so
+    newly-registered custom tools are visible to ``Robot.tools`` consumers.
     """
     try:
         from parol6.robot import _build_tools as _parol6_build_tools  # noqa: PLC0415
@@ -211,16 +168,9 @@ def list_tool_names() -> list[str]:
 
 @dataclass(slots=True)
 class CustomToolVariant:
-    """One variant on a custom tool — same body, different jaws + jaw motion.
-
-    Mirrors parol6's ``ToolVariant`` shape: each variant ships its own
-    pair of jaw STLs (e.g. SSG-48's "finger" vs "pinch" tips) and its
-    own jaw-motion descriptor (travel + axis + symmetry). The body
-    mesh is shared across variants — the user uploads body.stl once.
-
-    Variant jaws live at
-    ``~/.waldo-commander/custom_tools/<name>/variant_<key>_jaw_<side>.stl``
-    so they don't collide with the default-variant slots.
+    """One variant on a custom tool — same body, different jaws + motion.
+    Mirrors parol6's ``ToolVariant``. Variant jaws live at
+    ``<root>/<name>/variant_<key>_jaw_<side>.stl``.
     """
     key: str  # registry key (used in client.select_tool variant_key)
     display_name: str = ""
@@ -245,26 +195,15 @@ class CustomToolConfig:
     jaw_travel_m: float = 0.0
     jaw_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
     jaw_symmetric: bool = True
-    # Optional: when this custom tool is selected, also tell the
-    # CONTROLLER to act as ``proxy_tool_key`` (a built-in tool key like
-    # ``"SSG-48"``). Custom tools live only in the GUI process — the
-    # parol6-server doesn't know about them — so the visualisation +
-    # IK can use a custom mesh while motor control stays driven by a
-    # known built-in. Empty string / None means "no controller-side
-    # change; visualisation only".
+    # Built-in tool key the CONTROLLER should act as when this custom
+    # tool is selected (e.g. "SSG-48"). Custom tools live only in the
+    # GUI process; an empty string disables proxying.
     proxy_tool_key: str = ""
-    # True when the tool carries a calibratable camera. Drives whether
-    # the calibration overlays (frustum, hemisphere, reachability dots,
-    # board overlay, footprint) render while this tool is active, and
-    # whether Run / Localise / Hover are enabled. Default False — most
-    # tools are camera-less and should not get the calibration UI.
+    # True when the tool has a calibratable camera; gates the
+    # calibration overlays + Run/Localise/Hover.
     has_camera: bool = False
-    # Per-tool camera intrinsics + cold-start mount overrides. When set
-    # (non-None), these REPLACE the corresponding global settings
-    # (intr_*, cam_mount_*) at runtime whenever this tool is the
-    # currently-active one. None = inherit the global value. Useful
-    # when the user runs more than one camera-bearing tool, each with
-    # its own fx/fy/cx/cy/etc. and its own physical mount geometry.
+    # Per-tool camera overrides. Non-None REPLACES the global at runtime
+    # while this tool is active; None inherits the global.
     intr_fx: float | None = None
     intr_fy: float | None = None
     intr_cx: float | None = None
@@ -273,11 +212,8 @@ class CustomToolConfig:
     intr_height: int | None = None
     cam_mount_translate_mm: tuple[float, float, float] | None = None
     cam_mount_tilt_deg: tuple[float, float, float] | None = None
-    # Variants — alternative jaw configurations sharing the same body
-    # mesh. Empty list = single-variant tool (the default jaws + jaw
-    # motion fields above are used). Non-empty = parol6 registers the
-    # tool with ToolVariant entries; the gripper panel's variant
-    # dropdown picks among them.
+    # Empty = single-variant tool; non-empty registers ToolVariant entries
+    # so the gripper panel's variant dropdown can pick among them.
     variants: list[CustomToolVariant] = field(default_factory=list)
     has_jaws: bool = False  # True when jaw_left.stl + jaw_right.stl exist
     has_body: bool = False  # True when body.stl exists
@@ -303,8 +239,7 @@ class CustomToolConfig:
         return self.folder / JAW_RIGHT_STL_NAME
 
     def variant_jaw_path(self, variant_key: str, side: str) -> Path:
-        """Filesystem path for one variant's jaw STL. ``side`` is
-        ``"left"`` or ``"right"``."""
+        """One variant's jaw STL path; ``side`` is ``"left"`` or ``"right"``."""
         return self.folder / f"variant_{variant_key}_jaw_{side}.stl"
 
     def to_json(self) -> str:
@@ -323,12 +258,9 @@ class CustomToolConfig:
             "proxy_tool_key": str(self.proxy_tool_key or ""),
             "has_camera": bool(self.has_camera),
         }
-        # Per-tool intrinsics + mount overrides — only persist non-None
-        # values so the JSON stays clean for tools that inherit globals.
-        # Explicit per-key float / int membership instead of a clever
-        # substring expression: a future ``intr_height_max`` or
-        # ``intr_dist_k1`` field added to the dataclass would silently
-        # round to int with the substring check.
+        # Persist only non-None overrides. Explicit per-key float/int
+        # membership keeps a future ``intr_*_max`` field from being
+        # silently coerced via a substring check.
         _INTR_FLOAT_KEYS = ("intr_fx", "intr_fy", "intr_cx", "intr_cy")
         _INTR_INT_KEYS = ("intr_width", "intr_height")
         for k in (*_INTR_FLOAT_KEYS, *_INTR_INT_KEYS):
@@ -377,13 +309,8 @@ def load_config(name: str) -> CustomToolConfig | None:
         logger.warning("custom_tools: %s — invalid config JSON: %s", config_path, e)
         return None
 
-    # ---- Schema backfill -------------------------------------------------
-    # The SSG-48 + RealSense bracket migration started writing
-    # ``has_camera: true`` only with Phase 1D; older configs from the
-    # initial migration don't carry the field and would otherwise
-    # default to False — making the camera gate think the tool isn't
-    # camera-bearing. Backfill on read for the migration name, then
-    # rewrite the file so subsequent loads don't repeat the work.
+    # Backfill ``has_camera`` for pre-Phase-1D SSG-48 migration configs;
+    # the field defaults to False otherwise so the camera gate would close.
     backfilled = False
     if name == _SSG48_MIGRATION_NAME and "has_camera" not in raw:
         raw["has_camera"] = True
@@ -485,24 +412,13 @@ def list_configs() -> list[CustomToolConfig]:
 
 
 def delete_tool(name: str) -> None:
-    """Remove a custom tool's folder + config + STLs from disk, then
-    unregister it from parol6's tool registry so it disappears from
-    the gripper dropdown without a page reload.
-
-    Also deletes the baked mesh copies from parol6's mesh dir AND
-    clears any per-tool overrides stored in ``app.storage.user``.
-    Without the override clear, re-creating a tool with the same
-    name later would silently inherit the previous tool's
-    intrinsics + cold-start mount — confusing if the user thought
-    "delete + recreate" gave them a clean slate.
+    """Wipe a tool from disk + registry + per-tool storage. Clearing the
+    storage means a same-named recreate doesn't inherit stale overrides.
     """
     folder = CUSTOM_TOOLS_ROOT / name
     if folder.exists():
         shutil.rmtree(folder)
-    # Sweep baked mesh copies (body + jaws + per-variant jaws) out
-    # of parol6's mesh dir. Without this, an STL named after a
-    # deleted tool stays on disk forever — small per-tool, but it
-    # accumulates over the lifetime of a workshop's tool inventory.
+    # Sweep baked copies so the parol6 mesh dir doesn't accumulate orphans.
     mesh_dir = _parol6_mesh_dir()
     if mesh_dir is not None:
         try:
@@ -515,10 +431,8 @@ def delete_tool(name: str) -> None:
                     )
         except OSError as e:
             logger.debug("delete_tool: glob on mesh_dir failed (%s)", e)
-    # Best-effort unregister from parol6's registry. The registry
-    # mutation API is intentionally minimal in parol6 — we pop the
-    # key directly. If the dict shape changes upstream, this fails
-    # quietly and falls back to "tool gone after restart".
+    # Best-effort unregister; pops directly since parol6's mutation API
+    # is minimal. Falls back to "tool gone after restart" on shape change.
     key = f"custom:{name}"
     try:
         from parol6 import tools as parol6_tools  # noqa: PLC0415
@@ -528,9 +442,7 @@ def delete_tool(name: str) -> None:
             del registry[key]
     except Exception as e:  # noqa: BLE001
         logger.debug("custom_tools: delete_tool registry unregister failed: %s", e)
-    # Clear any persisted per-tool overrides for the deleted tool so
-    # a tool created with the same name later starts from globals
-    # rather than inheriting stale intrinsics / mount values.
+    # Clear persisted per-tool overrides so a same-name recreate is clean.
     try:
         clear_per_tool_overrides(key)
     except Exception as e:  # noqa: BLE001
@@ -595,17 +507,13 @@ def _load_trimesh(stl_path: Path) -> Any | None:
 
 
 def detect_mesh_unit_scale(stl_path: Path) -> tuple[float, str]:
-    """Heuristic: examine the STL's bbox and suggest a scale factor that
-    converts its units to metres. Returns ``(scale, label)``.
+    """Heuristic bbox-based unit detection; returns ``(scale, label)`` to
+    convert STL units to metres:
 
-    * bbox.max > 1.0 m → likely millimetres → scale = 0.001
-    * bbox.max > 0.0254 m AND < 1.0 m → likely already metres → scale = 1.0
-    * bbox.max < 0.001 m → likely 1000× over-scaled → scale = 1000.0
-    * bbox.max in (0.001, 0.0254) → ambiguous (very small in m, plausible
-      in cm) → default to 1.0 with an "unknown" label so the user picks.
-
-    Real STL units are not embedded in the file; this heuristic matches
-    the most common cases (CAD exports in mm, modeling tools in m).
+    * bbox.max > 1 m   → mm   → 0.001
+    * bbox.max < 1 mm  → sub  → 1000.0
+    * bbox.max < 1 in  → ambiguous → 1.0 (user picks)
+    * else             → m    → 1.0
     """
     mesh = _load_trimesh(stl_path)
     if mesh is None:
@@ -616,19 +524,14 @@ def detect_mesh_unit_scale(stl_path: Path) -> tuple[float, str]:
     if bbox_max < 0.001:
         return (1000.0, f"sub-mm scaled (bbox max {bbox_max:.6f} units)")
     if bbox_max < 0.0254:
-        # Smaller than an inch — could be metres-of-tiny-thing or
-        # mm-of-mid-thing. Mark as ambiguous; user override expected.
+        # Sub-inch is ambiguous (m or cm); let the user override.
         return (1.0, f"ambiguous (bbox max {bbox_max:.4f} units)")
     return (1.0, f"m (bbox max {bbox_max:.3f} units)")
 
 
 def snap_to_bbox_centre(stl_path: Path) -> tuple[float, float, float] | None:
-    """Compute the translate-in-metres that would move the mesh's bbox
-    centre to the origin. Returns ``-bbox.centre × scale``; caller
-    multiplies by their desired scale or hands raw to the placement
-    transform.
-
-    Returns None if the mesh can't be loaded.
+    """Translate (in mesh units) that would move the bbox centre to the
+    origin. Returns None when the mesh can't be loaded.
     """
     mesh = _load_trimesh(stl_path)
     if mesh is None:
@@ -640,26 +543,9 @@ def snap_to_bbox_centre(stl_path: Path) -> tuple[float, float, float] | None:
 def snap_flange_face_to_origin(
     stl_path: Path,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]] | None:
-    """Find the largest planar facet whose normal is closest to ±Z, then
-    return ``(translate, rpy_rad)`` that would put that face's centroid
-    at the origin with its outward normal aligned to flange +Z.
-
-    Approach (trimesh):
-
-    1. ``mesh.facets`` groups co-planar faces — pick the largest facet
-       group by total area.
-    2. From that group's average normal, compute a rotation that maps the
-       normal to flange +Z.
-    3. Apply rotation to the group's centroid; the negative of that
-       gives the translate to bring the rotated centroid to origin.
-
-    The "flange face" is the planar surface where the gripper bolts onto
-    the robot — usually the largest flat disc/square facing one of the
-    cardinal axes. This snap is the right move when the user dropped in
-    a mesh whose flange-face is in some random orientation.
-
-    Returns None if the mesh has no clear planar facet (rare for
-    machined parts) or fails to load.
+    """Snap the largest planar facet's centroid to origin with its normal
+    aligned to flange +Z. Returns ``(translate, rpy_rad)`` or None if the
+    mesh has no clear planar facet.
     """
     mesh = _load_trimesh(stl_path)
     if mesh is None:
@@ -719,20 +605,9 @@ def _rotation_between(a: NDArray[np.float64], b: NDArray[np.float64]) -> NDArray
 def snap_to_largest_circular_hole(
     stl_path: Path,
 ) -> tuple[float, float, float] | None:
-    """Tier-3 snap: find the largest circular hole in the largest planar
-    facet (typically the flange face's mount bore) and return the
-    translate that would put its centre at the origin.
-
-    Approach: for the largest facet (assumed flange face), get its
-    boundary loops. For each interior loop, fit a circle in 2D (after
-    projecting to the facet's plane). Pick the loop with the LARGEST
-    fitted-circle radius; return the negative of its centre as the snap
-    translate.
-
-    Returns None if the mesh has no clear circular hole, or trimesh
-    can't extract the facet boundary. This is a stretch goal — a fair
-    chunk of the time it returns None and the user falls back to the
-    flange-face snap.
+    """Snap the largest circular hole in the largest planar facet (the
+    flange-face mount bore) to origin. Returns None when no clear hole
+    is detected; callers fall back to ``snap_flange_face_to_origin``.
     """
     mesh = _load_trimesh(stl_path)
     if mesh is None:
@@ -785,15 +660,12 @@ def snap_to_largest_circular_hole(
             cx, cy, r = _fit_circle_2d(u, v)
         except Exception:  # noqa: BLE001
             continue
-        # Reject loops whose points don't actually look circular —
-        # residual std > 10% of radius is too noisy to call a circle.
+        # Reject loops whose residual std exceeds 10 % of radius.
         residuals = np.hypot(u - cx, v - cy) - r
         if r <= 0 or float(np.std(residuals)) > 0.1 * r:
             continue
-        # Reconstruct 3D centre.
+        # 3D centre: in-plane (cx, cy) + the loop's mean depth along normal.
         loop_centroid_3d = loop_arr.mean(axis=0)
-        # The fitted circle centre in 3D = nearest-plane projection of
-        # the in-plane (cx, cy) anchored on the loop's mean depth.
         depth = float(loop_centroid_3d @ avg_normal)
         centre_3d = cx * in_plane_x + cy * in_plane_y + depth * avg_normal
         if best is None or r > best[0]:
@@ -846,16 +718,9 @@ def _baked_filename(name: str, role: str) -> str:
 
 
 def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
-    """Apply the placement transform to each STL (body + jaws) and write
-    the results into parol6's mesh dir under unique names.
-
-    Returns ``{role: dst_path}`` on success (where role is "body",
-    "jaw_left", "jaw_right" — only roles that actually have a source
-    STL appear in the dict), or None on hard failure (parol6 mesh dir
-    unreachable, body STL missing, etc.).
-
-    Idempotent — re-baking with the same cfg produces the same on-disk
-    bytes (modulo trimesh's internal float rounding).
+    """Apply the placement transform to each STL and write to parol6's
+    mesh dir. Returns ``{role: dst_path}`` for the roles that had a
+    source STL, or None on hard failure. Idempotent.
     """
     mesh_dir = _parol6_mesh_dir()
     if mesh_dir is None:
@@ -891,11 +756,7 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
         bake_jobs.append(
             (f"variant_{v.key}_jaw_right", cfg.variant_jaw_path(v.key, "right")),
         )
-    # mtime-cache key: the bake output depends on both the source STL
-    # bytes AND the bake parameters in config.json (mesh_scale,
-    # mesh_rpy_rad, mesh_translate_m). We use mtime as a cheap proxy
-    # for "either has changed since last bake". Captured once per
-    # call so repeated stat() across roles doesn't add up.
+    # Captured once so repeated stat() across roles doesn't add up.
     try:
         cfg_mtime = (
             cfg.config_path.stat().st_mtime if cfg.config_path.exists() else 0.0
@@ -906,24 +767,12 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
     for role, src_path in bake_jobs:
         if not src_path.exists():
             continue
-        # Defensive size cap to prevent OOM on a huge user-supplied
-        # STL — see ``_stl_size_check``. Skipping a too-large mesh
-        # mirrors the missing-file branch above (continue, role
-        # absent from the returned dict, register_one notices and
-        # downgrades).
+        # Size-cap rejects mirror the missing-file branch.
         if not _stl_size_check(src_path):
             continue
         dst = mesh_dir / _baked_filename(cfg.name, role)
-        # Idempotency guard: skip re-bake when the destination file
-        # is newer than both the source STL and config.json. This
-        # turns a redundant register_all call (we currently observe
-        # 2-3 per cold start) from ~500-800 ms of trimesh.load +
-        # transform + export per STL into ~3 stat() calls — total
-        # cost of a redundant call drops from ~2 s to ~5 ms for the
-        # ssg48_realsense tool (body + 2 jaws + N variant jaws).
-        # Re-baking still fires automatically when the user edits
-        # the source STL or tweaks the placement transform in the
-        # custom-tools UI (which rewrites config.json).
+        # Skip the trimesh round-trip when the cached output is newer
+        # than both inputs (source STL + config.json holds the params).
         try:
             if dst.exists():
                 dst_mtime = dst.stat().st_mtime
@@ -952,22 +801,15 @@ def bake_one(cfg: CustomToolConfig) -> dict[str, Path] | None:
 
 
 def register_one(cfg: CustomToolConfig) -> bool:
-    """Bake + register one custom tool in ``parol6.tools._TOOL_REGISTRY``.
-
-    Returns True iff the tool ended up registered. Idempotent — calling
-    this for an already-registered key replaces the prior entry.
+    """Bake + register one custom tool. Returns True iff registered.
+    Idempotent; replaces the prior entry for the same key.
     """
     baked = bake_one(cfg)
     if not baked or "body" not in baked:
         return False
 
-    # Detect partial-jaw failures: the user uploaded both jaws but
-    # one (or both) failed to bake (corrupt STL, size-cap reject,
-    # trimesh import error, etc.). Without this check, the tool
-    # silently registers as ``has_jaws=False``, which the gripper
-    # dropdown shows as "no jaws" — confusing if the user thought
-    # their jaws should be there. Surfaces a structured warning so
-    # the log file makes the cause obvious.
+    # Surface partial-jaw bake failures (uploaded but failed to bake);
+    # otherwise the tool silently registers as has_jaws=False.
     cfg_has_left = cfg.jaw_left_path.exists()
     cfg_has_right = cfg.jaw_right_path.exists()
     baked_has_left = "jaw_left" in baked
@@ -1023,12 +865,8 @@ def register_one(cfg: CustomToolConfig) -> bool:
             ),
         )
 
-    # Build per-variant ToolVariant entries — same body, variant-
-    # specific jaw STLs + jaw motion. parol6's swap_tool_mesh
-    # substitutes a variant's full meshes list when the variant key is
-    # active, so each variant's mesh list must include the body + its
-    # own jaws (not just the jaws). The body filename is shared across
-    # variants since the mesh on disk is the same.
+    # Each variant's meshes list must include the body since parol6's
+    # swap_tool_mesh substitutes the full list at variant-pick time.
     ToolVariant = parol6_tools.ToolVariant  # noqa: N806
     variant_specs: list = []
     for v in cfg.variants:
@@ -1072,12 +910,8 @@ def register_one(cfg: CustomToolConfig) -> bool:
             )
         )
 
-    # Register against ``ToolConfig`` directly — it's a concrete
-    # dataclass in parol6.tools (the gripper-specific configs add motor
-    # / encoder fields we don't have for a generic custom tool). Motions
-    # attach when jaws + travel are configured. This keeps custom-tool
-    # support generic — works for static brackets AND for grippers
-    # with jaws.
+    # ``ToolConfig`` directly — gripper-specific configs add motor/encoder
+    # fields we don't have. Works for static brackets + jaw grippers alike.
     ToolConfig = parol6_tools.ToolConfig  # noqa: N806
     config = ToolConfig(
         name=cfg.display_name or cfg.name,
@@ -1095,9 +929,8 @@ def register_one(cfg: CustomToolConfig) -> bool:
         key, cfg.display_name or cfg.name,
         2 if has_jaws else 0, len(variant_specs),
     )
-    # Rebuild active_robot._tools so the gripper dropdown sees the
-    # new entry, then fire registry-changed callbacks so any open
-    # Settings panel refreshes its options without a page reload.
+    # Refresh Robot.tools + notify subscribers so the gripper dropdown
+    # picks up the new entry without a page reload.
     _refresh_active_robot_tools()
     _notify_tool_registry_changed()
     return True
@@ -1107,16 +940,9 @@ def register_all() -> list[str]:
     """Discover + register every custom tool. Returns the list of
     successfully-registered registry keys (``custom:<name>``).
     """
-    # Diagnostic: log the caller's stack so we can see who fires
-    # register_all on cold-start. We've observed register_all firing
-    # multiple times per startup and want to attribute each call to
-    # a specific call site. The mtime-guarded bake_one (added in the
-    # same batch) makes redundant calls cheap, but we'd still like
-    # to eliminate the duplicate caller for cleanliness.
+    # Diagnostic: log caller stack to attribute multi-fire on cold start.
     import traceback  # noqa: PLC0415
     stack_frames = traceback.format_stack()
-    # Skip the last frame (this function itself); keep the previous
-    # 6 frames which capture the call chain up to ~3 levels back.
     caller_summary = "".join(stack_frames[-7:-1]).strip()
     logger.info("custom_tools: register_all called — caller stack:\n%s", caller_summary)
     ensure_root()
@@ -1142,9 +968,8 @@ _SSG48_SENTINEL_FILENAME: str = ".ssg48_realsense_migrated"
 
 
 def _ssg48_merged_stl_path() -> Path | None:
-    """Locate parol6-vision's merged SSG-48 + camera bracket STL relative
-    to the package install. Returns None when the sibling clone isn't
-    where we expect (e.g. fresh checkout without parol6-vision next door).
+    """Locate the merged SSG-48 + camera-bracket STL in the parol6-vision
+    sibling clone. None when not present.
     """
     pv_root = (
         Path(__file__).resolve().parent.parent.parent.parent.parent / "parol6-vision"
@@ -1154,59 +979,33 @@ def _ssg48_merged_stl_path() -> Path | None:
 
 
 def auto_migrate_ssg48_with_bracket() -> bool:
-    """One-shot migration: convert the historical SSG-48 hijack into a
-    user-defined ``custom:ssg48_realsense`` tool, pre-baked from the merged
-    SSG-48 + camera-bracket STL with the same fit constants the hijack
-    used. Idempotent via a sentinel file at
-    ``~/.waldo-commander/custom_tools/.ssg48_realsense_migrated``.
+    """Convert the legacy SSG-48 hijack into a ``custom:ssg48_realsense``
+    tool, pre-baked from the merged SSG-48 + camera-bracket STL.
+    Idempotent via a sentinel at ``<root>/.ssg48_realsense_migrated``.
 
-    Why a migration instead of a permanent hijack: the hijack hardcodes
-    one user's CAD setup (Alvar's merged STL) into the SSG-48 entry,
-    which is wrong for upstream code. After this migration the regular
-    "SSG-48" entry stays as Jepson's stock body, and the camera-bracket
-    setup lives as a normal custom tool the user can iterate via the UI.
+    Pre-conditions: sentinel missing, merged STL present in the
+    parol6-vision sibling clone, name not in use.
 
-    Pre-conditions for the migration to fire:
+    Side effects on success: writes the new tool folder, registers
+    ``custom:ssg48_realsense``, writes the sentinel, and also writes
+    the legacy ``ssg48_body_realsense.stl`` into parol6's mesh dir
+    (collision.py still resolves the body by that filename).
 
-    * Sentinel file does NOT exist (first run after this code lands).
-    * ``parol6-vision/parol6_vision/sim/meshes/ssg48_body_realsense.stl``
-      exists at the sibling-clone location (the merged STL is Alvar's
-      personal CAD export — for users without the file, this no-ops
-      silently).
-    * The custom tool name ``ssg48_realsense`` is not already in use.
-
-    Side effects on success:
-
-    * ``~/.waldo-commander/custom_tools/ssg48_realsense/{body.stl,
-      jaw_left.stl, jaw_right.stl, config.json}`` written. The body
-      STL has the SSG-48 fit transform pre-applied so the placement
-      transform stays at identity — user iteration still works via
-      ``mesh_translate_m`` etc.
-    * ``custom:ssg48_realsense`` registered in ``parol6.tools._TOOL_REGISTRY``.
-    * Sentinel file written so this migration never runs again.
-    * The legacy ``ssg48_body_realsense.stl`` is also written into
-      parol6's mesh dir so the collision check (which still hardcodes
-      that filename) keeps working without further changes.
-
-    Returns True when the migration created a new custom tool, False
-    when skipped (sentinel present, source missing, name conflict, etc.).
+    Returns True when a new tool is created.
     """
     ensure_root()
     sentinel = CUSTOM_TOOLS_ROOT / _SSG48_SENTINEL_FILENAME
     if sentinel.exists():
         return False
     if _SSG48_MIGRATION_NAME in list_tool_names():
-        # Custom tool already exists — write the sentinel so we don't
-        # try again, and keep what's there. User-customised state wins.
+        # Tool already exists; keep it and write the sentinel.
         sentinel.touch(exist_ok=True)
         return False
 
     src_body = _ssg48_merged_stl_path()
     if src_body is None:
-        # No merged STL on disk — common case for users without Alvar's
-        # personal CAD. Skip without fanfare; don't write the sentinel
-        # so a later checkout that brings the file in does run the
-        # migration.
+        # No merged STL — skip without writing the sentinel so a later
+        # checkout that brings the file in still runs the migration.
         logger.info(
             "ssg48 migration: merged STL not found; skipping",
         )
@@ -1220,9 +1019,8 @@ def auto_migrate_ssg48_with_bracket() -> bool:
         logger.info("ssg48 migration: deps unavailable (%s); skipping", e)
         return False
 
-    # Same fit constants the SSG-48 hijack used historically — kept as
-    # module-level defaults in ``constants.py`` so this migration
-    # produces an identical body to the legacy hijack output.
+    # Fit constants live in ``constants.py`` so this matches the legacy
+    # hijack's body bytes-for-bytes.
     from . import constants as _c  # noqa: PLC0415
 
     fit_scale = float(_c._MERGED_STL_FIT_SCALE)
@@ -1242,7 +1040,7 @@ def auto_migrate_ssg48_with_bracket() -> bool:
     T_fit[:3, 3] = fit_translate
     mesh.apply_transform(T_fit)
 
-    # Step 2: user RPY + translate (Alvar's tuning on top of the fit).
+    # Step 2: user RPY + translate on top of the fit.
     if any(abs(a) > 1e-9 for a in user_rpy):
         T_extra = np.eye(4, dtype=np.float64)
         T_extra[:3, :3] = SciRot.from_euler("XYZ", user_rpy).as_matrix()
@@ -1266,10 +1064,8 @@ def auto_migrate_ssg48_with_bracket() -> bool:
         logger.warning("ssg48 migration: parol6 mesh dir unreachable: %s", e)
         return False
 
-    # Copy stock jaw STLs (already in flange-metres coords). The
-    # default-variant slots get the FINGER pair (Alvar's mounted
-    # variant); the per-variant slots get BOTH finger and pinch so
-    # the user can swap via the gripper-panel variant dropdown.
+    # Stock jaw STLs are already in flange metres. Default slots get the
+    # finger pair; per-variant slots get both finger and pinch.
     for stock_name, dst_name in (
         ("ssg48_finger_left.stl", JAW_LEFT_STL_NAME),
         ("ssg48_finger_right.stl", JAW_RIGHT_STL_NAME),
@@ -1292,10 +1088,8 @@ def auto_migrate_ssg48_with_bracket() -> bool:
                     str(target_folder / f"variant_{variant_key}_jaw_{side}.stl"),
                 )
 
-    # Also write the baked body to the legacy ``ssg48_body_realsense.stl``
-    # filename in parol6's mesh dir — collision.py and other consumers
-    # still resolve the gripper body via that filename. Keeps existing
-    # collision checks working without a parallel refactor in this turn.
+    # collision.py still resolves the body via the legacy filename;
+    # write a copy under that name to avoid a parallel refactor.
     try:
         legacy_path = mesh_dir / "ssg48_body_realsense.stl"
         mesh.export(str(legacy_path), file_type="stl")
@@ -1310,22 +1104,16 @@ def auto_migrate_ssg48_with_bracket() -> bool:
         mesh_translate_m=(0.0, 0.0, 0.0),
         mesh_rpy_rad=(0.0, 0.0, 0.0),
         mesh_scale=1.0,
-        # SSG-48 TCP — same flange→TCP transform as the built-in entry.
+        # Same flange→TCP and jaw motion as parol6's built-in SSG-48.
         tcp_origin_m=(0.0, 0.0, -0.105),
         tcp_rpy_rad=(0.0, 0.0, 0.0),
-        # Jaw motion from parol6's _SSG48_JAW_MOTION (24 mm symmetric, +Y).
         jaw_travel_m=0.024,
         jaw_axis=(0.0, 1.0, 0.0),
         jaw_symmetric=True,
-        # The CONTROLLER doesn't know about ``custom:`` keys — proxy
-        # motor commands through the built-in SSG-48 entry so jaw
-        # motion / current ranges still work on hardware.
+        # Controller doesn't know ``custom:`` keys; proxy through SSG-48.
         proxy_tool_key="SSG-48",
-        # The whole point of this migration: the merged STL has the
-        # camera bracket fused in, so this custom tool is calibratable.
         has_camera=True,
-        # Match parol6's SSG-48 ToolVariant entries — finger/pinch with
-        # the same 24 mm symmetric +Y travel.
+        # Match parol6's SSG-48 ToolVariant entries (finger / pinch).
         variants=[
             CustomToolVariant(
                 key="finger", display_name="Finger",
@@ -1347,8 +1135,7 @@ def auto_migrate_ssg48_with_bracket() -> bool:
         cfg.jaw_left_path.exists() and cfg.jaw_right_path.exists()
     )
 
-    # Register the new custom tool so it shows up in the dropdown
-    # without a restart.
+    # Register so the dropdown picks up the new tool without a restart.
     register_one(cfg)
 
     sentinel.touch()
@@ -1366,15 +1153,9 @@ def auto_migrate_ssg48_with_bracket() -> bool:
 
 
 def _active_gui_tool_key() -> str | None:
-    """Return the tool key the GUI is currently presenting as active.
-
-    For built-ins (controller knows them), this matches
-    ``robot_state.tool_key`` — set by the controller's broadcast.
-    For custom tools (controller doesn't know them), this comes from
-    ``app.storage.general['selected_tool']`` instead — the controller
-    is broadcasting the proxy_tool_key (or whatever it last had) but
-    the GUI is presenting the custom tool. The user's choice wins for
-    visualization / camera gating / per-tool overrides.
+    """GUI's logical active tool key (custom: prefix preserved). Reads
+    ``app.storage.general['selected_tool']`` first so the user's choice
+    wins over the controller's built-in-only broadcast.
     """
     try:
         from nicegui import app  # noqa: PLC0415
@@ -1393,30 +1174,18 @@ def _active_gui_tool_key() -> str | None:
 
 
 def is_active_tool(name: str) -> bool:
-    """Return True when ``custom:<name>`` is the GUI's currently-
-    presented active tool. Used by the UI to show an ACTIVE badge and
-    to decide whether a transform edit gets a live in-scene refresh.
-    """
+    """True when ``custom:<name>`` is the GUI's active tool."""
     return _active_gui_tool_key() == f"custom:{name}"
 
 
-# Built-in tool keys that ship with a calibratable camera. parol6's
-# ``ToolConfig`` doesn't carry a ``has_camera`` field, so we maintain
-# this whitelist here. As of 2026-05: only the MSG AI gripper has an
-# integrated RGB camera. Add new keys here if/when more camera-bearing
-# built-ins land — and propose ``has_camera`` upstream as part of the
-# Phase 3 PR if Jepson is interested.
+# Built-in tool keys with a calibratable camera. parol6's ``ToolConfig``
+# carries no ``has_camera`` field, hence the whitelist.
 BUILTIN_CAMERA_BEARING_TOOLS: frozenset[str] = frozenset({"MSG"})
 
 
 def is_camera_bearing(tool_key: str | None) -> bool:
-    """Return True when ``tool_key`` refers to a tool with a calibratable
-    camera. Custom tools opt in via ``CustomToolConfig.has_camera``;
-    built-ins are checked against the small whitelist above.
-
-    Used to gate calibration overlay visibility (frustum, hemisphere,
-    reachability dots, board overlay, footprint) — without a camera-
-    bearing tool active, those overlays don't make sense.
+    """True when ``tool_key`` is camera-bearing (custom tool with
+    ``has_camera``, or a built-in in ``BUILTIN_CAMERA_BEARING_TOOLS``).
     """
     if not tool_key:
         return False
@@ -1429,12 +1198,7 @@ def is_camera_bearing(tool_key: str | None) -> bool:
 
 
 def active_tool_is_camera_bearing() -> bool:
-    """Convenience: ``is_camera_bearing(_active_gui_tool_key())``.
-
-    Reads the GUI's logical active tool, not the controller's
-    broadcast — the controller can't know about custom tools, so its
-    broadcast points at the proxy_tool_key. The GUI's choice wins.
-    """
+    """``is_camera_bearing(_active_gui_tool_key())``."""
     return is_camera_bearing(_active_gui_tool_key())
 
 
@@ -1443,9 +1207,7 @@ def active_tool_is_camera_bearing() -> bool:
 # ---------------------------------------------------------------------------
 
 
-# Setting keys that custom tools can override per-tool. Anything else
-# (board placement, hemisphere search, localise tunables, etc.) stays
-# global — those are workspace properties, not tool properties.
+# Keys overridable per-tool; the rest are workspace properties.
 _PER_TOOL_OVERRIDABLE_KEYS: frozenset[str] = frozenset({
     "intr_fx", "intr_fy", "intr_cx", "intr_cy",
     "intr_width", "intr_height",
@@ -1454,33 +1216,22 @@ _PER_TOOL_OVERRIDABLE_KEYS: frozenset[str] = frozenset({
 
 
 # ---------------------------------------------------------------------------
-# Per-tool override storage layer
+# Per-tool override storage layer.
 #
-# Persistent path: ``app.storage.user[f"calib_tool_{tool_key}_{setting_key}"]``.
-# Works for ANY tool key: built-ins like MSG / SSG-48 (which can't carry
-# fields on their parol6 ToolConfig) AND custom tools (which can also
-# store on CustomToolConfig fields, used as a fallback layer).
+# Persistent: ``app.storage.user[f"calib_tool_{tool_key}_{setting_key}"]``.
+# A thread-safe runtime cache mirrors it; worker threads can't read
+# app.storage.user directly. Call ``prime_per_tool_overrides_cache()`` from
+# a request thread before spawning workers.
 #
-# Thread-safe cache: ``_per_tool_runtime_cache`` mirrors the persistent
-# storage. NiceGUI's ``app.storage.user`` raises RuntimeError outside a
-# request context, so worker threads (calibration, localise, hover,
-# reachability) can't read it directly. Reads always go through the
-# cache; writes update both the cache + the persistent storage. The
-# cache is primed by ``prime_per_tool_overrides_cache()`` which must
-# be called from the request thread before spawning any worker.
-#
-# Resolution priority for ``settings.get(<intr_/cam_mount_*>)``:
-#   1. Per-tool storage override for the GUI's active tool
-#   2. CustomToolConfig field (legacy / custom-tool specific path)
-#   3. Built-in tool defaults (e.g. MSG OV9732 specs)
+# Resolution priority for overridable keys:
+#   1. Per-tool storage override (active tool)
+#   2. CustomToolConfig field (legacy fallback)
+#   3. Built-in tool defaults
 #   4. Global runtime override
 #   5. Module default
 # ---------------------------------------------------------------------------
 
 
-# ``{tool_key: {setting_key: value}}``. Module-level dict, accessible
-# from any thread. Authoritative for thread reads; persistent storage
-# is the source of truth across restarts.
 _per_tool_runtime_cache: dict[str, dict[str, Any]] = {}
 
 
@@ -1489,10 +1240,7 @@ def _per_tool_storage_key(tool_key: str, setting_key: str) -> str:
 
 
 def _coerce_per_tool_value(setting_key: str, raw: Any) -> Any:
-    """Normalise the value as it leaves the persistent layer / enters
-    the runtime cache. Tuples round-trip through JSON as lists; coerce
-    cam_mount_translate_mm + cam_mount_tilt_deg back to 3-tuples so
-    consumers see a stable shape regardless of source."""
+    """Restore tuple shape on cam_mount keys after a JSON round-trip."""
     if raw is None:
         return None
     if setting_key in ("cam_mount_translate_mm", "cam_mount_tilt_deg"):
@@ -1506,12 +1254,7 @@ def _coerce_per_tool_value(setting_key: str, raw: Any) -> Any:
 
 def prime_per_tool_overrides_cache() -> None:
     """Refresh ``_per_tool_runtime_cache`` from ``app.storage.user``.
-    Must be called from a request context (NiceGUI's user storage is
-    request-context-bound). Every code path that spawns a worker
-    thread reading per-tool settings should call this first so the
-    worker has fresh values to read.
-
-    Idempotent: re-running just refreshes the cache.
+    Must be called from a request context. Idempotent.
     """
     try:
         from nicegui import app  # noqa: PLC0415
@@ -1521,8 +1264,7 @@ def prime_per_tool_overrides_cache() -> None:
     try:
         store = app.storage.user
     except Exception as e:  # noqa: BLE001
-        # Likely outside a request context. The cache stays at whatever
-        # it was; we just can't refresh it now.
+        # Outside a request context — cache stays at its current value.
         logger.debug(
             "prime_per_tool_overrides_cache: storage not in request "
             "context (%s); cache unchanged", e,
@@ -1555,14 +1297,8 @@ def prime_per_tool_overrides_cache() -> None:
 
 
 def get_per_tool_override(tool_key: str, setting_key: str) -> Any:
-    """Return the per-tool override for ``setting_key`` on ``tool_key``,
-    or ``None`` when unset.
-
-    Read order: thread-safe runtime cache first, then the persistent
-    storage. The persistent layer raises RuntimeError outside a
-    request context (worker threads), so the cache is the only path
-    that reliably works from anywhere; the storage fallback exists
-    for the case where the cache hasn't been primed yet.
+    """Per-tool override for ``setting_key`` on ``tool_key`` (None unset).
+    Reads the cache first, falls back to persistent storage when primed.
     """
     if not tool_key or setting_key not in _PER_TOOL_OVERRIDABLE_KEYS:
         return None
@@ -1581,16 +1317,13 @@ def get_per_tool_override(tool_key: str, setting_key: str) -> Any:
 def set_per_tool_override(
     tool_key: str, setting_key: str, value: Any,
 ) -> bool:
-    """Persist a per-tool override into ``app.storage.user`` AND mirror
-    it into the thread-safe runtime cache. Pass ``value=None`` to
-    clear the override.
+    """Persist a per-tool override + mirror into the runtime cache. Pass
+    ``value=None`` to clear.
     """
     if not tool_key or setting_key not in _PER_TOOL_OVERRIDABLE_KEYS:
         return False
-    # Update the thread-safe cache first; the storage write may fail
-    # if we're outside a request context, but the cache update lets
-    # subsequent worker reads see the new value during the same
-    # session.
+    # Update the cache first so worker reads see the new value even if
+    # the storage write fails (outside a request context).
     if value is None:
         bucket = _per_tool_runtime_cache.get(tool_key)
         if bucket is not None:
@@ -1624,10 +1357,7 @@ def set_per_tool_override(
 
 
 def has_per_tool_override(tool_key: str) -> bool:
-    """True iff ANY of the overridable keys has a stored value for
-    this tool. Used by the UI to decide whether to show the override-
-    on indicator.
-    """
+    """True iff any overridable key has a stored value for ``tool_key``."""
     return any(
         get_per_tool_override(tool_key, k) is not None
         for k in _PER_TOOL_OVERRIDABLE_KEYS
@@ -1641,20 +1371,8 @@ def clear_per_tool_overrides(tool_key: str) -> None:
 
 
 def active_tool_override(key: str) -> Any:
-    """Return the active tool's per-tool override for ``key`` if one
-    exists, else ``None``.
-
-    Reads the GUI's logical active tool (custom: keys included).
-    Resolution order:
-
-    1. Per-tool storage layer (``app.storage.user[calib_tool_<key>_*]``)
-       — works for both built-ins AND custom tools.
-    2. Custom tool's ``CustomToolConfig`` field (legacy fallback for
-       configs saved before the storage layer landed; only meaningful
-       for camera-bearing custom tools).
-
-    Returns ``None`` when neither layer has the value, in which case
-    ``settings.get`` falls through to the global runtime / default.
+    """Active tool's per-tool override for ``key``, or None. Layers:
+    storage → CustomToolConfig field → built-in defaults.
     """
     if key not in _PER_TOOL_OVERRIDABLE_KEYS:
         return None
@@ -1662,23 +1380,19 @@ def active_tool_override(key: str) -> Any:
     if not tool_key:
         return None
 
-    # Layer 1: storage (works for any tool, built-in or custom).
+    # Layer 1: storage.
     storage_value = get_per_tool_override(tool_key, key)
     if storage_value is not None:
         return storage_value
 
-    # Layer 2: CustomToolConfig field (legacy fallback for custom
-    # tools whose users edited values via the per-tool card before the
-    # storage layer was added).
+    # Layer 2: CustomToolConfig field (legacy fallback).
     if tool_key.startswith("custom:"):
         cfg = load_config(tool_key[len("custom:"):])
         if cfg is None or not cfg.has_camera:
             return None
         return getattr(cfg, key, None)
 
-    # Layer 3: built-in tool defaults (e.g. MSG AI gripper's OV9732
-    # camera position + intrinsics). Saves the user from having to
-    # type these in by hand for the stock tools we ship support for.
+    # Layer 3: built-in tool defaults so stock tools work out of the box.
     builtin = _BUILTIN_TOOL_DEFAULTS.get(tool_key)
     if builtin is not None and key in builtin:
         return builtin[key]
@@ -1686,16 +1400,9 @@ def active_tool_override(key: str) -> Any:
     return None
 
 
-# Built-in camera-bearing tool defaults. Keyed by parol6 tool key; each
-# value is a dict of overridable settings to default values. Used by
-# ``active_tool_override`` as the lowest-priority layer (after per-user
-# storage and per-tool config), so a fresh install sees sensible
-# camera placement / intrinsics out of the box for the stock tools.
-#
-# MSG AI gripper: OV9732 camera, 1280x720 native, f=2.84 mm, 3.0 um
-# pixel pitch, 100 deg diagonal FOV. Pinhole-derived focal in pixels:
-# fx = fy = 2.84 / 0.003 = ~947 px. Camera origin in flange frame
-# matches Alvar's CAD inspection of the MSG body STL.
+# Built-in camera-bearing tool defaults. MSG AI gripper: OV9732 sensor,
+# 1280x720, f=2.84 mm, 3.0 um pitch → fx=fy≈947 px; mount geometry from
+# CAD inspection of the MSG body STL.
 _BUILTIN_TOOL_DEFAULTS: dict[str, dict[str, Any]] = {
     "MSG": {
         "intr_fx": 947.0,
@@ -1714,11 +1421,8 @@ def update_active_tool_calibrated_mount(
     cam_mount_translate_mm: tuple[float, float, float],
     cam_mount_tilt_deg: tuple[float, float, float],
 ) -> bool:
-    """After a successful calibration, persist the calibrated mount as
-    a per-tool override on the active tool. Works for built-ins
-    (writes to storage) AND custom tools (writes to storage; the
-    legacy CustomToolConfig fields stay untouched). Returns True when
-    a write actually happened.
+    """Persist a calibrated mount as a per-tool override on the active
+    tool. Returns True iff a write happened.
     """
     tool_key = _active_gui_tool_key()
     if not tool_key:
@@ -1753,15 +1457,8 @@ def update_active_tool_calibrated_mount(
 
 
 def live_refresh_active_tool(name: str) -> bool:
-    """If ``custom:<name>`` is the active tool, call the URDF scene's
-    ``apply_tool`` to re-load tool meshes from disk so a fresh re-bake
-    appears immediately. Returns True when a refresh was issued.
-
-    No-op when:
-    * the tool isn't currently active (the user needs to switch to it
-      via the gripper panel before edits become visible),
-    * waldo-commander's UI state isn't initialised yet (e.g. called
-      during page-teardown).
+    """If ``custom:<name>`` is active, re-call ``apply_tool`` so a fresh
+    bake appears immediately. Returns True when a refresh was issued.
     """
     if not is_active_tool(name):
         return False
@@ -1788,10 +1485,8 @@ def live_refresh_active_tool(name: str) -> bool:
 
 
 def list_registered_tools() -> list[tuple[str, str]]:
-    """Return ``[(registry_key, display_name), ...]`` for every tool
-    currently in ``parol6.tools._TOOL_REGISTRY``. Used by the import
-    dialog so the user picks a source by name. Excludes ``"NONE"`` (it
-    has no meshes worth copying).
+    """``[(key, display_name), ...]`` for every tool in
+    ``parol6.tools._TOOL_REGISTRY``, excluding ``"NONE"``.
     """
     try:
         from parol6 import tools as parol6_tools  # noqa: PLC0415
@@ -1806,25 +1501,11 @@ def list_registered_tools() -> list[tuple[str, str]]:
 
 
 def import_from_registered(source_key: str, target_name: str) -> CustomToolConfig | None:
-    """Fork the tool at ``parol6.tools._TOOL_REGISTRY[source_key]`` into a
-    new custom tool under ``~/.waldo-commander/custom_tools/<target_name>/``.
-
-    Reads the source's meshes (BODY + JAWs), copies the underlying STL
-    files from parol6's mesh dir to the new custom-tool folder, extracts
-    the TCP transform + jaw motion, and writes a ``config.json`` with a
-    placement transform of identity (the source meshes are already in
-    flange coordinates so no extra placement is needed).
-
-    Returns the new ``CustomToolConfig`` on success, or None when:
-    * the source key isn't in the registry,
-    * the source has no body mesh,
-    * the target name already exists,
-    * file copies fail.
-
-    Use case: migrate a built-in tool (or one that was modified by a
-    startup hijack like the SSG-48 merged-bracket bake) into the custom
-    system so the user can iterate transforms / TCP / motion via the UI
-    instead of editing module constants.
+    """Fork ``source_key`` into a new custom tool. Copies the source's
+    body + jaw STLs from parol6's mesh dir, extracts TCP + jaw motion,
+    and writes an identity-placement ``config.json``. Returns None when
+    the source is missing, has no body, the target exists, or a copy
+    fails.
     """
     if target_name in list_tool_names():
         logger.warning("import: target %r already exists", target_name)
@@ -1859,13 +1540,12 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
         return None
 
     def _resolve(filename: str) -> Path:
-        """Strip any browser cache-bust ``?v=<mtime>`` suffix the SSG-48
-        hijack adds for Three.js URL invalidation — it's URL syntax,
-        invalid as a filesystem path."""
+        """Strip the ``?v=<mtime>`` cache-bust suffix added by the
+        SSG-48 hijack so the URL becomes a usable filesystem path."""
         plain = filename.split("?", 1)[0]
         return mesh_dir / plain
 
-    # Copy STLs into the new custom-tool folder under canonical names.
+    # Copy STLs into the new custom-tool folder.
     target_folder = CUSTOM_TOOLS_ROOT / target_name
     target_folder.mkdir(parents=True, exist_ok=True)
     body_src = _resolve(body_spec.file)
@@ -1873,9 +1553,7 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
         logger.warning("import: body STL missing: %s", body_src)
         return None
     shutil.copyfile(str(body_src), str(target_folder / BODY_STL_NAME))
-    # Up to two jaws: jaw_specs[0] -> jaw_left, jaw_specs[1] -> jaw_right.
-    # parol6's tools list "right" before "left" by convention; both
-    # orderings work since the only thing that matters is one-per-side.
+    # jaw_specs[0]/[1] map to right/left by parol6's convention.
     if len(jaw_specs) >= 2:
         for jaw_spec, dst_name in (
             (jaw_specs[0], JAW_RIGHT_STL_NAME),
@@ -1885,14 +1563,11 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
             if jaw_src.exists():
                 shutil.copyfile(str(jaw_src), str(target_folder / dst_name))
 
-    # ``LinearMotion`` is consulted both inside the variants loop below
-    # AND for the tool-level jaw_motion extraction further down. Hoist
-    # the lookup once so both paths see the same name.
+    # Hoist the LinearMotion lookup so the variants loop + tool-level
+    # extraction below share it.
     LinearMotion = getattr(parol6_tools, "LinearMotion", None)
 
-    # Extract variants — each variant has its own jaw STLs + jaw motion.
-    # Skip the body mesh from the variant's meshes list (we already
-    # copied the shared body above).
+    # Extract variant-specific jaws + motion (body is shared, already copied).
     variants_out: list[CustomToolVariant] = []
     for src_variant in getattr(src, "variants", ()) or ():
         vkey = str(getattr(src_variant, "key", ""))
@@ -1937,17 +1612,14 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
             )
         )
 
-    # Extract TCP transform: source.transform is the 4×4 flange→TCP.
+    # Extract flange→TCP transform.
     transform = np.asarray(src.transform, dtype=np.float64)
     tcp_origin = tuple(float(v) for v in transform[:3, 3])
     tcp_rpy = tuple(
         float(v) for v in SciRot.from_matrix(transform[:3, :3]).as_euler("XYZ")
     )
 
-    # Jaw motion: pick the first LinearMotion (custom_tools only models
-    # one). parol6 ships LinearMotion with axis + travel_m + symmetric.
-    # ``LinearMotion`` was looked up earlier (used by the variants
-    # block too).
+    # Take the first LinearMotion as jaw motion (custom_tools models one).
     jaw_travel_m = 0.0
     jaw_axis: tuple[float, float, float] = (0.0, 1.0, 0.0)
     jaw_symmetric = True
@@ -1968,7 +1640,7 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
             f"Imported from {source_key}. "
             f"{getattr(src, 'description', '') or ''}".strip()
         ),
-        # Identity placement — source STLs are already in flange coords.
+        # Source STLs are already in flange coords.
         mesh_translate_m=(0.0, 0.0, 0.0),
         mesh_rpy_rad=(0.0, 0.0, 0.0),
         mesh_scale=1.0,
@@ -1977,17 +1649,13 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
         jaw_travel_m=jaw_travel_m,
         jaw_axis=jaw_axis,
         jaw_symmetric=jaw_symmetric,
-        # Proxy motor commands through the source built-in tool —
-        # the controller knows that key, our ``custom:`` key it
-        # doesn't.
+        # Proxy motor commands through the source built-in tool.
         proxy_tool_key=str(source_key),
-        # Inherit camera-bearing status from the source tool.
         has_camera=is_camera_bearing(source_key),
         variants=variants_out,
     )
     save_config(cfg)
-    # Refresh the derived flags now that body / jaws / variant jaws
-    # exist on disk.
+    # Refresh derived flags now that the STLs exist on disk.
     cfg.has_body = cfg.body_path.exists()
     cfg.has_jaws = cfg.jaw_left_path.exists() and cfg.jaw_right_path.exists()
     for v in cfg.variants:
@@ -2004,28 +1672,18 @@ def import_from_registered(source_key: str, target_name: str) -> CustomToolConfi
 
 
 async def select_as_active(name: str, proxy_tool_key: str = "") -> bool:
-    """Make ``custom:<name>`` the actively-used tool.
+    """Make ``custom:<name>`` the active tool.
 
-    Custom tools live only in the GUI process — the parol6-server has
-    no awareness of them, so ``client.select_tool("custom:<name>")``
-    raises with "Unknown tool". The architecturally-correct answer is
-    to treat custom tools as a CLIENT-SIDE concept (visualisation +
-    IK) and decouple the controller's tool selection from the visual.
+    Always: local apply via ``active_robot.set_active_tool`` +
+    ``urdf_scene.apply_tool`` (FK/IK + 3D scene use the custom TCP
+    and meshes).
 
-    What this does:
-
-    1. Always: local apply on the GUI side — ``active_robot.set_active_tool``
-       (so FK/IK uses the custom TCP) plus ``urdf_scene.apply_tool`` (so
-       the 3D scene shows the custom meshes). These read from the
-       in-process ``_TOOL_REGISTRY`` and the custom key is fine there.
-    2. Optional: when ``proxy_tool_key`` is non-empty, also send
-       ``client.select_tool(proxy_tool_key)`` so the CONTROLLER acts as
-       that built-in tool — required for jaw motion / motor commands.
-       For the SSG-48 + bracket migration, ``proxy_tool_key="SSG-48"``
-       so jaws still drive on hardware.
+    Optional: with ``proxy_tool_key`` non-empty, send
+    ``client.select_tool(proxy_tool_key)`` so the controller acts as
+    that built-in (needed for jaw motion / motor commands).
 
     Returns True iff the local apply succeeded; the proxy call is
-    best-effort and its failure is reported as a warning, not an error.
+    best-effort.
     """
     full_key = f"custom:{name}"
     try:
@@ -2053,9 +1711,8 @@ async def select_as_active(name: str, proxy_tool_key: str = "") -> bool:
                 full_key, e,
             )
 
-    # Persist the GUI's choice so a page reload restores this custom
-    # tool — without this, on reload the controller's broadcast wins
-    # (the proxy built-in) and the user is back on SSG-48 / whatever.
+    # Persist so a page reload restores this tool; otherwise the
+    # controller's broadcast (the proxy built-in) wins on reload.
     try:
         from nicegui import app  # noqa: PLC0415
 
@@ -2068,8 +1725,7 @@ async def select_as_active(name: str, proxy_tool_key: str = "") -> bool:
 
     # ---- CONTROLLER PROXY (optional) -----------------------------------
     if proxy_tool_key:
-        # ``ui_state.control_panel`` is a property that raises
-        # RuntimeError when uninitialised — wrap broadly.
+        # ``ui_state.control_panel`` raises RuntimeError when uninitialised.
         client = None
         try:
             panel = ui_state.control_panel

@@ -20,19 +20,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-# Lock guarding paired RMW updates to ``_state``. Acquire when reading or
-# writing more than one related key as a unit so other threads can't see
-# a half-updated view.
-#
-# Currently scopes the ``reach_generation`` + ``reachable_candidates`` pair
-# (writers in ``localise._update_T_board2base`` and
-# ``reachability._render_reachability_dots``; readers in
-# ``pose_popup._on_scene_click``). Single-key writes like
-# ``_state["is_running"] = True`` don't need the lock — the dict assignment
-# is GIL-atomic on its own.
-#
-# ``RLock`` so a path that already holds the lock can acquire it again
-# (e.g. a writer that calls into a helper which itself locks).
+# Guards paired RMW updates to ``_state`` (e.g. ``reach_generation`` +
+# ``reachable_candidates``). Single-key writes are GIL-atomic and don't
+# need this. ``RLock`` so a holder can re-acquire via a helper.
 _state_lock = threading.RLock()
 
 
@@ -58,28 +48,17 @@ _state: dict[str, Any] = {
     "board_group": None,       # ChArUco board overlay (deletable scene group)
     "hemisphere_group": None,  # hemisphere wireframe + reachability dots group
     "tablet_group": None,      # translucent tablet collision-box visual
-    # Reachable hemisphere candidates cached by _add_reachability_points; the
-    # board-localise thread reuses these as lookout joint configurations so we
-    # don't have to re-run pose generation just to pick scan poses.
+    # Reused by the localise thread as lookout joint configurations.
     "reachable_candidates": [],
-    # Cached collision-manager pair for validate_joint_trajectory(); built
-    # lazily on first call so users importing this module pay nothing.
+    # Built lazily on first ``validate_joint_trajectory`` call.
     "trajectory_collision_mgr_pair": None,
-    # Timestamp of the most recent successful Localise Board run. None
-    # means never — the Run button shows a warning dialog in that case
-    # because calibration would aim at the configured _BOARD_TRANSLATE_M
-    # rather than the actual board pose.
+    # Most recent successful Localise Board run. None gates the Run button's
+    # warning dialog.
     "last_localise_ok_at": None,
     # True while the localise-before-Run confirmation dialog is open.
-    # _busy_warn checks this so the user can't start a parallel Localise
-    # while the dialog is awaiting their answer.
     "dialog_open": False,
-    # Detection-overlay (live perception viz). The group handle is the
-    # NiceGUI scene group containing the wireframe boxes + labels for the
-    # most recent set of detections; we delete + rebuild it on each poll
-    # tick where the JSON has changed. detection_last_mtime caches the
-    # file mtime so we skip unchanged polls cheaply. detection_overlay_timer
-    # is the ui.timer handle from add_overlays.
+    # Detection-overlay (live perception viz): group handle + mtime cache
+    # for change-detection polling + the ui.timer driving the poll.
     "detection_overlay_group": None,  # NiceGUI group handle
     "detection_last_mtime": 0.0,       # for change detection
     "detection_overlay_timer": None,
@@ -90,9 +69,7 @@ _state: dict[str, Any] = {
     "show_near_cone": True,
     "show_centerline": True,
     "show_footprint": True,
-    # Off by default — the perception JSON file frequently outlives
-    # the pipeline run that wrote it, and the user wouldn't expect a
-    # stale wireframe of "the white cube" to greet them on startup.
+    # Off by default — stale perception JSON often outlives its run.
     "show_detections": False,
 }
 
@@ -103,9 +80,8 @@ _state: dict[str, Any] = {
 
 
 def _aruco_dict_id(name: str) -> int:
-    """Translate a user-facing dictionary name (e.g. ``"DICT_4X4_50"``) to
-    OpenCV's integer constant. Falls back to ``DICT_4X4_50`` with a warning
-    if the name isn't recognised.
+    """Translate a dictionary name (e.g. ``"DICT_4X4_50"``) to OpenCV's
+    integer constant; falls back to ``DICT_4X4_50``.
     """
     import cv2  # noqa: PLC0415
     attr = getattr(cv2.aruco, name, None)
@@ -119,19 +95,9 @@ def _aruco_dict_id(name: str) -> int:
 
 
 def current_board_config() -> Any:
-    """Build a fresh ``BoardConfig`` from the current settings.
-
-    Imports parol6-vision lazily so this module loads cleanly even when
-    the calibration package isn't installed (e.g. in headless tests).
-
-    When the user is mid-edit (e.g. just changed square_length but not yet
-    marker_length, or vice-versa), the marker/square invariant
-    ``0 < marker < square`` may be temporarily violated. Rather than
-    raising and aborting every consumer, we clamp marker_length to
-    ``0.6 * square_length`` (the recommended sweet spot per
-    Garrido-Jurado 2014) and log a warning. The UI also surfaces the
-    invariant in real time when the user types invalid values, but
-    this ensures the scene keeps rendering regardless.
+    """Build a fresh ``BoardConfig`` from the current settings. Clamps
+    marker_length to ``0.6 * square_length`` when the user is mid-edit and
+    has temporarily violated the ``0 < marker < square`` invariant.
     """
     from parol6_vision.calibration.board import BoardConfig  # noqa: PLC0415
 
@@ -162,33 +128,23 @@ def current_board_config() -> Any:
 
 
 def _hemi_azimuth_center_deg() -> float:
-    """Direction from the robot base origin to the hemisphere anchor, in
-    degrees measured from world +X (CCW). Used so the hemisphere naturally
-    faces "away from the robot" toward where the workable space (board)
-    sits."""
+    """Base→hemisphere-anchor azimuth (degrees, CCW from world +X)."""
     cx, cy, _ = _hemi_centre_world().tolist()
     return float(np.degrees(np.arctan2(cy, cx)))
 
 
 def _hemi_azimuth_world_range_deg() -> tuple[float, float]:
-    """World-frame azimuth range covering the hemisphere's spread, centered
-    on the base→board direction. Used by both the viz and the orchestrator."""
+    """World-frame azimuth range centred on the base→board direction."""
     center = _hemi_azimuth_center_deg()
     spread = float(settings.hemi_azimuth_spread_deg)
     return (center - spread, center + spread)
 
 
 def _build_T_board2base() -> NDArray[np.float64]:
-    """Compose the SE(3) board→base matrix from the board placement settings.
-
-    When the mounting surface is enabled, the board origin is auto-lifted
-    along its local +Z by the surface's thickness (``surface_dimensions_m[2]``).
-    This matches the physical reality of a tablet lying screen-up on a
-    bench: the bench surface is at world z=0, the surface body sits on the
-    bench, and the ChArUco face is at z = surface_thickness above the bench.
-    The user-facing ``board_translate_m`` continues to describe where the
-    board sits IF the surface had zero thickness — ergonomic because it
-    preserves the natural mental model "the board's at this XY".
+    """Compose the SE(3) board→base matrix from settings. When the mounting
+    surface is enabled, the board origin is lifted along board-local +Z by
+    the surface thickness so ``board_translate_m`` describes the position
+    as if the surface were zero-thickness.
     """
     rpy = settings.board_rpy_rad
     R = np.eye(3, dtype=np.float64)
@@ -197,7 +153,7 @@ def _build_T_board2base() -> NDArray[np.float64]:
 
     translation = np.asarray(settings.board_translate_m, dtype=np.float64).copy()
     if bool(settings.surface_enabled):
-        # Lift along board's +Z (out of the screen face) by surface thickness.
+        # Lift along board's +Z by surface thickness.
         thickness = float(settings.surface_dimensions_m[2])
         translation += R[:, 2] * thickness
 
@@ -208,13 +164,9 @@ def _build_T_board2base() -> NDArray[np.float64]:
 
 
 def _board_center_world() -> NDArray[np.float64]:
-    """Compute the board's geometric center in world coordinates.
-
-    The ChArUco config places the board's local origin at one corner and the
-    board extends to (w_m, h_m, 0) in board-local coordinates. The
-    pose-generator look-at target uses the board CENTRE (not the corner);
-    aiming at the corner would make the pose generator aim cameras at one
-    edge of the board, leaving most of the printed pattern outside FOV.
+    """Board geometric centre in world coords. The ChArUco config places
+    the local origin at one corner; the pose-generator look-at target needs
+    the centre so the printed pattern stays inside FOV.
     """
     sx = int(settings.board_squares_x)
     sy = int(settings.board_squares_y)
@@ -226,10 +178,9 @@ def _board_center_world() -> NDArray[np.float64]:
 
 
 def _hemi_centre_world() -> NDArray[np.float64]:
-    """Hemisphere anchor — ``hemi_centre_override_m`` if set, board centre
-    otherwise. This is the SPATIAL anchor of the hemisphere (where the dome
-    of camera positions sits in world frame). Distinct from the look-at
-    target, which is always the actual board centre regardless of override.
+    """Hemisphere spatial anchor — ``hemi_centre_override_m`` if set, board
+    centre otherwise. Distinct from the look-at target (always the board
+    centre regardless of override).
     """
     override = settings.hemi_centre_override_m
     if override is not None:
@@ -237,20 +188,13 @@ def _hemi_centre_world() -> NDArray[np.float64]:
     return _board_center_world()
 
 
-# Module-level computed value. Must come AFTER ``_build_T_board2base`` is
-# defined so the call here resolves correctly. Gets mutated in place via
-# slice assignment from ``rebuild_T_board2base`` and from auto-localise so
-# importers see updates without rebinding.
+# Mutated in place via slice assignment so importers see updates without
+# rebinding. Defined after ``_build_T_board2base`` so the call resolves.
 _T_BOARD2BASE: NDArray[np.float64] = _build_T_board2base()
 
 
 def rebuild_T_board2base() -> None:
-    """Rebuild ``_T_BOARD2BASE`` from the current settings (board placement,
-    surface thickness) and write it in place via slice assignment.
-
-    Call this after any board-placement or surface-thickness setting
-    changes so all importing modules see the new value.
-    """
+    """Rebuild ``_T_BOARD2BASE`` from settings and write it in place."""
     new_T = _build_T_board2base()
     _T_BOARD2BASE[:] = new_T
 
@@ -261,19 +205,9 @@ def rebuild_T_board2base() -> None:
 
 
 def save_recovered_board_pose(T_board2base: NDArray[np.float64]) -> None:
-    """Persist a localise/calibration-recovered board pose.
-
-    Writes to BOTH:
-      * ``_state["recovered_board_pose"]`` — in-memory, survives a browser
-        refresh within the same waldo-commander process.
-      * ``app.storage.general["recovered_board_pose"]`` — persisted to
-        ``storage-general.json`` on disk, survives waldo-commander
-        restarts.
-
-    Tagged with the current sim/real mode so that switching modes after
-    a restart doesn't apply an inappropriate pose (a real-mode recovered
-    pose isn't valid in sim mode and vice versa). Mode tag check happens
-    on ``restore_recovered_board_pose``.
+    """Persist a recovered board pose to both ``_state`` (in-memory) and
+    ``app.storage.general`` (disk). Tagged with sim/real mode so
+    ``restore_recovered_board_pose`` can discard stale poses on mode swap.
     """
     import logging  # noqa: PLC0415
 
@@ -304,22 +238,10 @@ def save_recovered_board_pose(T_board2base: NDArray[np.float64]) -> None:
 
 
 def restore_recovered_board_pose() -> NDArray[np.float64] | None:
-    """Find a previously-recovered board pose, if any applies.
-
-    Checks in-memory ``_state["recovered_board_pose"]`` first (browser
-    refresh path: same process kept the value). Falls back to
-    ``app.storage.general["recovered_board_pose"]`` (waldo-commander
-    restart path: storage persisted to disk).
-
-    For storage hits, the saved sim/real mode flag must match the
-    current ``robot_state.simulator_active``; otherwise the pose is
-    discarded with a log line so the user knows the stale entry exists
-    and can re-localise.
-
-    Returns:
-        4x4 SE(3) pose if a valid one is found, else None. On a storage
-        hit, ``_state["recovered_board_pose"]`` is also re-populated so
-        subsequent calls take the in-memory fast path.
+    """Find a previously-recovered board pose: in-memory ``_state`` first,
+    ``app.storage.general`` fallback. Storage hits whose sim/real mode tag
+    doesn't match the current mode are discarded. On a storage hit the
+    in-memory slot is re-populated for the fast path.
     """
     import logging  # noqa: PLC0415
 
@@ -394,14 +316,9 @@ def restore_recovered_board_pose() -> NDArray[np.float64] | None:
 
 
 def clear_recovered_board_pose() -> None:
-    """Wipe the recovered-pose state. Next ``add_overlays`` will fall back
-    to the configured ``_BOARD_TRANSLATE_M`` / ``_BOARD_RPY_RAD``.
-
-    Use when the user has physically moved the board between sessions
-    and doesn't want the stale recovered pose to override the configured
-    one. Currently no UI entry point — call from a Python shell or edit
-    ``storage-general.json`` manually if needed. See DEFERRED_FEATURES.md
-    for a planned reset-button + sim/real pose-swap UI.
+    """Wipe the recovered-pose state so the next ``add_overlays`` falls
+    back to the configured ``_BOARD_TRANSLATE_M`` / ``_BOARD_RPY_RAD``.
+    No UI entry point yet — see DEFERRED_FEATURES.md.
     """
     import logging  # noqa: PLC0415
 
