@@ -106,6 +106,8 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
 
         def _dispatch_thread() -> None:
             from .panel import _post_status as _ps  # noqa: PLC0415
+
+            client: Any = None
             try:
                 from parol6 import RobotClient  # noqa: PLC0415
 
@@ -126,6 +128,27 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
                 except Exception:  # noqa: BLE001
                     logger.exception("go-to-pose dispatch crashed")
             finally:
+                # If STOP fired during this move, follow up with resume()
+                # so the controller leaves its disabled state and
+                # subsequent commands (tool switch, jog, etc.) aren't
+                # rejected with "Controller disabled: Motion command
+                # sent while controller is disabled". PAROL6 firmware
+                # latches HALT → DISABLED until an explicit RESUME.
+                if _state.get("stop_requested") and client is not None:
+                    try:
+                        client.resume()
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("go-to-pose post-halt resume raised: %s", e)
+                # Clear our reference from the panel's STOP-button slot so
+                # a subsequent ``_teardown_overlays`` (fired by a tool
+                # switch or features-off toggle) doesn't try to halt the
+                # already-finished move via a stale client handle —
+                # which used to spuriously HALT the controller and
+                # leave it disabled. ``is`` check prevents clobbering
+                # a newer client that another worker may have already
+                # set.
+                if _state.get("client") is client:
+                    _state["client"] = None
                 _state["is_going_to_pose"] = False
                 _state["stop_requested"] = False
 
@@ -238,6 +261,26 @@ def _go_to_pose_for_candidate(candidate: Any, dot_idx: int) -> None:
             except Exception:  # noqa: BLE001
                 logger.exception("go-to-pose worker crashed")
         finally:
+            # If STOP fired during this move, follow up with resume()
+            # so the controller leaves its disabled state and
+            # subsequent commands (tool switch, jog, etc.) aren't
+            # rejected with "Controller disabled". PAROL6 firmware
+            # latches HALT → DISABLED until an explicit RESUME.
+            if _state.get("stop_requested") and client is not None:
+                try:
+                    client.resume()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("go-to-pose post-halt resume raised: %s", e)
+            # Clear our reference from the panel's STOP-button slot so
+            # a subsequent ``_teardown_overlays`` (fired by a tool
+            # switch or features-off toggle) doesn't try to halt the
+            # already-finished move via a stale client handle —
+            # which used to spuriously HALT the controller and leave
+            # it disabled, blocking the next tool-switch attempt.
+            # ``is`` check prevents clobbering a newer client that
+            # another worker may have already set.
+            if _state.get("client") is client:
+                _state["client"] = None
             # Only clear the flag if THIS worker still owns it. The
             # collision-blocked path already released ownership above
             # (worker_holds_flag = False); a later `_spawn_dispatch`
