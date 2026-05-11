@@ -1040,13 +1040,32 @@ def build_page_content() -> None:
                 except Exception:
                     hw_now = False
                 if hw_now and robot_state.simulator_active:
-                    logger.info("Hardware detected — switching to robot mode")
-                    robot_state.simulator_active = False
+                    # Honour the user's last explicit toggle choice. If
+                    # they were running in sim deliberately (e.g.
+                    # editing scripts with the robot powered off
+                    # nearby), don't override their choice just because
+                    # hardware is suddenly detectable. Only auto-switch
+                    # when no explicit preference has been recorded —
+                    # preserving the original "first launch with
+                    # hardware wired" convenience for fresh installs.
                     try:
-                        await client.simulator(False)
-                        await client.resume()
-                    except Exception as e:
-                        logger.warning("auto robot-mode switch failed: %s", e)
+                        saved_mode = ng_app.storage.general.get("startup_mode")
+                    except Exception:  # noqa: BLE001
+                        saved_mode = None
+                    if saved_mode == "sim":
+                        logger.info(
+                            "Hardware detected but user preference is sim — "
+                            "staying in sim mode. Toggle the robot button "
+                            "if you want to switch."
+                        )
+                    else:
+                        logger.info("Hardware detected — switching to robot mode")
+                        robot_state.simulator_active = False
+                        try:
+                            await client.simulator(False)
+                            await client.resume()
+                        except Exception as e:
+                            logger.warning("auto robot-mode switch failed: %s", e)
                 robot_state.connected = hw_now
 
                 control_panel.update_robot_btn_visual()
@@ -1191,19 +1210,51 @@ def _register_handlers() -> None:
             logger.debug("startup: wait_ready failed: %s", e)
 
     async def _set_initial_mode(port: str) -> None:
-        """Start streaming; defer mode decision to page load.
+        """Pick the controller's initial mode (sim vs hardware) and resume.
 
-        When a port is configured the controller already has a real serial
-        transport — don't replace it with simulator.  The page-load ping
-        in ``_init`` will set ``robot_state.simulator_active`` based on
-        whether hardware is actually connected.
+        Priority order:
+          1. ``app.storage.general["startup_mode"]`` — the user's last
+             explicit toggle choice. Persisted by
+             ``ControlPanel.on_toggle_sim`` so a restart honours
+             "I was in sim last time, keep me there" without forcing
+             the user to re-toggle on every launch.
+          2. Fallback (no saved preference): sim if no com_port is
+             configured, otherwise leave the controller's pre-existing
+             serial transport alone. Matches the original Jepson
+             behaviour for fresh installs.
+
+        The page-load ping in ``_init`` may still upgrade sim→hardware
+        when hardware is actually detected — but only when the user
+        hasn't explicitly chosen sim (see auto-switch logic there).
         """
-        if not port:
+        try:
+            saved_mode = ng_app.storage.general.get("startup_mode")
+        except Exception:  # noqa: BLE001
+            saved_mode = None
+
+        if saved_mode == "sim":
             try:
                 await client.simulator(True)
             except Exception as e:
                 logger.error("startup: simulator(True) failed: %s", e)
             robot_state.simulator_active = True
+            logger.debug("startup: restored saved mode = sim")
+        elif saved_mode == "hardware":
+            # User explicitly chose hardware — leave controller in
+            # robot mode regardless of whether a com_port is set.
+            robot_state.simulator_active = False
+            logger.debug("startup: restored saved mode = hardware")
+        elif not port:
+            # No saved preference + no port configured → default to sim.
+            try:
+                await client.simulator(True)
+            except Exception as e:
+                logger.error("startup: simulator(True) failed: %s", e)
+            robot_state.simulator_active = True
+        # else: no saved preference but a port IS configured → leave
+        # the controller's existing serial transport in place. _init's
+        # ping-based auto-switch handles the hw-detected case.
+
         try:
             await client.resume()
         except Exception as e:

@@ -1594,7 +1594,16 @@ class ControlPanel:
             self._robot_btn.classes(add="glass-btn", remove="glass-amber")
 
     async def on_toggle_sim(self) -> None:
-        """Toggle between robot and simulator modes and update URDF appearance."""
+        """Toggle between robot and simulator modes and update URDF appearance.
+
+        Persists the resulting mode to ``app.storage.general["startup_mode"]``
+        so the next restart honours the user's last explicit choice
+        (``"sim"`` or ``"hardware"``). Without this the only signal
+        ``_set_initial_mode`` had on startup was whether a ``com_port``
+        was configured — which forces hardware mode even when the user
+        last ran in sim, causing the surprising "I was in sim, why am
+        I in hardware now?" behaviour on every restart.
+        """
         try:
             # Stop any running user script before mode switch (safety)
             editor_panel = ui_state.editor_panel
@@ -1618,6 +1627,11 @@ class ControlPanel:
                     await self.client.resume()
                 except Exception as e:
                     logger.warning("Resume after simulator on failed: %s", e)
+                # Persist the user's choice so the next startup re-applies it.
+                try:
+                    app.storage.general["startup_mode"] = "sim"
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("startup_mode persistence failed: %s", e)
             else:
                 await self.client.simulator(False)
                 robot_state.simulator_active = False
@@ -1629,6 +1643,10 @@ class ControlPanel:
                     await self.client.resume()
                 except Exception as e:
                     logger.warning("Resume after simulator off failed: %s", e)
+                try:
+                    app.storage.general["startup_mode"] = "hardware"
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("startup_mode persistence failed: %s", e)
 
         except Exception as ex:
             ui.notify(f"Simulator toggle failed: {ex}", color="negative")
