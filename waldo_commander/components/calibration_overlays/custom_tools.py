@@ -1252,23 +1252,35 @@ def _coerce_per_tool_value(setting_key: str, raw: Any) -> Any:
     return raw
 
 
-def prime_per_tool_overrides_cache() -> None:
-    """Refresh ``_per_tool_runtime_cache`` from ``app.storage.user``.
-    Must be called from a request context. Idempotent.
+def _per_tool_storage_dict():
+    """Return ``app.storage.general`` (NOT ``.user``) — works from any
+    context, including worker threads. Returns None if NiceGUI isn't
+    available or storage isn't ready.
+
+    Per-tool overrides used to live in ``app.storage.user``, but that
+    requires a UI request context which worker threads (localise /
+    calibration / hover) don't have. Writes from those threads failed
+    silently with "app.storage.user can only be used within a UI
+    context", losing every calibrated-mount auto-save. ``.general`` is
+    installation-global, which is the correct scope for per-tool
+    calibration data anyway (the calibrated mount of a physical
+    gripper isn't tied to a browser session).
     """
     try:
         from nicegui import app  # noqa: PLC0415
-    except Exception as e:  # noqa: BLE001
-        logger.debug("prime_per_tool_overrides_cache: nicegui unavailable (%s)", e)
-        return
-    try:
-        store = app.storage.user
-    except Exception as e:  # noqa: BLE001
-        # Outside a request context — cache stays at its current value.
-        logger.debug(
-            "prime_per_tool_overrides_cache: storage not in request "
-            "context (%s); cache unchanged", e,
-        )
+
+        return app.storage.general
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def prime_per_tool_overrides_cache() -> None:
+    """Refresh ``_per_tool_runtime_cache`` from ``app.storage.general``.
+    Idempotent. Safe to call from any context.
+    """
+    store = _per_tool_storage_dict()
+    if store is None:
+        logger.debug("prime_per_tool_overrides_cache: storage unavailable")
         return
     new_cache: dict[str, dict[str, Any]] = {}
     prefix = "calib_tool_"
@@ -1298,17 +1310,18 @@ def prime_per_tool_overrides_cache() -> None:
 
 def get_per_tool_override(tool_key: str, setting_key: str) -> Any:
     """Per-tool override for ``setting_key`` on ``tool_key`` (None unset).
-    Reads the cache first, falls back to persistent storage when primed.
+    Reads the cache first, falls back to persistent storage.
     """
     if not tool_key or setting_key not in _PER_TOOL_OVERRIDABLE_KEYS:
         return None
     cached = _per_tool_runtime_cache.get(tool_key, {}).get(setting_key)
     if cached is not None:
         return cached
+    store = _per_tool_storage_dict()
+    if store is None:
+        return None
     try:
-        from nicegui import app  # noqa: PLC0415
-
-        raw = app.storage.user.get(_per_tool_storage_key(tool_key, setting_key))
+        raw = store.get(_per_tool_storage_key(tool_key, setting_key))
     except Exception:  # noqa: BLE001
         return None
     return _coerce_per_tool_value(setting_key, raw)
@@ -1318,12 +1331,12 @@ def set_per_tool_override(
     tool_key: str, setting_key: str, value: Any,
 ) -> bool:
     """Persist a per-tool override + mirror into the runtime cache. Pass
-    ``value=None`` to clear.
+    ``value=None`` to clear. Returns True on storage write success.
     """
     if not tool_key or setting_key not in _PER_TOOL_OVERRIDABLE_KEYS:
         return False
-    # Update the cache first so worker reads see the new value even if
-    # the storage write fails (outside a request context).
+    # Update the cache first so subsequent reads see the new value even
+    # if the persistent write fails.
     if value is None:
         bucket = _per_tool_runtime_cache.get(tool_key)
         if bucket is not None:
@@ -1334,19 +1347,18 @@ def set_per_tool_override(
         normalised = _coerce_per_tool_value(setting_key, value)
         _per_tool_runtime_cache.setdefault(tool_key, {})[setting_key] = normalised
 
-    try:
-        from nicegui import app  # noqa: PLC0415
-    except Exception:  # noqa: BLE001
+    store = _per_tool_storage_dict()
+    if store is None:
         return False
     skey = _per_tool_storage_key(tool_key, setting_key)
     try:
         if value is None:
-            app.storage.user.pop(skey, None)
+            store.pop(skey, None)
         else:
             if isinstance(value, tuple):
-                app.storage.user[skey] = list(value)
+                store[skey] = list(value)
             else:
-                app.storage.user[skey] = value
+                store[skey] = value
         return True
     except Exception as e:  # noqa: BLE001
         logger.warning(

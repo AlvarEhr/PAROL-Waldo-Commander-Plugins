@@ -602,8 +602,9 @@ def _per_tool_tuple_input(
 
 def build_per_tool_camera_section() -> None:
     """Per-tool camera intrinsics + cold-start mount override for the
-    active tool. Writes to ``app.storage.user[calib_tool_<key>_*]`` so
-    each camera-bearing tool carries its own values.
+    active tool. Writes to ``app.storage.general[calib_tool_<key>_*]`` so
+    each camera-bearing tool carries its own values (installation-global
+    scope — see ``custom_tools._per_tool_storage_dict`` for rationale).
     """
     from . import custom_tools  # noqa: PLC0415
 
