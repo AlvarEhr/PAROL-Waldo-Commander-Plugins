@@ -313,7 +313,13 @@ class UrdfScene(
                 ui.scene(
                     grid=False,  # Disable rectangular grid
                     polar_grid=(default_radius, 12, 6),  # (radius, sectors, rings)
+                    raycaster_threshold=0.005,
                     background_color=background_color,
+                    # Match the original feature-branch hoverable() visuals: a white,
+                    # ~0.2 opacity halo at 2x the source geometry's footprint.
+                    hover_color="#ffffff",
+                    hover_opacity=0.2,
+                    hover_scale=1.5,
                     on_click=self._handle_scene_click,
                     click_events=[
                         "mousedown",
@@ -322,7 +328,6 @@ class UrdfScene(
                         "contextmenu",
                     ],
                 )
-                .props("raycaster-threshold=0.005")
                 .classes("w-full h-[66vh]")
                 .on_transform_end(self._handle_transform_event) as self.scene
             ):
@@ -363,15 +368,12 @@ class UrdfScene(
             try:
                 if self.scene:
                     self.scene.set_axes_inset(
-                        {
-                            "enabled": True,
-                            "anchor": "bottom-left",
-                            "marginX": 48,
-                            "marginY": -12,
-                            "size": 120,
-                        }
+                        enabled=True,
+                        anchor="bottom-left",
+                        margin_x=48,
+                        margin_y=-12,
                     )
-                    self.scene.set_axes_labels({"enabled": True})
+                    self.scene.set_axes_labels(enabled=True)
             except Exception as e:
                 logger.debug("set_axes_inset configuration failed: %s", e)
 
@@ -419,6 +421,21 @@ class UrdfScene(
                 if not self._joint_controls_suspended:
                     self._disable_joint_transform_controls()
                     self._joint_controls_suspended = True
+            else:
+                # Jogging mode: capture starting rotation (used by translate-only
+                # cartesian streaming to keep rotation fixed) and notify the
+                # consumer that a drag session has started. Doing this here —
+                # rather than on the first on_transform event — is required
+                # because on_transform_start already set _tcp_ball_dragging,
+                # so the legacy "first event" detection inside
+                # _handle_tcp_transform_for_jog never triggers.
+                self._tcp_drag_start_rot_deg = tuple(robot_state.orientation.deg)
+                cb = self._tcp_cartesian_move_start_callback
+                if cb is not None:
+                    try:
+                        cb()
+                    except Exception as err:
+                        logger.error("TCP cartesian move start callback error: %s", err)
         elif object_name == "tcp:jog_ball":
             self._tcp_ball_dragging = True
 
@@ -1029,7 +1046,7 @@ class UrdfScene(
                         grp = (
                             ui.scene.group()
                             .with_name(f"targetgroup:{target.id}")
-                            .hoverable()
+                            .hover_effect("glow")
                         )
                         with grp:
                             mk = _create_waypoint_marker(
@@ -1052,7 +1069,7 @@ class UrdfScene(
                     # Delete old group and recreate
                     if self.scene:
                         try:
-                            self.scene.disable_transform_controls(td["group"].id)
+                            td["group"].disable_transform_controls()
                         except (RuntimeError, KeyError):
                             pass
                     self._safe_delete(td["group"])
@@ -1061,7 +1078,7 @@ class UrdfScene(
                             grp = (
                                 ui.scene.group()
                                 .with_name(f"targetgroup:{target.id}")
-                                .hoverable()
+                                .hover_effect("glow")
                             )
                             with grp:
                                 mk = _create_waypoint_marker(
@@ -1082,7 +1099,7 @@ class UrdfScene(
                 td = self._target_objects.pop(tid)
                 if self.scene:
                     try:
-                        self.scene.disable_transform_controls(td["group"].id)
+                        td["group"].disable_transform_controls()
                     except RuntimeError:
                         pass
                 self._safe_delete(td["group"])
@@ -1253,7 +1270,7 @@ class UrdfScene(
         for td in self._target_objects.values():
             if self.scene:
                 try:
-                    self.scene.disable_transform_controls(td["group"].id)
+                    td["group"].disable_transform_controls()
                 except (RuntimeError, KeyError):
                     pass
             self._safe_delete(td["group"])
