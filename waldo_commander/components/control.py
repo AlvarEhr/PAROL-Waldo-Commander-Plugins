@@ -1423,7 +1423,13 @@ class ControlPanel:
                     await self.client.move_j(target, speed=spd)
                 except Exception as e:  # noqa: BLE001
                     logger.error("Send-anyway joint-limit failed: %s", e)
-                    ui.notify(f"Failed joint move: {e}", color="negative")
+                    try:
+                        ui.notify(f"Failed joint move: {e}", color="negative")
+                    except RuntimeError as notify_err:
+                        logger.debug(
+                            "Send-anyway notify suppressed (no slot context): %s",
+                            notify_err,
+                        )
 
             def _send_anyway() -> None:
                 asyncio.create_task(_do_move())
@@ -1438,7 +1444,16 @@ class ControlPanel:
             await self.client.move_j(target, speed=spd)
         except Exception as e:
             logger.error("Go to joint limit failed: %s", e)
-            ui.notify(f"Failed joint move: {e}", color="negative")
+            # ``ui.notify`` requires a slot context that's gone by the time
+            # ``move_j`` raises — NiceGUI's task chain doesn't restore it
+            # post-await on every call. Fall back to log-only if so.
+            try:
+                ui.notify(f"Failed joint move: {e}", color="negative")
+            except RuntimeError as notify_err:
+                logger.debug(
+                    "Go to joint limit notify suppressed (no slot context): %s",
+                    notify_err,
+                )
 
     # ---- Gizmo control methods ----
 

@@ -30,27 +30,113 @@ from .state import (
     _hemi_centre_world,
     _state,
     _state_lock,
+    clear_recovered_board_pose,
     current_board_config,
+    rebuild_T_board2base,
     save_recovered_board_pose,
 )
 
 
-def _build_localise_seed_targets_xy(
-    spread_m: float = 0.12,
-) -> list[tuple[float, float]]:
-    """Five XY seed targets for the J0 sweep — centre + four diagonal
-    corners — anchored on the currently-believed board centre. Diagonal
-    spread maximises coverage from N seeds.
+# PAROL6 J0 (joint 1) limits from URDF: ±2.1475731 rad (±123.05°). Other
+# joints have asymmetric limits but only J0 is varied during the sweep.
+# Hardcoded as a fallback if the runtime import fails (kept in sync via
+# the upstream PAROL6.urdf — re-verify if upstream URDF changes).
+_PAROL6_J0_LIMIT_RAD: tuple[float, float] = (-2.1475731, 2.1475731)
+try:
+    from parol6.PAROL6_ROBOT import _joint_limits_radian as _RUNTIME_J_LIMITS
+    _PAROL6_J0_LIMIT_RAD = (
+        float(_RUNTIME_J_LIMITS[0, 0]),
+        float(_RUNTIME_J_LIMITS[0, 1]),
+    )
+except Exception:  # noqa: BLE001
+    pass
+
+# parol6's wire validation rejects ``q == limit`` (not just ``q > limit``).
+# Clipping to exactly ±123.05° trips ``ValueError: Joint 1 target out of
+# range`` at move_j time. Stay 1° inside both ends.
+_PAROL6_J0_SWEEP_SAFETY_RAD: float = float(np.radians(1.0))
+
+# Minimum arc (after J0-limit clipping) we still consider "useful" for a
+# sweep. Anything below half the D435 horizontal FOV (~27°) produces
+# essentially the same coverage as a single static capture.
+_LOCALISE_MIN_USEFUL_SWEEP_DEG: float = 30.0
+
+# Mean per-corner reprojection error gate for samples fed to
+# ``solve_localise_joint``. Detections above this threshold are mirror-
+# prone (solvePnP returns spurious-but-numerically-consistent poses at
+# low corner counts). Falls back to using all samples if too few pass.
+_LOCALISE_MAX_REPROJ_PX_FOR_JOINT_SOLVE: float = 1.5
+_LOCALISE_MIN_FILTERED_SAMPLES_FOR_JOINT_SOLVE: int = 4
+
+
+def _filter_pose_pairs_by_reproj(
+    pose_pairs: list[tuple[NDArray[np.float64], NDArray[np.float64]]],
+    qualities: list[tuple[int, float]],
+    max_reproj_px: float = _LOCALISE_MAX_REPROJ_PX_FOR_JOINT_SOLVE,
+    min_filtered: int = _LOCALISE_MIN_FILTERED_SAMPLES_FOR_JOINT_SOLVE,
+) -> list[tuple[NDArray[np.float64], NDArray[np.float64]]]:
+    """Filter pose pairs by per-detection reprojection error.
+
+    High reproj-px correlates with solvePnP mirror flips at low corner
+    counts — gating them before the joint solve prevents one bad sample
+    from poisoning the cv2 minimisation. Falls back to the full input
+    if too few samples pass the gate; RANSAC inside
+    ``solve_localise_joint`` then handles whatever outliers remain.
     """
-    centre = np.asarray(_hemi_centre_world(), dtype=np.float64)
-    cx, cy = float(centre[0]), float(centre[1])
-    d = float(spread_m) * float(np.cos(np.radians(45)))
+    filtered = [
+        pp for pp, (_, rpe) in zip(pose_pairs, qualities)
+        if rpe <= max_reproj_px
+    ]
+    n_filt = len(filtered)
+    n_all = len(pose_pairs)
+    if n_filt < min_filtered:
+        logger.info(
+            "Joint solve: only %d/%d samples passed reproj<%.1fpx — "
+            "using all (RANSAC handles outliers)",
+            n_filt, n_all, max_reproj_px,
+        )
+        return pose_pairs
+    if n_filt < n_all:
+        logger.info(
+            "Joint solve: filtered %d/%d samples by reproj<%.1fpx",
+            n_filt, n_all, max_reproj_px,
+        )
+    return filtered
+
+
+def _build_localise_seed_targets_xy() -> list[tuple[float, float]]:
+    """Workspace-agnostic XY seed targets covering PAROL6's forward reach.
+
+    Each call returns the SAME five anchor points regardless of any prior
+    board pose. The previous (configured-pose-anchored) seed pattern
+    silently failed whenever the user placed the board outside the
+    ±12 cm bubble around the configured location — defeating the whole
+    point of "localise."
+
+    Five polar seeds expressed as XY:
+      - r=0.22 m, az=0°    : near-centre
+      - r=0.28 m, az=0°    : mid-centre
+      - r=0.34 m, az=0°    : far-centre
+      - r=0.28 m, az=+50°  : far +Y side
+      - r=0.28 m, az=-50°  : far -Y side
+
+    Combined with J0-sweep clipping in the sweep loop, each seed
+    contributes a useful arc of workspace coverage even when the centred
+    sweep would push past PAROL6's ±123° J0 limit.
+    """
+    radii_az_deg: list[tuple[float, float]] = [
+        (0.22,   0.0),
+        (0.28,   0.0),
+        (0.34,   0.0),
+        (0.28,  50.0),
+        (0.28, -50.0),
+    ]
     return [
-        (cx, cy),
-        (cx + d, cy + d),
-        (cx + d, cy - d),
-        (cx - d, cy + d),
-        (cx - d, cy - d),
+        (
+            float(r * np.cos(np.radians(az))),
+            float(r * np.sin(np.radians(az))),
+        )
+        for r, az in radii_az_deg
     ]
 
 
@@ -103,6 +189,23 @@ def _localise_board_thread() -> None:
     # Lazy import — break the panel<->localise cycle.
     from .panel import _post_status  # noqa: PLC0415
 
+    # "Every press is fresh" — drop any prior recovered pose so the scan
+    # treats the board as if its position is unknown. Reverts
+    # ``_T_BOARD2BASE`` to the configured pose so the sim VirtualBoard's
+    # ground truth lines up with the workspace defaults and the median-
+    # consensus fallback isn't biased by a stale recovery.
+    try:
+        clear_recovered_board_pose()
+        rebuild_T_board2base()
+        refresh_board_dependent_overlays()
+        logger.info(
+            "Localise: cleared prior recovered pose; board ground truth "
+            "reverted to configured location for this scan.",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Localise: clear-prior-pose skipped (%s: %s)",
+                     type(e).__name__, e)
+
     def _check_collision_or_warn(
         target_q_deg: list[float],
         context: str,
@@ -138,13 +241,22 @@ def _localise_board_thread() -> None:
             )
             _post_status(msg)
             loop = _state.get("main_loop")
+            nicegui_client = _state.get("nicegui_client")
             if loop is not None:
+                def _scheduled_notify(m: str = msg) -> None:
+                    # ``ui.notify`` needs a slot context; ``call_soon_threadsafe``
+                    # callbacks run with an empty slot stack. Enter the captured
+                    # client first (same pattern as ``show_collision_dialog_threadsafe``).
+                    try:
+                        if nicegui_client is not None:
+                            with nicegui_client:
+                                _ui.notify(m, color="warning", position="top")
+                        else:
+                            _ui.notify(m, color="warning", position="top")
+                    except Exception as e:  # noqa: BLE001
+                        logger.debug("localise toast fired without slot: %s", e)
                 try:
-                    loop.call_soon_threadsafe(
-                        lambda m=msg: _ui.notify(
-                            m, color="warning", position="top",
-                        ),
-                    )
+                    loop.call_soon_threadsafe(_scheduled_notify)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("localise toast schedule failed: %s", e)
             return False
@@ -210,11 +322,13 @@ def _localise_board_thread() -> None:
             return float(-(forward / fn)[2])
 
         # Seed entries (seed_target_xy, seed_q_rad) for the J0 sweep
-        # branches. Seeds are centred on the believed board location so
-        # each run aims at the most-likely board placement.
+        # branches. Seeds cover PAROL6's forward workspace independent
+        # of any prior board pose — localise should find the board
+        # wherever it's placed, with no assumption about the configured
+        # or last-recovered location.
         seed_targets_xy = _build_localise_seed_targets_xy()
         logger.info(
-            "localise seed targets (centred on believed board centre): %s",
+            "localise seed targets (workspace-agnostic): %s",
             [(round(x, 3), round(y, 3)) for x, y in seed_targets_xy],
         )
         seed_q_list: list[tuple[tuple[float, float], NDArray[np.float64]]] = []
@@ -269,12 +383,11 @@ def _localise_board_thread() -> None:
                 )
             if not seed_q_list:
                 _post_status(
-                    "Localise: no reachable seed pose at any of "
-                    f"{len(seed_targets_xy)} candidate targets "
-                    f"around believed centre. Try widening "
-                    "_LOCALISE_SEED_DISTANCE_RANGE_M / "
-                    "_LOCALISE_SEED_ELEVATION_RANGE_DEG, or update the "
-                    "configured board location."
+                    "Localise: no reachable IK pose at any of "
+                    f"{len(seed_targets_xy)} workspace seed targets. "
+                    "Try widening _LOCALISE_SEED_DISTANCE_RANGE_M / "
+                    "_LOCALISE_SEED_ELEVATION_RANGE_DEG, or check "
+                    "for active-tool / camera-mount mis-config."
                 )
                 return
             _localise_skip_multitarget = True
@@ -365,6 +478,10 @@ def _localise_board_thread() -> None:
             is_sim_mode = True
 
         raw_client = RobotClient(host="127.0.0.1", port=5001)
+        # When helper-mode is on, wrap the client to warn + pause before
+        # each significant J0 rotation. Passthrough when disabled.
+        from .helper_mode import maybe_wrap_helper_mode  # noqa: PLC0415
+        raw_client = maybe_wrap_helper_mode(raw_client)
         _state["client"] = raw_client
 
         # HALT latches the controller into DISABLED until a RESUME, so a
@@ -437,6 +554,15 @@ def _localise_board_thread() -> None:
             # Stash before start() — see ``_calibration_thread``.
             _state["real_camera"] = camera
             camera.start()
+            # AE warm-up — D435 auto-exposure takes ~30 frames to converge.
+            # Without this the first sweep's early frames span the AE-tuning
+            # window, dropping marker detection on over/under-exposed frames.
+            for _ in range(30):
+                try:
+                    camera.capture_color()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("AE warm-up capture failed: %s", e)
+                    break
             intrinsics = camera.intrinsics
             logger.info(
                 "localise camera: RealSenseCamera (real-hardware mode), "
@@ -455,6 +581,12 @@ def _localise_board_thread() -> None:
             dtype=np.float64,
         )
 
+        # CV2-to-OURS board-frame correction (R_x(180°) + (0, H_m, 0)) is
+        # baked into ``board.board_pose_to_matrix(detection, cfg)``, so
+        # every consumer of solvePnP-recovered ``T_board2cam`` — including
+        # the joint AX=YB solver below — sees OURS-frame poses directly.
+        # No per-callsite multiplication needed.
+
         K = intrinsics.as_camera_matrix()
         D = intrinsics.dist_coeffs
 
@@ -468,6 +600,11 @@ def _localise_board_thread() -> None:
         # camera mount simultaneously when rotation diversity is enough.
         # Median consensus is the fallback when the joint solve declines.
         pose_pair_samples: list[tuple[NDArray[np.float64], NDArray[np.float64]]] = []
+        # Parallel to ``pose_pair_samples``: (corner_count, mean_reproj_px)
+        # per detection. Used to gate joint-solve inputs to high-quality
+        # samples before RANSAC. Low corner counts + high reproj are
+        # mirror-flip-prone in solvePnP.
+        pose_pair_qualities: list[tuple[int, float]] = []
 
         # Per-sweep frame-outcome diagnostics — distinguishes blank frames,
         # no-markers, sparse ChArUco, and full detections so the summary
@@ -517,6 +654,21 @@ def _localise_board_thread() -> None:
                     "localise %s: capture_color failed (%s: %s); skipping",
                     label, type(e).__name__, e,
                 )
+                return False
+            # Pair the flange pose with the frame BEFORE detection / diagnostic
+            # probes. ChArUco + solvePnP take 5-30 ms during which J0 keeps
+            # rotating in continuous-sweep mode — querying flange afterwards
+            # would record a pose past the frame's capture moment, biasing
+            # every back-projection downstream.
+            try:
+                T_flange2base = flange_pose_provider()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "localise %s: flange-pose query failed (%s: %s)",
+                    label, type(e).__name__, e,
+                )
+                return False
+            if T_flange2base is None:
                 return False
 
             frame_std = float(frame.std())
@@ -574,17 +726,7 @@ def _localise_board_thread() -> None:
             detection = detector.detect(frame, K, D)
             if detection is None:
                 return False
-            try:
-                T_flange2base = flange_pose_provider()
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "localise %s: flange-pose query failed (%s: %s)",
-                    label, type(e).__name__, e,
-                )
-                return False
-            if T_flange2base is None:
-                return False
-            T_board2cam = board_pose_to_matrix(detection)
+            T_board2cam = board_pose_to_matrix(detection, cfg)
             T_board2base_obs = T_flange2base @ cold_start.T_cam2flange @ T_board2cam
             board_centre_obs = (T_board2base_obs @ center_local)[:3]
             detected_centres.append(board_centre_obs)
@@ -594,6 +736,10 @@ def _localise_board_thread() -> None:
             pose_pair_samples.append(
                 (T_flange2base.copy(), T_board2cam.copy())
             )
+            pose_pair_qualities.append((
+                int(detection.num_corners_detected),
+                float(detection.reprojection_error_px),
+            ))
             _diag["detected"] += 1
             return True
 
@@ -627,11 +773,32 @@ def _localise_board_thread() -> None:
                         )
                         break
 
-                # Start at whichever end of the J0 range is closer to the
-                # robot's current J0 — saves driving across the workspace.
+                # Sweep span centred on the seed's J0, clipped to PAROL6's
+                # J0 joint range. The pre-fix behaviour skipped the entire
+                # sweep when either endpoint exceeded ±123°; with a side-
+                # facing seed (e.g., az=+50°) the centred span would push
+                # past +123° on one end. Clipping keeps the reachable arc
+                # rather than discarding the whole sweep.
                 seed_j0_rad = float(seed_q_rad[0])
-                low_j0 = seed_j0_rad - np.radians(float(settings.localise_j0_sweep_half_deg))
-                high_j0 = seed_j0_rad + np.radians(float(settings.localise_j0_sweep_half_deg))
+                half = np.radians(float(settings.localise_j0_sweep_half_deg))
+                j0_lo_lim = float(_PAROL6_J0_LIMIT_RAD[0]) + _PAROL6_J0_SWEEP_SAFETY_RAD
+                j0_hi_lim = float(_PAROL6_J0_LIMIT_RAD[1]) - _PAROL6_J0_SWEEP_SAFETY_RAD
+                low_j0 = max(seed_j0_rad - half, j0_lo_lim)
+                high_j0 = min(seed_j0_rad + half, j0_hi_lim)
+                arc_rad = high_j0 - low_j0
+                if arc_rad < np.radians(_LOCALISE_MIN_USEFUL_SWEEP_DEG):
+                    logger.info(
+                        "localise sweep (%.2f, %.2f): clipped arc %.1f° < "
+                        "%.1f° minimum (seed J0 %.1f° vs J0 limit [%.1f°, "
+                        "%.1f°]), skipping",
+                        seed_xy[0], seed_xy[1],
+                        float(np.degrees(arc_rad)),
+                        _LOCALISE_MIN_USEFUL_SWEEP_DEG,
+                        float(np.degrees(seed_j0_rad)),
+                        float(np.degrees(j0_lo_lim)),
+                        float(np.degrees(j0_hi_lim)),
+                    )
+                    continue
                 try:
                     cur_angles = raw_client.angles()
                     cur_j0_rad = (
@@ -641,6 +808,8 @@ def _localise_board_thread() -> None:
                     )
                 except Exception:  # noqa: BLE001
                     cur_j0_rad = seed_j0_rad
+                # Start at the end closer to current J0 — saves driving
+                # across the workspace before any capture.
                 if abs(cur_j0_rad - low_j0) <= abs(cur_j0_rad - high_j0):
                     start_j0 = low_j0
                     end_j0 = high_j0
@@ -651,13 +820,15 @@ def _localise_board_thread() -> None:
                 start_q[0] = start_j0
                 end_q = seed_q_rad.copy()
                 end_q[0] = end_j0
+                # Non-J0 joints inherited from the seed IK — if they're
+                # already at a limit, the sweep is unsalvageable here.
                 if not (
                     scan_robot.check_limits(start_q)
                     and scan_robot.check_limits(end_q)
                 ):
                     logger.info(
-                        "localise sweep (%.2f, %.2f): start or end out of joint "
-                        "limits (J0 range %.1f° → %.1f°), skipping",
+                        "localise sweep (%.2f, %.2f): non-J0 limits hit even "
+                        "after J0 clip (J0 %.1f° → %.1f°), skipping",
                         seed_xy[0], seed_xy[1],
                         float(np.degrees(start_j0)),
                         float(np.degrees(end_j0)),
@@ -983,11 +1154,11 @@ def _localise_board_thread() -> None:
                 f"from {attempted} captures across "
                 f"{len(seed_q_list) if bool(settings.localise_use_j0_sweep) else len(candidates)} "
                 "scan path(s) (need "
-                f"≥{int(settings.localise_min_detections)}). Board may be outside "
-                f"the scanned region — update the configured board location "
-                "so the seed targets centre on the actual placement, or "
-                "widen _LOCALISE_SEED_DISTANCE_RANGE_M / "
-                "_LOCALISE_SEED_ELEVATION_RANGE_DEG."
+                f"≥{int(settings.localise_min_detections)}). The board "
+                "may be outside PAROL6's forward workspace, occluded, or "
+                "the lighting / contrast may be too low for ChArUco "
+                "detection. Move the board into the visible workspace "
+                "and retry."
             )
             return
 
@@ -1009,7 +1180,11 @@ def _localise_board_thread() -> None:
                         solve_localise_joint,
                     )
 
-                    stage1_joint_result = solve_localise_joint(pose_pair_samples)
+                    stage1_joint_result = solve_localise_joint(
+                        _filter_pose_pairs_by_reproj(
+                            pose_pair_samples, pose_pair_qualities,
+                        )
+                    )
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "Stage-1 intermediate joint solve raised %s: %s",
@@ -1205,13 +1380,50 @@ def _localise_board_thread() -> None:
             max_passes = 5
             passes_done = 0
 
-            added_primary = _run_refinement_pass(refine_target, "primary")
-            passes_done += 1
+            # Workspace sanity gate on the primary aim. Stage 1's median is
+            # biased by cold_start ≠ true mount; if the bias pushes it
+            # outside PAROL6's reachable forward workspace, the primary
+            # refinement pass will see nothing and waste ~30 s. Skip
+            # straight to the (now sorted) seed retries.
+            refine_xy = np.asarray(refine_target[:2], dtype=np.float64)
+            refine_r = float(np.linalg.norm(refine_xy))
+            primary_in_workspace = (
+                0.10 <= refine_r <= 0.42
+                and refine_xy[0] >= -0.10  # not behind the base
+            )
+            if primary_in_workspace:
+                added_primary = _run_refinement_pass(refine_target, "primary")
+                passes_done += 1
+            else:
+                logger.info(
+                    "localise stage 2: primary aim %s outside reachable "
+                    "workspace (r=%.2fm), skipping straight to seed retries",
+                    np.round(refine_target[:2], 3).tolist(),
+                    refine_r,
+                )
+                added_primary = 0
 
             if added_primary == 0 and not _state.get("stop_requested"):
                 z_for_alts = float(refine_target[2])
-                # Reuse the Stage 1 seed XY pattern as alternative aims.
-                for seed_xy in seed_targets_xy:
+                # Sort seeds by distance from the Stage 1 median (which may
+                # be biased by cold_start ≠ true mount, but still preserves
+                # rough directional info about where the board lies). On
+                # real hardware this typically cuts a 4-retry waste down
+                # to 0-1 retries — the closest seed usually wins.
+                # refine_xy already computed above for the workspace gate.
+                sorted_seeds = sorted(
+                    seed_targets_xy,
+                    key=lambda s, c=refine_xy: float(
+                        np.linalg.norm(np.asarray(s, dtype=np.float64) - c)
+                    ),
+                )
+                logger.info(
+                    "localise stage 2 retry order (by distance from "
+                    "biased median %s): %s",
+                    np.round(refine_xy, 3).tolist(),
+                    [(round(sx, 3), round(sy, 3)) for sx, sy in sorted_seeds],
+                )
+                for seed_xy in sorted_seeds:
                     if (
                         _state.get("stop_requested")
                         or passes_done >= max_passes
@@ -1245,7 +1457,11 @@ def _localise_board_thread() -> None:
                         solve_localise_joint,
                     )
 
-                    intermediate = solve_localise_joint(pose_pair_samples)
+                    intermediate = solve_localise_joint(
+                        _filter_pose_pairs_by_reproj(
+                            pose_pair_samples, pose_pair_qualities,
+                        )
+                    )
                 except Exception as e:  # noqa: BLE001
                     logger.warning(
                         "Stage-2 confidence intermediate joint solve raised "
@@ -1305,7 +1521,11 @@ def _localise_board_thread() -> None:
                     solve_localise_joint,
                 )
 
-                joint_result = solve_localise_joint(pose_pair_samples)
+                joint_result = solve_localise_joint(
+                    _filter_pose_pairs_by_reproj(
+                        pose_pair_samples, pose_pair_qualities,
+                    )
+                )
             except Exception as e:  # noqa: BLE001
                 logger.warning("Joint solve raised %s: %s", type(e).__name__, e)
                 joint_result = None
@@ -1491,6 +1711,17 @@ def _localise_board_thread() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning("RealSenseCamera stop failed: %s", e)
             _state["real_camera"] = None
+        # Re-enable the controller before closing. STOP fires ``halt()``,
+        # which sets ``state.enabled=False`` server-side (SIM_GOTCHAS §13);
+        # without an explicit resume, subsequent jogs fail with "Controller
+        # disabled" until the next localise/calibration run's start-of-run
+        # resume. Mirrors the start-of-run resume so each session leaves the
+        # controller in ready state.
+        if raw_client is not None:
+            try:
+                raw_client.resume()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Localise finally: resume() raised: %s", e)
         # Close the controller socket + inner loop. None when init
         # failed before construction.
         if raw_client is not None:

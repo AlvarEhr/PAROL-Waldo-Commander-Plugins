@@ -215,6 +215,16 @@ def save_recovered_board_pose(T_board2base: NDArray[np.float64]) -> None:
     arr = np.asarray(T_board2base, dtype=np.float64).reshape(4, 4).copy()
     _state["recovered_board_pose"] = arr
 
+    # Tag the in-memory copy with the mode it belongs to. The cached-read
+    # path in ``restore_recovered_board_pose`` revalidates on each call;
+    # without the tag a startup-time mode-mismatched restore would stick
+    # forever (the in-memory hit bypasses the storage-side mode check).
+    try:
+        from waldo_commander.state import robot_state as _rs_for_tag  # noqa: PLC0415
+        _state["recovered_board_pose_mode"] = bool(_rs_for_tag.simulator_active)
+    except Exception:  # noqa: BLE001
+        _state["recovered_board_pose_mode"] = None
+
     try:
         import time as _time  # noqa: PLC0415
 
@@ -242,18 +252,47 @@ def restore_recovered_board_pose() -> NDArray[np.float64] | None:
     ``app.storage.general`` fallback. Storage hits whose sim/real mode tag
     doesn't match the current mode are discarded. On a storage hit the
     in-memory slot is re-populated for the fast path.
+
+    The in-memory cache is also mode-tag-validated on every call: if the
+    cached pose's tag disagrees with the current mode the cache is
+    cleared and storage is re-read. This handles the startup race where
+    ``robot_state.simulator_active`` defaults to False before the first
+    STATUS frame arrives — without this revalidation, a real-mode entry
+    restored at startup persists when the user later toggles to sim.
     """
     import logging  # noqa: PLC0415
 
     _log = logging.getLogger(__name__)
 
+    try:
+        from waldo_commander.state import robot_state as _rs  # noqa: PLC0415
+        current_sim: bool | None = bool(_rs.simulator_active)
+    except Exception:  # noqa: BLE001
+        current_sim = None
+
     in_memory = _state.get("recovered_board_pose")
+    cached_mode = _state.get("recovered_board_pose_mode")
     if in_memory is not None:
-        return np.asarray(in_memory, dtype=np.float64).reshape(4, 4)
+        cached_mode_matches = (
+            cached_mode is None
+            or current_sim is None
+            or bool(cached_mode) == current_sim
+        )
+        if cached_mode_matches:
+            return np.asarray(in_memory, dtype=np.float64).reshape(4, 4)
+        # Cache mode disagrees with current — drop and fall through to
+        # the storage path which re-checks via ``saved_sim_mode``.
+        _log.info(
+            "Cached recovered board pose discarded: was %s mode, "
+            "current is %s — re-reading from storage.",
+            "sim" if cached_mode else "real",
+            "sim" if current_sim else "real",
+        )
+        _state["recovered_board_pose"] = None
+        _state["recovered_board_pose_mode"] = None
 
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
-        from waldo_commander.state import robot_state as _rs  # noqa: PLC0415
 
         stored = _ng_app.storage.general.get("recovered_board_pose")
     except Exception as e:  # noqa: BLE001
@@ -274,11 +313,11 @@ def restore_recovered_board_pose() -> NDArray[np.float64] | None:
         return None
 
     saved_sim = stored.get("saved_sim_mode")
-    try:
-        current_sim = bool(_rs.simulator_active)
-    except Exception:  # noqa: BLE001
-        current_sim = True
-    if saved_sim is not None and bool(saved_sim) != current_sim:
+    if (
+        saved_sim is not None
+        and current_sim is not None
+        and bool(saved_sim) != current_sim
+    ):
         _log.info(
             "Board overlay: stored recovered pose was saved in %s mode but "
             "current mode is %s — keeping configured pose. Run Localise to "
@@ -290,6 +329,9 @@ def restore_recovered_board_pose() -> NDArray[np.float64] | None:
 
     arr = np.asarray(pose_list, dtype=np.float64).reshape(4, 4)
     _state["recovered_board_pose"] = arr.copy()
+    _state["recovered_board_pose_mode"] = (
+        bool(saved_sim) if saved_sim is not None else None
+    )
 
     saved_at = stored.get("saved_at_ts", 0.0)
     age_str = ""
@@ -324,6 +366,7 @@ def clear_recovered_board_pose() -> None:
 
     _log = logging.getLogger(__name__)
     _state["recovered_board_pose"] = None
+    _state["recovered_board_pose_mode"] = None
     try:
         from nicegui import app as _ng_app  # noqa: PLC0415
 

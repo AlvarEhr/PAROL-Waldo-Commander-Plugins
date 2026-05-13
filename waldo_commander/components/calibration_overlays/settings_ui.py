@@ -861,6 +861,26 @@ def build_gripper_section() -> None:
     ).classes("text-xs opacity-70")
 
 
+def build_helper_mode_section() -> None:
+    """J0 helper-mode toggle + pre-move pause (sticky-base assistance)."""
+    ui.label(
+        "When enabled, EVERY motion command that rotates J0 (any "
+        "non-trivial delta) is preceded by a log warning (direction + "
+        "magnitude) and an optional pause, giving you time to physically "
+        "assist a sticky base joint. Small/slow J0 moves are often the "
+        "most prone to stiction, so all moves are flagged — not just "
+        "large ones. Applies to localise + calibration moves only.",
+    ).classes("text-xs opacity-70")
+    with ui.row().classes("items-center gap-3 q-mt-sm"):
+        _switch_input("helper_mode_j0_enabled", "Enable J0 helper mode")
+        _number_input(
+            "helper_mode_j0_pause_s",
+            "Pre-move pause (s)",
+            fmt="%.1f", step=0.5, min_val=0.0, max_val=10.0,
+            width="w-32",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Top-level builder
 # ---------------------------------------------------------------------------
@@ -896,6 +916,11 @@ def build_calibration_settings_expansion() -> None:
             "w-full",
         ):
             build_gripper_section()
+        with ui.expansion(
+            "J0 helper mode (sticky-base assistance)",
+            icon="pan_tool",
+        ).classes("w-full"):
+            build_helper_mode_section()
 
 
 # ---------------------------------------------------------------------------

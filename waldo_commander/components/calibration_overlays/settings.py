@@ -99,6 +99,9 @@ DEFAULTS: dict[str, Any] = {
     "localise_min_detections": _c._LOCALISE_MIN_DETECTIONS,
     # ---- Gripper jaw variant --------------------------------------------
     "tool_jaw_variant": _c._SSG48_JAW_VARIANT,
+    # ---- J0 helper mode (sticky-base assistance) ------------------------
+    "helper_mode_j0_enabled": False,
+    "helper_mode_j0_pause_s": 2.0,
 }
 
 

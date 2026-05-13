@@ -98,6 +98,10 @@ def _drive_hover_pose_thread(
     # must not clobber a re-acquired flag.
     worker_holds_flag = True
 
+    # Tracked so ``finally`` can resume the controller before exit (STOP →
+    # halt leaves state.enabled=False, blocking subsequent jogs).
+    client: Any = None
+
     try:
         from parol6 import Robot, RobotClient  # noqa: PLC0415
         from parol6_vision.calibration.camera_mount import (  # noqa: PLC0415
@@ -245,6 +249,7 @@ def _drive_hover_pose_thread(
 
                     def _thread() -> None:
                         from .panel import _post_status as _ps  # noqa: PLC0415
+                        c: Any = None
                         try:
                             from parol6 import RobotClient as _RC  # noqa: PLC0415
 
@@ -273,6 +278,16 @@ def _drive_hover_pose_thread(
                             except Exception:  # noqa: BLE001
                                 logger.exception("hover-override thread crashed")
                         finally:
+                            # Resume so subsequent jogs aren't blocked by a
+                            # halt-disabled controller (SIM_GOTCHAS §13).
+                            if c is not None:
+                                try:
+                                    c.resume()
+                                except Exception as e:  # noqa: BLE001
+                                    logger.debug(
+                                        "hover-override finally: resume() raised: %s",
+                                        e,
+                                    )
                             _state["is_hovering"] = False
                             _state["stop_requested"] = False
 
@@ -313,6 +328,17 @@ def _drive_hover_pose_thread(
             logger.exception("hover thread crashed")
             _post_status(f"Hover ERROR: {e}")
     finally:
+        # Re-enable the controller before exit. STOP fires ``halt()``, which
+        # sets ``state.enabled=False`` server-side (SIM_GOTCHAS §13); without
+        # this resume, subsequent jogs fail with "Controller disabled" until
+        # the next worker's start-of-run resume. Only this worker's client
+        # is resumed; the "Send anyway" inner thread has its own (and its
+        # own start-of-run resume).
+        if client is not None and worker_holds_flag:
+            try:
+                client.resume()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("hover finally: resume() raised: %s", e)
         # Only clear is_hovering if this worker still owns it; a re-acquired
         # flag (via "Send anyway") belongs to a different worker.
         if worker_holds_flag:

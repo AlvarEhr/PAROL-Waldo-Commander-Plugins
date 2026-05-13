@@ -146,8 +146,14 @@ def _calibration_thread() -> None:
                     return _gated
                 return attr
 
-        client = _HaltableClient(raw_client)
-        # Stash the raw client so STOP can call halt() directly.
+        # When helper-mode is on, wrap so each significant J0 motion gets a
+        # direction warning + pre-move pause. Passthrough when disabled.
+        from .helper_mode import maybe_wrap_helper_mode  # noqa: PLC0415
+        helper_client = maybe_wrap_helper_mode(raw_client)
+
+        client = _HaltableClient(helper_client)
+        # Stash the raw client so STOP can call halt() directly (bypasses
+        # both helper-mode and haltable wrappers; halt() must not pause).
         _state["client"] = raw_client
 
         # HALT latches the controller into DISABLED until a RESUME, so a
@@ -205,6 +211,16 @@ def _calibration_thread() -> None:
             # device, ``finally`` needs the handle to clean up.
             _state["real_camera"] = camera
             camera.start()
+            # AE warm-up — D435 auto-exposure takes ~30 frames after start
+            # to converge. Without this, the first bootstrap pose's 8-frame
+            # average spans the AE-tuning window, mixing over/under-exposed
+            # frames into the mean. 1-second dead cost; only on hardware.
+            for _ in range(30):
+                try:
+                    camera.capture_color()
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("AE warm-up capture failed: %s", e)
+                    break
             intrinsics = camera.intrinsics
             logger.info(
                 "calibration camera: RealSenseCamera (real-hardware mode), "
@@ -908,6 +924,15 @@ def _calibration_thread() -> None:
             except Exception as e:  # noqa: BLE001
                 logger.warning("RealSenseCamera stop failed: %s", e)
             _state["real_camera"] = None
+        # Re-enable the controller before closing. STOP fires ``halt()``,
+        # which sets ``state.enabled=False`` server-side (SIM_GOTCHAS §13);
+        # without this resume, jog buttons + scripts fail with "Controller
+        # disabled" until the next worker's start-of-run resume.
+        if raw_client is not None:
+            try:
+                raw_client.resume()
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Calibration finally: resume() raised: %s", e)
         # Close the controller socket + inner loop so they don't leak
         # across runs. None when init failed before construction.
         if raw_client is not None:
