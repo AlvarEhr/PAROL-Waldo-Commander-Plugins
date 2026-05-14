@@ -2,9 +2,13 @@ name: tests
 
 on:
   push:
+    branches-ignore:
+      - proto-plugin-framework
     paths:
       - '**'
   pull_request:
+    branches-ignore:
+      - proto-plugin-framework
     paths:
       - '**'
 
