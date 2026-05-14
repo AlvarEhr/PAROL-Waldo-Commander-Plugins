@@ -26,7 +26,101 @@ Eight tools, prefixed `parol6_` so they coexist with other MCP servers:
 
 Future scope (not in v0): vision tools mapped onto Gemini Robotics-ER 1.6,
 program-file editing, async task store for long-running runs, calibration
-triggers. See `Docs/MCP_SERVER_DESIGN.md` §8.
+triggers. See `docs/MCP_SERVER_DESIGN.md` §8.
+
+## Testing locally
+
+You do not need to boot full Waldo-Commander to verify the plugin. The
+repo ships a standalone demo bootstrap that loads only `parol6_mcp`,
+serves uvicorn on `127.0.0.1:8080`, and prints paste-ready test
+commands.
+
+Install the runtime deps once:
+
+```
+pip install fastmcp uvicorn pydantic nicegui
+```
+
+Launch the demo:
+
+```
+python examples/run_mcp_demo.py
+```
+
+Expected stdout: a one-screen instructions block listing the 8 tools,
+curl / mcp-inspector / Claude Code / Claude Desktop test recipes, then
+uvicorn's startup log ending with `Uvicorn running on http://127.0.0.1:8080`.
+
+Minimum "is the server alive" check in a second terminal — the MCP
+initialize handshake:
+
+```
+curl -sN -X POST http://127.0.0.1:8080/mcp \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"curl","version":"0"}}}'
+```
+
+A 200 response with a `result.serverInfo.name = "parol6_mcp"` field
+proves transport + tool registration are alive. For `tools/list` and
+beyond, use the MCP Inspector (handles the session for you) or any
+MCP-aware LLM client (configs below).
+
+Press Ctrl+C in the demo terminal to shut down — `unload_all()` runs in
+the cleanup path so the FastMCP session manager exits cleanly.
+
+### Claude Desktop
+
+Paste into `claude_desktop_config.json` (Windows:
+`%APPDATA%\Claude\claude_desktop_config.json`) under `mcpServers`:
+
+```
+"parol6": {
+  "transport": "http",
+  "url": "http://127.0.0.1:8080/mcp"
+}
+```
+
+Restart Desktop. The 8 tools surface under the parol6 server name.
+
+### Claude Code CLI
+
+```
+claude mcp add --scope user parol6 --transport http \
+  --url http://127.0.0.1:8080/mcp
+claude mcp list   # parol6 should show "Connected"
+```
+
+In any Claude Code session you'll see `mcp__parol6__*` tools available.
+
+### Integration test
+
+```
+pip install httpx asgi_lifespan pytest-asyncio
+pytest tests/integration/test_mcp_server.py -v
+```
+
+Three checks: `tools/list` returns the 8-tool surface with correct
+annotations, `parol6_get_joints` handles an empty state cache cleanly,
+`parol6_move_j` round-trips the `host.motion not yet wired` stub
+rejection into a structured MCP `isError` payload.
+
+### Expected behaviour today
+
+- **Read-only tools work.** `parol6_get_joints`, `parol6_get_pose`,
+  `parol6_get_tool_state` read from `host.state.*`. They return `null`
+  in the demo because no robot broadcast feeds the cache.
+- **`parol6_check_collision`** dispatches if `parol6_vision` is
+  installed; otherwise returns `manager_ready=false`.
+- **`parol6_move_j`** returns a structured rejection
+  (`"host.motion not yet wired"`) until the consolidated motion
+  dispatch path lands. The rejection payload is the same shape it'll
+  have once real `validate_joint_trajectory_core` rejections flow
+  through — proves the pipeline.
+- **`parol6_force_move_j`** works end-to-end if a `RobotClient` is
+  connected (the unchecked path is wired today).
+- **`parol6_halt` / `parol6_resume`** work end-to-end if a `RobotClient`
+  is connected.
 
 ## How it works
 
