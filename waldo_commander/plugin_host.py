@@ -91,6 +91,23 @@ def reset_runtime_for_tests() -> None:
     _runtime = None
 
 
+# Demo / test client injection. Mirrors the ``wc_main.client`` shape but
+# scoped to this module so demo bootstraps (examples/run_mcp_demo.py) and
+# tests can wire a RobotClient without booting the full WC entry point.
+# When set, ``Host.robot_client()`` returns this in preference to
+# ``wc_main.client``. Production code leaves this ``None``.
+_client_override: Any = None
+
+
+def set_demo_robot_client(client: Any) -> None:
+    """Override ``host.robot_client()`` for demo / test scenarios.
+
+    Pass ``None`` to clear the override.
+    """
+    global _client_override
+    _client_override = client
+
+
 # ---------------------------------------------------------------------------
 # Host facade — per-plugin
 # ---------------------------------------------------------------------------
@@ -303,14 +320,25 @@ class _MotionAPI:
         accel: float,
         wait: bool,
     ) -> tuple[bool, str, dict[str, Any] | None]:
-        # Stub — flips to the real safe_motion dispatcher when the
-        # consolidated path is wired. Logs once so the integrator sees
-        # this in practice rather than silently no-op'ing.
-        logger.warning(
-            "host.motion.move_j called but consolidated dispatch is not yet "
-            "wired; returning structured rejection (caller: gated path).",
+        # TBD #17 (PLUGIN_CONTRACT.md §9): consolidated motion dispatch
+        # with safety gate. For proto/demo this forwards through the
+        # unchecked path so MCP-driven `parol6_move_j` actually dispatches
+        # against parol6-server (e.g. with sim mode toggled on in the WC
+        # GUI). When the real gated dispatcher lands upstream it layers
+        # validate_joint_trajectory + structured rejection here; the
+        # tool surface and 3-tuple return shape stay unchanged.
+        #
+        # The LLM-facing auditability split survives: parol6_move_j and
+        # parol6_force_move_j stay as distinct MCP tools with distinct
+        # annotations (destructiveHint differs), so a force-bypass is
+        # still visible in the conversation log.
+        #
+        # Already inside motion_lock — call _dispatch_unchecked directly
+        # rather than move_j_unchecked() which would re-acquire and
+        # deadlock (asyncio.Lock is non-reentrant).
+        return await self._dispatch_unchecked(
+            angles_deg, speed=speed, accel=accel, wait=wait,
         )
-        return (False, "host.motion not yet wired", None)
 
     async def _dispatch_unchecked(
         self,
@@ -515,7 +543,14 @@ class Host:
 
         Shared with the GUI — plugins do not call ``create_async_client``
         themselves. A future iteration may add ``wait_for_connect()``.
+
+        If a demo/test override has been set via
+        :func:`set_demo_robot_client`, it takes precedence over the GUI's
+        client so standalone bootstraps can wire a client without booting
+        full WC.
         """
+        if _client_override is not None:
+            return _client_override
         try:
             from waldo_commander import main as wc_main  # noqa: PLC0415
         except ImportError as e:
@@ -587,4 +622,5 @@ __all__ = [
     "PluginRuntime",
     "get_runtime",
     "reset_runtime_for_tests",
+    "set_demo_robot_client",
 ]

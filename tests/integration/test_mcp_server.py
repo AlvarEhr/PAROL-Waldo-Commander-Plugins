@@ -6,9 +6,13 @@ socket, no uvicorn. Exercises three things:
 1. ``tools/list`` returns all 8 v0 tools with the expected annotations.
 2. ``parol6_get_joints`` handles a missing RobotClient without raising —
    should return ``angles_deg=None`` (no broadcast cached) cleanly.
-3. ``parol6_move_j`` round-trips the host.motion stub rejection
-   (``"host.motion not yet wired"``) into a structured MCP isError
-   payload via ``format_rejection``.
+3. ``parol6_move_j`` round-trips the no-client rejection through the
+   gated path into a structured MCP isError payload via
+   ``format_rejection``. (The proto wires ``_dispatch_gated`` straight
+   to ``_dispatch_unchecked``; without a bound RobotClient that path
+   surfaces ``"no robot client available"`` — verifies the same
+   formatting pipeline real validate_joint_trajectory rejections will
+   use upstream.)
 
 Skips when ``fastmcp``, ``httpx``, or ``asgi_lifespan`` are missing — same
 pattern as ``tests/test_plugin_loader.py``.
@@ -213,11 +217,14 @@ async def test_get_joints_handles_empty_state_cache(mcp_client: _BoundClient) ->
     assert result == {"angles_deg": None}
 
 
-async def test_move_j_returns_host_motion_stub_rejection(
+async def test_move_j_returns_no_client_rejection_when_unbound(
     mcp_client: _BoundClient,
 ) -> None:
-    """The stubbed host.motion.move_j returns (False, 'host.motion not yet
-    wired', None); the tool wraps that into a structured rejection."""
+    """The proto wires _dispatch_gated -> _dispatch_unchecked. Without
+    a bound RobotClient (no --connect-parol6 in standalone mode), the
+    unchecked path returns (False, 'no robot client available', None);
+    the tool wraps that into a structured rejection. Verifies the
+    formatting pipeline real safety-gate rejections will use upstream."""
     body = await mcp_client.rpc(
         "tools/call",
         {
@@ -234,7 +241,7 @@ async def test_move_j_returns_host_motion_stub_rejection(
     assert result["ok"] is False
     assert result["isError"] is True
     rejection = result["rejection"]
-    assert "host.motion not yet wired" in rejection["reason"]
-    # detail=None from the stub → manager_ready defaults to True in the
-    # Pydantic model; the next_steps text is the generic remediation.
+    assert "no robot client" in rejection["reason"]
+    # detail=None from the dispatcher → manager_ready defaults to True
+    # in the Pydantic model; next_steps carries the generic remediation.
     assert "parol6_check_collision" in rejection["next_steps"]

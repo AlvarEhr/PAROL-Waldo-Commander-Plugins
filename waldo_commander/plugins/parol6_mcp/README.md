@@ -109,18 +109,26 @@ rejection into a structured MCP `isError` payload.
 
 - **Read-only tools work.** `parol6_get_joints`, `parol6_get_pose`,
   `parol6_get_tool_state` read from `host.state.*`. They return `null`
-  in the demo because no robot broadcast feeds the cache.
+  in standalone mode because no broadcast feeds the per-process state
+  cache; the WC GUI process has its own cache.
 - **`parol6_check_collision`** dispatches if `parol6_vision` is
   installed; otherwise returns `manager_ready=false`.
-- **`parol6_move_j`** returns a structured rejection
-  (`"host.motion not yet wired"`) until the consolidated motion
-  dispatch path lands. The rejection payload is the same shape it'll
-  have once real `validate_joint_trajectory_core` rejections flow
-  through — proves the pipeline.
-- **`parol6_force_move_j`** works end-to-end if a `RobotClient` is
-  connected (the unchecked path is wired today).
+- **`parol6_move_j`** dispatches against parol6-server when a
+  `RobotClient` is bound (run the demo with `--connect-parol6`, or boot
+  full WC). The proto wires `_dispatch_gated` straight to the unchecked
+  path — the real `validate_joint_trajectory` layer slots in upstream
+  (TBD #17 in `docs/PLUGIN_CONTRACT.md` §9). The LLM-facing audit split
+  (`parol6_move_j` vs `parol6_force_move_j` as distinct tools with
+  different `destructiveHint` flags) survives intact.
+- **`parol6_force_move_j`** works end-to-end with the same wiring; the
+  distinction from `parol6_move_j` is the MCP-surface annotation and
+  the `acknowledge_unsafe: true` required flag.
 - **`parol6_halt` / `parol6_resume`** work end-to-end if a `RobotClient`
   is connected.
+- Without a bound client, every motion-mutating tool returns a
+  structured rejection with `reason="no robot client available"` so
+  the LLM sees a uniform shape whether the gate, the controller, or
+  the bind is the missing piece.
 
 ## How it works
 

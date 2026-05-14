@@ -195,6 +195,18 @@ def _require_host() -> "Host":
     return _host
 
 
+def _serialise_tool_status(status: Any) -> dict[str, Any]:
+    """Flatten a waldoctl ToolStatus to a JSON-safe dict for MCP responses."""
+    return {
+        "key": status.key,
+        "state": int(status.state),
+        "engaged": bool(status.engaged),
+        "part_detected": bool(status.part_detected),
+        "positions": list(status.positions),
+        "channels": list(status.channels),
+    }
+
+
 # ---------------------------------------------------------------------------
 # FastMCP server
 # ---------------------------------------------------------------------------
@@ -218,13 +230,21 @@ mcp = FastMCP("parol6_mcp")
 async def parol6_get_joints() -> dict[str, list[float] | None]:
     """Return the PAROL6's current joint angles in degrees.
 
-    Six values, base joint first to wrist last. Read from the cached
-    broadcast snapshot (~50 Hz refresh). Returns null when no broadcast
-    has been received yet.
+    Six values, base joint first to wrist last. Reads the cached
+    broadcast snapshot first (~50 Hz refresh inside WC); falls back to a
+    live ``client.angles()`` query when the cache is empty (standalone
+    demo with --connect-parol6, or pre-broadcast startup). Returns null
+    only when neither path produces a value.
     """
     host = _require_host()
     angles = host.state.joint_angles_deg()
-    return {"angles_deg": list(angles) if angles else None}
+    if angles:
+        return {"angles_deg": list(angles)}
+    client = host.robot_client()
+    if client is None:
+        return {"angles_deg": None}
+    live = await client.angles()
+    return {"angles_deg": list(live) if live is not None else None}
 
 
 @mcp.tool(
@@ -239,12 +259,17 @@ async def parol6_get_joints() -> dict[str, list[float] | None]:
 async def parol6_get_pose(params: PoseQueryInput) -> dict[str, Any]:
     """Return the current TCP pose as [x, y, z, rx, ry, rz] in mm + degrees.
 
-    Goes through the live RobotClient because the cached broadcast only
-    carries WRF pose; TRF needs an explicit query. With a gripper tool
-    selected, WRF returns the TCP pose, not the flange — to get flange
-    position, run forward kinematics on the joint angles.
+    WRF reads come from the cached broadcast snapshot when available;
+    TRF and any cache miss fall through to a live ``client.pose(frame)``
+    query. With a gripper tool selected, WRF is the TCP pose, not the
+    flange — for flange position run forward kinematics on the joint
+    angles.
     """
     host = _require_host()
+    if params.frame == "WRF":
+        cached = host.state.tcp_pose()
+        if cached:
+            return {"pose_mm_deg": list(cached), "frame": "WRF"}
     client = host.robot_client()
     if client is None:
         return {"pose_mm_deg": None, "frame": params.frame,
@@ -270,23 +295,41 @@ async def parol6_get_tool_state() -> dict[str, Any]:
 
     Status includes operational state, engagement, normalised positions of
     each motion DOF, and tool-specific channels (current draw for electric
-    grippers, etc.). Reads from the cached broadcast snapshot.
+    grippers, etc.). Reads the cached broadcast snapshot first; on cache
+    miss falls through to a live status query against the bound
+    RobotClient when one is present.
     """
     host = _require_host()
     tool_key = host.state.active_tool_key()
     status = host.state.tool_status()
-    if status is None:
+    if status is not None:
+        return {
+            "active_tool_key": tool_key,
+            "status": _serialise_tool_status(status),
+        }
+    # Cache miss — fall back to the client's private status primitive.
+    # parol6.Robot.create_async_client() binds this through
+    # ToolSpec._get_status; calling it directly avoids the tool-binding
+    # requirement that the higher-level client.tool API has, so it works
+    # even with the standalone AsyncRobotClient the demo runner builds.
+    client = host.robot_client()
+    if client is None:
         return {"active_tool_key": tool_key, "status": None}
+    fetch = getattr(client, "_tool_status", None)
+    if fetch is None:
+        return {"active_tool_key": tool_key, "status": None}
+    try:
+        live_status = await fetch()
+    except (RuntimeError, OSError, NotImplementedError) as e:
+        logger.debug("parol6_get_tool_state: live status query failed (%s)", e)
+        return {"active_tool_key": tool_key, "status": None}
+    if live_status is None:
+        return {"active_tool_key": tool_key, "status": None}
+    if not tool_key:
+        tool_key = getattr(live_status, "key", "") or ""
     return {
         "active_tool_key": tool_key,
-        "status": {
-            "key": status.key,
-            "state": int(status.state),
-            "engaged": bool(status.engaged),
-            "part_detected": bool(status.part_detected),
-            "positions": list(status.positions),
-            "channels": list(status.channels),
-        },
+        "status": _serialise_tool_status(live_status),
     }
 
 
