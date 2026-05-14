@@ -108,6 +108,28 @@ def set_demo_robot_client(client: Any) -> None:
     _client_override = client
 
 
+# Demo / test FastAPI-app injection. When set, the host mounts plugin
+# routes on this app instead of ``nicegui.app`` and registers
+# startup/shutdown hooks via ``add_event_handler`` rather than NiceGUI's
+# ``App.on_startup``. The standalone demo runner needs this because
+# uvicorn serving ``nicegui.app`` without ``ui.run()`` triggers NiceGUI's
+# internal ``_startup`` hook to raise (it expects ``ui.run`` to have run
+# its setup first). Production code leaves this ``None`` — the host
+# falls through to ``nicegui.app`` and its hook bookkeeping unchanged.
+_fastapi_app_override: Any = None
+
+
+def set_demo_fastapi_app(app: Any) -> None:
+    """Override ``host.fastapi_app()`` for demo / test scenarios.
+
+    Pass ``None`` to clear the override. When set, ``Host.on_startup`` /
+    ``on_shutdown`` register handlers on the injected app via
+    ``add_event_handler`` so the FastMCP lifespan pump still fires.
+    """
+    global _fastapi_app_override
+    _fastapi_app_override = app
+
+
 # ---------------------------------------------------------------------------
 # Host facade — per-plugin
 # ---------------------------------------------------------------------------
@@ -561,11 +583,15 @@ class Host:
     # ---- FastAPI handle ---------------------------------------------------
 
     def fastapi_app(self) -> FastAPI:
-        """Return the NiceGUI app (a FastAPI subclass).
+        """Return the FastAPI app plugins mount on.
 
-        Plugins mount sub-apps on this; parol6_mcp mounts FastMCP's
-        Starlette app at ``/mcp`` via this handle.
+        Production returns ``nicegui.app`` (a FastAPI subclass). The
+        standalone demo runner injects a fresh ``FastAPI()`` via
+        :func:`set_demo_fastapi_app` so uvicorn can serve plugin routes
+        without booting NiceGUI's ``ui.run()`` machinery.
         """
+        if _fastapi_app_override is not None:
+            return _fastapi_app_override
         from nicegui import app  # noqa: PLC0415
 
         return app  # type: ignore[return-value]
@@ -573,15 +599,26 @@ class Host:
     # ---- Lifecycle hooks --------------------------------------------------
 
     def on_startup(self, coro: Callable[[], Any]) -> None:
+        self._rt.startup_hooks.append(coro)
+        if _fastapi_app_override is not None:
+            # Fresh FastAPI — write directly to Starlette's underlying
+            # handler list. ``app.add_event_handler`` was removed in
+            # recent FastAPI versions; the router's ``on_startup`` /
+            # ``on_shutdown`` lists are the canonical storage that every
+            # higher-level API ultimately mutates.
+            _fastapi_app_override.router.on_startup.append(coro)
+            return
         from nicegui import app  # noqa: PLC0415
 
-        self._rt.startup_hooks.append(coro)
         app.on_startup(coro)
 
     def on_shutdown(self, coro: Callable[[], Any]) -> None:
+        self._rt.shutdown_hooks.append(coro)
+        if _fastapi_app_override is not None:
+            _fastapi_app_override.router.on_shutdown.append(coro)
+            return
         from nicegui import app  # noqa: PLC0415
 
-        self._rt.shutdown_hooks.append(coro)
         app.on_shutdown(coro)
 
     # ---- Event bus --------------------------------------------------------
@@ -622,5 +659,6 @@ __all__ = [
     "PluginRuntime",
     "get_runtime",
     "reset_runtime_for_tests",
+    "set_demo_fastapi_app",
     "set_demo_robot_client",
 ]

@@ -1,9 +1,17 @@
 """Standalone bootstrap for the parol6_mcp plugin.
 
-Spins up the FastAPI app (NiceGUI's, since the plugin mounts on it) with
-just the ``parol6_mcp`` plugin loaded — no full Waldo-Commander UI
-required. Reads via ``host.state.*`` return empty / null because no
-broadcast feeds the cache in standalone mode.
+Spins up a fresh FastAPI app, loads ``parol6_mcp`` against it, and
+serves uvicorn. Production WC mounts plugin routes on ``nicegui.app``;
+the demo deliberately uses a fresh app to bypass NiceGUI's ``_startup``
+invariant (which raises ``RuntimeError("You must call ui.run() ...")``
+when uvicorn boots the lifespan without ``ui.run()`` having configured
+NiceGUI first). The plugin's host API uses ``set_demo_fastapi_app`` to
+route mounts and startup hooks to this fresh app.
+
+Reads via ``host.state.*`` return empty / null because no broadcast
+feeds the cache in standalone mode. The cache-miss fallback in
+``parol6_get_*`` tools falls through to live ``client.*`` queries when
+``--connect-parol6`` is set.
 
 By default the demo runs with no RobotClient, so motion tools return
 ``"no robot client available"`` rejections. Pass ``--connect-parol6`` to
@@ -56,9 +64,12 @@ import sys
 from typing import Any
 
 import uvicorn
-from nicegui import app as nicegui_app
+from fastapi import FastAPI
 
-from waldo_commander.plugin_host import set_demo_robot_client
+from waldo_commander.plugin_host import (
+    set_demo_fastapi_app,
+    set_demo_robot_client,
+)
 from waldo_commander.plugins import load_all, unload_all
 
 PORT = int(os.environ.get("MCP_DEMO_PORT", "8080"))
@@ -177,17 +188,24 @@ Press Ctrl+C to stop.
 
 
 async def _bootstrap_and_serve(connect_parol6: bool) -> None:
-    """Load plugins, optionally bind a RobotClient, then serve uvicorn.
+    """Inject the demo FastAPI app + optional RobotClient, load plugins,
+    then serve uvicorn.
 
-    Order matters: ``load_all()`` runs each plugin's ``on_load``, which
-    registers ``app.on_startup`` hooks (FastMCP's session-manager
-    lifespan). Uvicorn's lifespan startup then fires those hooks. Calling
-    ``load_all()`` AFTER ``serve()`` would register the hooks too late —
-    startup has already completed.
-
-    The RobotClient is set BEFORE ``load_all()`` so any hook that probes
-    ``host.robot_client()`` during startup sees the bound client.
+    Order matters: ``set_demo_fastapi_app`` runs BEFORE ``load_all()`` so
+    the plugin's ``on_load`` mounts ``/mcp`` on the demo app (not on
+    ``nicegui.app``) and registers its startup hooks against that app.
+    Uvicorn's lifespan startup then fires those hooks, entering FastMCP's
+    session manager. Mounting after ``load_all()`` would attach to the
+    wrong app; mounting after ``serve()`` would register hooks too late.
     """
+    demo_app = FastAPI(
+        title="parol6_mcp demo",
+        description=(
+            "Standalone bootstrap. Plugin routes mount here; "
+            "nicegui.app is intentionally not served."
+        ),
+    )
+    set_demo_fastapi_app(demo_app)
     client = _maybe_connect_robot_client(connect_parol6)
 
     try:
@@ -204,7 +222,7 @@ async def _bootstrap_and_serve(connect_parol6: bool) -> None:
         _print_instructions()
 
         config = uvicorn.Config(
-            nicegui_app,
+            demo_app,
             host=HOST,
             port=PORT,
             log_level="info",
@@ -217,6 +235,7 @@ async def _bootstrap_and_serve(connect_parol6: bool) -> None:
         finally:
             await unload_all()
     finally:
+        set_demo_fastapi_app(None)
         set_demo_robot_client(None)
         if client is not None:
             close = getattr(client, "close", None)

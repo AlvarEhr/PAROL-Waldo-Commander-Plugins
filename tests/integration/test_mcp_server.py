@@ -31,9 +31,12 @@ asgi_lifespan = pytest.importorskip("asgi_lifespan")
 
 import httpx
 from asgi_lifespan import LifespanManager
-from nicegui import app as nicegui_app
+from fastapi import FastAPI
 
-from waldo_commander.plugin_host import reset_runtime_for_tests
+from waldo_commander.plugin_host import (
+    reset_runtime_for_tests,
+    set_demo_fastapi_app,
+)
 from waldo_commander.plugins import (
     load_all,
     reset_loader_for_tests,
@@ -78,24 +81,33 @@ def _reset_singletons():
 
 @pytest.fixture
 async def mcp_client():
-    """Load parol6_mcp into the live NiceGUI FastAPI app, enter the app
-    lifespan (which fires the plugin's FastMCP session-manager startup
-    hook), and yield an httpx AsyncClient pointed at the in-process app.
+    """Mount parol6_mcp on a fresh FastAPI app via ``set_demo_fastapi_app``,
+    enter that app's lifespan (firing the plugin's FastMCP session-manager
+    startup hook), and yield an httpx AsyncClient against it.
+
+    Matches the demo runner's pattern. Avoids ``nicegui.app`` because its
+    internal ``_startup`` hook raises when uvicorn / lifespan tries to
+    boot it without ``ui.run()`` having run its setup first.
     """
+    demo_app = FastAPI()
+    set_demo_fastapi_app(demo_app)
+
     state = await load_all()
     assert any(p.plugin_id == "parol6_mcp" for p in state.loaded), (
         "parol6_mcp failed to load — check fastmcp is installed."
     )
 
-    async with LifespanManager(nicegui_app):
-        transport = httpx.ASGITransport(app=nicegui_app)
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver",
-        ) as client:
-            session_id = await _initialize(client)
-            yield _BoundClient(client, session_id)
-
-    await unload_all()
+    try:
+        async with LifespanManager(demo_app):
+            transport = httpx.ASGITransport(app=demo_app)
+            async with httpx.AsyncClient(
+                transport=transport, base_url="http://testserver",
+            ) as client:
+                session_id = await _initialize(client)
+                yield _BoundClient(client, session_id)
+    finally:
+        await unload_all()
+        set_demo_fastapi_app(None)
 
 
 # ---------------------------------------------------------------------------
