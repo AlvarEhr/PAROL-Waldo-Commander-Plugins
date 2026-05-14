@@ -1,23 +1,21 @@
-"""Demo: Gemini API driving the parol6_mcp server.
+"""Interactive Gemini chat driving the parol6_mcp server.
 
 Reads GEMINI_API_KEY from parol6-vision/.env, connects to a running
-parol6_mcp server at http://127.0.0.1:8080/mcp, and runs four prompts
-that exercise read + motion tools. Watch the sim robot in
-Waldo-Commander while Gemini autonomously routes through MCP.
+parol6_mcp server (default port 8765, override with MCP_DEMO_PORT),
+prints the tool list Gemini can see, and drops you into a REPL where
+you type prompts and Gemini autonomously routes through MCP tools.
 
 Prerequisites:
     Terminal 1: parol6-server (sim/real toggled via the GUI button)
-    Terminal 2: waldo-commander GUI (toggle sim mode before running this)
-    Terminal 3: python examples/run_mcp_demo.py --connect-parol6
+    Terminal 2: waldo-commander GUI (toggle SIM mode before running this)
+    Terminal 3: set MCP_DEMO_PORT=8765 (Windows: ``set ...``)
+                python examples/run_mcp_demo.py --connect-parol6
     Terminal 4: python examples/gemini_mcp_test.py     (this script)
 
 Install (one-time):
     pip install google-genai mcp python-dotenv
 
-The four prompts go from read-only (joints, pose) to a motion command
-that should be visible in the WC GUI. Gemini decides which tools to
-call; this script prints every tool invocation + result and the final
-text reply per prompt.
+Type /quit (or /exit, or Ctrl+C) to leave.
 """
 
 from __future__ import annotations
@@ -25,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import os
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from google import genai
@@ -36,25 +35,19 @@ from mcp.client.streamable_http import streamablehttp_client
 _ENV_FILE = (
     Path(__file__).resolve().parent.parent.parent / "parol6-vision" / ".env"
 )
-# Avoid clashing with Waldo-Commander on 8080; run the demo on 8765
-# unless MCP_DEMO_PORT is set (matches run_mcp_demo.py's convention).
 _MCP_PORT = int(os.environ.get("MCP_DEMO_PORT", "8765"))
 _MCP_URL = f"http://127.0.0.1:{_MCP_PORT}/mcp"
 _MODEL = "gemini-2.5-pro"
 
-_PROMPTS = [
+_QUIT = {"/quit", "/exit", "quit", "exit"}
+
+_EXAMPLE_PROMPTS = [
     "What are the robot's current joint angles?",
     "What's the TCP pose in the WRF frame right now?",
-    (
-        "Get the current joint angles. Then call parol6_move_j to drive the "
-        "robot to those same joints but with J1 (the second joint, index 1) "
-        "increased by 20 degrees. Use a moderate speed around 0.25 and "
-        "accel around 0.5. Wait for motion to finish."
-    ),
-    (
-        "Now return the robot to the joint angles you read at the very "
-        "start. Same speed and accel as before."
-    ),
+    "Move J1 by +20 degrees from current. Use speed 0.25, accel 0.5.",
+    "Now move it back to where it was.",
+    "Check whether moving from current joints to all zeros would collide.",
+    "Halt the robot.",
 ]
 
 
@@ -72,40 +65,79 @@ def _load_api_key() -> str:
     return key
 
 
-def _print_afc_step(afc_history: object) -> None:
-    """Best-effort summary of the auto-function-calling steps Gemini took."""
-    if not afc_history:
+def _print_tools(tool_objects: list[Any]) -> None:
+    """Print MCP tools available to Gemini with one-line descriptions."""
+    print(f"\nMCP tools advertised ({len(tool_objects)}):")
+    width = max(len(t.name) for t in tool_objects) + 2
+    for t in tool_objects:
+        desc_first = (t.description or "").strip().split("\n")[0]
+        if len(desc_first) > 90:
+            desc_first = desc_first[:87] + "..."
+        print(f"  {t.name:<{width}} {desc_first}")
+
+
+def _print_examples() -> None:
+    print("\nExample prompts to try:")
+    for p in _EXAMPLE_PROMPTS:
+        print(f"  > {p}")
+    print()
+
+
+def _print_afc_steps(history: Any) -> None:
+    """Best-effort summary of Gemini's tool-call steps for the last turn."""
+    if not history:
         return
-    print("  --- tool-call trace ---")
-    for step in afc_history:
+    for step in history:
         parts = getattr(step, "parts", []) or []
         for part in parts:
             fc = getattr(part, "function_call", None)
             fr = getattr(part, "function_response", None)
             if fc:
-                print(f"  [CALL]   {fc.name}({dict(fc.args)})")
+                args_repr = dict(fc.args) if fc.args else {}
+                print(f"  [CALL]   {fc.name}({args_repr})")
             elif fr:
                 payload = str(fr.response)
-                if len(payload) > 200:
-                    payload = payload[:197] + "..."
+                if len(payload) > 240:
+                    payload = payload[:237] + "..."
                 print(f"  [RESULT] {fr.name}: {payload}")
 
 
-async def _run_prompts(
-    gemini: "genai.Client",
+async def _chat_loop(
+    gemini: genai.Client,
     session: ClientSession,
 ) -> None:
-    for i, prompt in enumerate(_PROMPTS, 1):
-        print(f"\n{'=' * 60}\nPROMPT {i}/{len(_PROMPTS)}\n{'=' * 60}")
-        print(f"USER: {prompt}\n")
-        resp = await gemini.aio.models.generate_content(
-            model=_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(tools=[session]),
+    chat = gemini.aio.chats.create(
+        model=_MODEL,
+        config=types.GenerateContentConfig(tools=[session]),
+    )
+    print(
+        "\nReady. Type your prompts at the > prompt. "
+        "/quit (or /exit, Ctrl+C) to leave.\n"
+    )
+    while True:
+        try:
+            text = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nBye.")
+            return
+        if not text:
+            continue
+        if text.lower() in _QUIT:
+            print("Bye.")
+            return
+        try:
+            resp = await chat.send_message(text)
+        except KeyboardInterrupt:
+            print("\nBye.")
+            return
+        except Exception as e:  # noqa: BLE001
+            print(f"\nERROR: {type(e).__name__}: {e}\n")
+            continue
+        _print_afc_steps(
+            getattr(resp, "automatic_function_calling_history", None),
         )
-        _print_afc_step(getattr(resp, "automatic_function_calling_history", None))
-        text = (resp.text or "").strip()
-        print(f"\nGEMINI: {text or '<no text reply>'}")
+        reply = (resp.text or "").strip()
+        print(f"\nGEMINI: {reply or '<no text reply>'}\n")
 
 
 async def main() -> None:
@@ -116,18 +148,16 @@ async def main() -> None:
             async with ClientSession(read, write) as session:
                 await session.initialize()
                 tools = await session.list_tools()
-                names = sorted(t.name for t in tools.tools)
-                print(f"MCP tools advertised ({len(names)}):")
-                for n in names:
-                    print(f"  - {n}")
-
+                _print_tools(tools.tools)
+                _print_examples()
                 gemini = genai.Client(api_key=api_key)
-                await _run_prompts(gemini, session)
-    except Exception as e:
+                await _chat_loop(gemini, session)
+    except (OSError, ConnectionError) as e:
         print(f"\nERROR: {type(e).__name__}: {e}")
         print(
-            "\nIs the MCP server running with --connect-parol6?\n"
+            f"\nIs the MCP server running on port {_MCP_PORT}?\n"
             '  cd /d "C:\\Users\\alvar\\OneDrive\\Desktop\\Project Files\\Waldo-Commander-plugins"\n'
+            f"  set MCP_DEMO_PORT={_MCP_PORT}\n"
             "  python examples/run_mcp_demo.py --connect-parol6"
         )
         raise
